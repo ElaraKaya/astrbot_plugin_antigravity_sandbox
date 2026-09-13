@@ -1,0 +1,93 @@
+{
+  "gemini_api_keys": {
+    "description": "Google Gemini API Key 列表",
+    "type": "list",
+    "hint": "支持填写多个 Key；每次请求按顺序轮询，遇到 401、403 或 429 自动尝试下一个。不会写入日志。",
+    "items": {
+      "type": "string",
+      "description": "Gemini API Key"
+    },
+    "default": [],
+    "secret": true
+  },
+  "default_model": {
+    "description": "Antigravity agent_config.model",
+    "type": "string",
+    "hint": "auto 或留空：不发送 model，省略 agent_config.model 由服务端默认路由（官方 2026-09-08 默认 gemini-3.8-flash）。可自定义填写任意模型名称，如 gemini-3.8-flash、gemini-3.7-flash 等。",
+    "default": "auto"
+  },
+  "submit_background": {
+    "description": "提交时使用 background=true（立即返回 id，稍后取回）",
+    "type": "bool",
+    "hint": "官方 Interactions API 支持 background。关闭后提交会同步等待整段智能体循环（最长约 120 秒超时）。",
+    "default": true
+  },
+  "max_total_tokens": {
+    "description": "agent_config.max_total_tokens（0 表示不发送该字段）",
+    "type": "int",
+    "hint": "限制单次交互 token 总量（input+output+thinking，不含 cached）。触达后 status=incomplete。",
+    "default": 0
+  },
+  "upload_webhook_url": {
+    "description": "图床上传 Webhook 地址",
+    "type": "string",
+    "hint": "完整 POST 上传接口，例如 https://bot.elara.cyou/Webhook/upload。插件不会自动拼接路径。",
+    "default": "https://bot.elara.cyou/Webhook/upload"
+  },
+  "upload_public_base_url": {
+    "description": "图床公网访问基础地址",
+    "type": "string",
+    "hint": "用于拼接上传后文件 URL，例如 https://bot.elara.cyou。",
+    "default": "https://bot.elara.cyou"
+  },
+  "upload_token": {
+    "description": "图床 Bearer Token",
+    "type": "string",
+    "hint": "用户在此填写；仅在提交任务时挂载为 /workspace/upload.token，不写日志、不回显。",
+    "default": "",
+    "secret": true
+  },
+  "upload_prefix": {
+    "description": "图床默认上传目录",
+    "type": "string",
+    "hint": "例如 agysb。Agent 上传文件时使用此目录。",
+    "default": "agysb"
+  },
+  "env_auto_cleanup": {
+    "description": "自动回收闲置沙盒环境",
+    "type": "bool",
+    "hint": "启动时以及每次新建任务提交前，按 TTL 删除可回收的 environment，避免项目环境存储配额 429。2026-09-08 起。",
+    "default": true
+  },
+  "env_idle_ttl_hours": {
+    "description": "沙盒闲置多久后可回收（小时）",
+    "type": "int",
+    "hint": "从本插件最后一次 submit/retrieve/continue 或 Google last_accessed 起算。默认 24 小时，以便当天还能 /agcontinue。2026-09-08 起。",
+    "default": 24
+  },
+  "env_keep_recent": {
+    "description": "每个 Key 至少保留的最近沙盒数",
+    "type": "int",
+    "hint": "即使已过 TTL 也先留着，方便续接最近任务。按 last_accessed / last_used_at 取最新。2026-09-08 起。",
+    "default": 2
+  },
+  "env_cleanup_scope": {
+    "description": "自动回收范围",
+    "type": "string",
+    "hint": "tracked：只删本插件记录过的 sandbox_id。all：删除该 Gemini 项目里所有可回收环境（可能影响同一 Key 的其它工具）。2026-09-08 起。",
+    "options": ["tracked", "all"],
+    "default": "tracked"
+  },
+  "env_cleanup_on_quota": {
+    "description": "存储配额 429 时紧急回收并重试",
+    "type": "bool",
+    "hint": "遇到 Project environment storage quota exceeded 时，先在当前 Key 的项目里紧急删除闲置环境，再用同一把 Key 重试提交，而不是只换备用 Key。2026-09-08 起。",
+    "default": true
+  },
+  "auto_retrieve": {
+    "description": "提交/续接 1 小时后自动取回",
+    "type": "bool",
+    "hint": "任务产物会发布到公网链接，用户可能不手动取回。开启后，每次提交或续接满 1 小时若仍未被取回，后台自动查询一次状态并写日志，不推送到会话。手动取回会取消等待。默认开启。",
+    "default": true
+  }
+}

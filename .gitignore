@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.ruff_cache/
+*.json
+!_conf_schema.json
+*.log
+.env
+*.bak*
+*.zip
+*.tar.gz
