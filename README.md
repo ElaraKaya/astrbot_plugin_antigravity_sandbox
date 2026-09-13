@@ -1,0 +1,2 @@
+# astrbot_plugin_antigravity_sandbox
+向 Google Antigravity 托管智能体提交沙盒任务并取回产物
