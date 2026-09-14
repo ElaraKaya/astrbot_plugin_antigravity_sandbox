@@ -37,8 +37,8 @@ AstrBot 插件：把 Google **Antigravity** 托管智能体当成可提交 / 可
 | `default_model` | `agent_config.model`。`auto` 或留空：不发送 `model`，无 token 上限时整段省略 `agent_config`，交给服务端默认/路由（官方 2026-09-08 默认 `gemini-3.8-flash`）。也可强制 `gemini-3.8-flash` / `gemini-3.7-flash` / `gemini-3.6-flash` / `gemini-3.5-flash` / `gemini-3.5-flash-lite`。 |
 | `submit_background` | 默认 `true`：`background=true`，提交后马上返回 id。 |
 | `max_total_tokens` | `0` 表示不发送。大于 0 时写入 `agent_config.max_total_tokens`。 |
-| `upload_webhook_url` | 完整上传接口，例如 `https://bot.elara.cyou/Webhook/upload`。 |
-| `upload_public_base_url` | 公网访问基础地址，例如 `https://bot.elara.cyou`。 |
+| `upload_webhook_url` | 完整上传接口，例如 `https://example.com/Webhook/upload`。留空不启用。 |
+| `upload_public_base_url` | 公网访问基础地址，例如 `https://example.com`。留空不启用。 |
 | `upload_token` | 图床 Bearer Token，secret 配置，不写日志；任务提交时挂载为 `/workspace/upload.token`。 |
 | `upload_prefix` | 默认上传目录，默认 `agysb`。 |
 | `env_auto_cleanup` | **2026-09-08 起。** 默认 `true`：启动时以及每次新建任务提交前，按 TTL 回收闲置环境。 |

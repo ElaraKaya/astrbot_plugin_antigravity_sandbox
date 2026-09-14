@@ -31,14 +31,14 @@
   "upload_webhook_url": {
     "description": "图床上传 Webhook 地址",
     "type": "string",
-    "hint": "完整 POST 上传接口，例如 https://bot.elara.cyou/Webhook/upload。插件不会自动拼接路径。",
-    "default": "https://bot.elara.cyou/Webhook/upload"
+    "hint": "完整 POST 上传接口，例如 https://example.com/Webhook/upload。插件不会自动拼接路径。",
+    "default": ""
   },
   "upload_public_base_url": {
     "description": "图床公网访问基础地址",
     "type": "string",
-    "hint": "用于拼接上传后文件 URL，例如 https://bot.elara.cyou。",
-    "default": "https://bot.elara.cyou"
+    "hint": "用于拼接上传后文件 URL，例如 https://example.com。",
+    "default": ""
   },
   "upload_token": {
     "description": "图床 Bearer Token",
