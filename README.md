@@ -4,7 +4,7 @@ AstrBot 插件：用 Google **Antigravity** 托管智能体在云端沙盒里跑
 
 - 插件名：`astrbot_plugin_antigravity_sandbox`
 - 作者：珂夜
-- 版本：1.5.0
+- 版本：1.5.3
 - 需要 AstrBot `>=4.5.7,<5`
 
 ## 介绍
@@ -90,6 +90,9 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | `/agenvlist` | 查看本插件记录的环境 |
 | `/agencleanup` | 回收闲置环境（慎用 `all`） |
 
+短号是四位数字（如 `0001`）。续接不换号，覆盖为该沙盒最新一轮；不能从更早的祖先 id 分叉。  
+续接前若未取回会先自动取回上一轮；`status` 不是 `completed` 则只返回当前状态、不续接。
+
 ### 给大模型用的工具
 
 插件会注册三个工具，对话里直接说「去沙盒做某某事」即可：
@@ -113,7 +116,9 @@ Project environment storage quota exceeded
 
 默认只动本插件跟踪过的沙盒。
 
+## 更新日志
 
+见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可证
 

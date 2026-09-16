@@ -61,11 +61,11 @@ except ImportError:  # loaded as a loose main.py, not a package
 ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 SHORT_INDEX_LIMIT = 2000
 SHORT_INDEX_DROP = 1000
-SHORT_ID_WIDTH = 5
-SHORT_ID_SUBMIT_STEP = 10
-SHORT_ID_SUBMIT_START = 10
-SHORT_ID_SUBMIT_WRAP = 20000
-SHORT_ID_CONTINUE_MAX = 9
+SHORT_ID_WIDTH = 4
+SHORT_ID_SUBMIT_START = 1
+SHORT_ID_SUBMIT_WRAP = 9999
+CONTINUE_SHORT_TIME_WIDTH = 6
+CONTINUE_SHORT_RE = re.compile(rf"^(\d+)_(\d{{{CONTINUE_SHORT_TIME_WIDTH}}})$")
 TOKEN_TARGET = "/workspace/upload.token"
 SANDBOX_ID_RE = re.compile(r"^[0-9a-f]{32}$", re.I)
 ENV_META_LIMIT = 2000
@@ -184,6 +184,14 @@ def _submit_stamp() -> str:
     return datetime.now().strftime("%y%m%d%H%M%S")
 
 
+def _short_serial(raw: str) -> int | None:
+    text = _as_str(raw)
+    matched = CONTINUE_SHORT_RE.fullmatch(text)
+    if matched:
+        return int(matched.group(1))
+    return _parse_short_int(text)
+
+
 def _output_file_names(output_files: str) -> list[str]:
     return [x.strip() for x in _as_str(output_files).split(",") if x.strip()]
 
@@ -265,6 +273,11 @@ def _parse_command_prompt(raw: str, *, default_ext: str | None = "md") -> tuple[
     return prompt, ",".join(f"result.{ext}" for ext in exts)
 
 
+CONTINUE_GATE_HINT = (
+    "续接前若未取回会先自动取回上一轮；status 不是 completed 则只返回当前状态、不续接。"
+)
+
+
 class HandlerReceipt:
     def __init__(
         self,
@@ -278,6 +291,8 @@ class HandlerReceipt:
         output: str = "",
         expected_urls: list[str] | None = None,
         steps: str = "",
+        continue_blocked: bool = False,
+        auto_retrieved: bool = False,
     ) -> None:
         self.text = text
         self.ok = ok
@@ -288,6 +303,8 @@ class HandlerReceipt:
         self.output = output
         self.expected_urls = list(expected_urls or [])
         self.steps = steps
+        self.continue_blocked = continue_blocked
+        self.auto_retrieved = auto_retrieved
 
 
 SUBMIT_TOOL_DESC = (
@@ -306,8 +323,9 @@ RETRIEVE_TOOL_DESC = (
 
 CONTINUE_TOOL_DESC = (
     "基于已有沙盒任务的短号 taskid，异步提交后续交互指令进行追问、修正或执行下一步。"
-    "插件会按短号查找当时绑定的 Key，并续接对应沙盒与会话。不要传内部长 ID。"
-    "返回新的短号 taskid。"
+    "插件会按短号查找当时绑定的 Key，并续接该沙盒最新一轮交互（不能从祖先 id 分叉）。"
+    "若上一轮尚未取回，会先自动取回；status 不是 completed 则只返回当前状态、不提交续接。"
+    "不要传内部长 ID。短号不变，覆盖为最新一轮。"
 )
 
 
@@ -363,7 +381,7 @@ def _retrieve_parameters() -> dict:
         "properties": {
             "task_id": {
                 "type": "string",
-                "description": "提交或续接时返回的短号 taskid，例如 00512",
+                "description": "提交或续接时返回的短号 taskid，例如 0001",
             },
         },
         "required": ["task_id"],
@@ -381,8 +399,8 @@ def _continue_parameters() -> dict:
             "task_id": {
                 "type": "string",
                 "description": (
-                    "上一轮任务的短号 taskid，例如 00512。"
-                    "插件据此查找当时绑定的 Key、沙盒和会话。"
+                    "上一轮任务的短号 taskid，例如 0001。"
+                    "插件据此查找当时绑定的 Key、沙盒和会话，并续接该沙盒最新一轮。"
                 ),
             },
             "output_files": {
@@ -492,6 +510,7 @@ class AntigravitySandboxPlugin(Star):
         task_id: str = "",
         sandbox_id: str = "",
         previous_task_id: str = "",
+        overwrite_short: str = "",
     ) -> str:
         key = _as_str(key)
         if key:
@@ -511,6 +530,7 @@ class AntigravitySandboxPlugin(Star):
                 sandbox_id,
                 previous_task_id=previous_task_id,
                 key=key,
+                overwrite_short=overwrite_short,
             )
         return short
 
@@ -928,8 +948,17 @@ class AntigravitySandboxPlugin(Star):
             index: dict[str, dict[str, str]] = {}
             for key, value in data.items():
                 if isinstance(value, dict) and value.get("task_id") and value.get("sandbox_id"):
-                    n = _parse_short_int(str(key))
-                    store_key = _format_short(n) if n is not None else str(key)
+                    raw_key = str(key)
+                    if CONTINUE_SHORT_RE.fullmatch(raw_key):
+                        store_key = raw_key
+                    else:
+                        n = _parse_short_int(raw_key)
+                        if n is None:
+                            store_key = raw_key
+                        elif len(raw_key) > SHORT_ID_WIDTH:
+                            store_key = raw_key
+                        else:
+                            store_key = _format_short(n)
                     item = {
                         "task_id": str(value["task_id"]),
                         "sandbox_id": str(value["sandbox_id"]),
@@ -940,6 +969,12 @@ class AntigravitySandboxPlugin(Star):
                     recorded_at = _as_str(value.get("recorded_at"))
                     if recorded_at:
                         item["recorded_at"] = recorded_at
+                    retrieved = _as_str(value.get("retrieved"))
+                    if retrieved:
+                        item["retrieved"] = retrieved
+                    last_status = _as_str(value.get("last_status"))
+                    if last_status:
+                        item["last_status"] = last_status
                     index[store_key] = item
             return index
         except Exception as e:
@@ -983,39 +1018,24 @@ class AntigravitySandboxPlugin(Star):
     def _used_submit_serials(self) -> set[int]:
         used: set[int] = set()
         for key in self._short_index:
-            n = _parse_short_int(key)
+            n = _short_serial(key)
             if n is None or n < SHORT_ID_SUBMIT_START:
                 continue
-            used.add(n // SHORT_ID_SUBMIT_STEP)
+            used.add(n)
         return used
 
     def _alloc_submit_short(self) -> str:
-        # 五位短号：前四位是任务序号，末位是续接位。新建只比较前四位，取最小空号。
-        # 例如 00500 仍在、00010 已被清理时，下一个新建是 00010 而不是 00510。
-        max_serial = SHORT_ID_SUBMIT_WRAP // SHORT_ID_SUBMIT_STEP
-        start_serial = SHORT_ID_SUBMIT_START // SHORT_ID_SUBMIT_STEP
+        # 四位短号，取最小空号。续接覆盖同一短号，不另占号。
         used = self._used_submit_serials()
-        for serial in range(start_serial, max_serial + 1):
+        for serial in range(SHORT_ID_SUBMIT_START, SHORT_ID_SUBMIT_WRAP + 1):
             if serial not in used:
-                return _format_short(serial * SHORT_ID_SUBMIT_STEP)
+                return _format_short(serial)
         self._trim_short_index()
         used = self._used_submit_serials()
-        for serial in range(start_serial, max_serial + 1):
+        for serial in range(SHORT_ID_SUBMIT_START, SHORT_ID_SUBMIT_WRAP + 1):
             if serial not in used:
-                return _format_short(serial * SHORT_ID_SUBMIT_STEP)
+                return _format_short(serial)
         return _format_short(SHORT_ID_SUBMIT_START)
-
-    def _alloc_continue_short(self, previous_short: str) -> str:
-        # 末位 0 是新建号，1-9 是续接号。
-        # 续接满 9 次后覆盖末位 1（00519 -> 00511），再 00512、00513… 以此类推。
-        # 续接太久之前的会话没有意义，不必再保留最早那几次续接号。
-        n = _parse_short_int(previous_short)
-        if n is None:
-            return self._alloc_submit_short()
-        last = n % 10
-        base = n - last
-        nxt = base + 1 if last >= SHORT_ID_CONTINUE_MAX else n + 1
-        return _format_short(nxt)
 
     def _short_item(
         self,
@@ -1035,6 +1055,30 @@ class AntigravitySandboxPlugin(Star):
             item["key"] = key
         return item
 
+    def _copy_retrieve_meta(self, src: dict[str, str], dest: dict[str, str]) -> None:
+        retrieved = _as_str(src.get("retrieved"))
+        if retrieved:
+            dest["retrieved"] = retrieved
+        last_status = _as_str(src.get("last_status"))
+        if last_status:
+            dest["last_status"] = last_status
+
+    def _mark_short_retrieved(self, short: str, status: str) -> None:
+        short = _as_str(short)
+        if not short or short not in self._short_index:
+            return
+        item = dict(self._short_index[short])
+        item["retrieved"] = "1"
+        item["last_status"] = _as_str(status) or "unknown"
+        self._short_index[short] = item
+        self._save_short_index()
+
+    def _short_retrieved_completed(self, short: str) -> bool:
+        item = self._short_index.get(_as_str(short)) or {}
+        if _as_str(item.get("retrieved")).lower() not in {"1", "true", "yes"}:
+            return False
+        return _as_str(item.get("last_status")).lower() == "completed"
+
     def _record_short(
         self,
         task_id: str,
@@ -1042,6 +1086,7 @@ class AntigravitySandboxPlugin(Star):
         *,
         previous_task_id: str = "",
         key: str = "",
+        overwrite_short: str = "",
     ) -> str:
         task_id = _as_str(task_id)
         sandbox_id = _as_str(sandbox_id)
@@ -1057,21 +1102,32 @@ class AntigravitySandboxPlugin(Star):
         existing_short = self._short_for_task(task_id)
         if existing_short:
             old = self._short_index.get(existing_short) or {}
-            self._short_index[existing_short] = self._short_item(
+            item = self._short_item(
                 task_id,
                 sandbox_id,
                 key=key or _as_str(old.get("key")),
                 recorded_at=_as_str(old.get("recorded_at")),
             )
+            self._copy_retrieve_meta(old, item)
+            self._short_index[existing_short] = item
             self._save_short_index()
             return existing_short
+        previous_task_id = _as_str(previous_task_id)
+        short = _as_str(overwrite_short) or (
+            self._short_for_task(previous_task_id) if previous_task_id else ""
+        )
+        if short:
+            old = self._short_index.get(short) or {}
+            self._short_index[short] = self._short_item(
+                task_id,
+                sandbox_id,
+                key=key or _as_str(old.get("key")),
+            )
+            self._save_short_index()
+            return short
         if len(self._short_index) >= SHORT_INDEX_LIMIT:
             self._trim_short_index()
-        previous_task_id = _as_str(previous_task_id)
-        if previous_task_id:
-            short = self._alloc_continue_short(self._short_for_task(previous_task_id))
-        else:
-            short = self._alloc_submit_short()
+        short = self._alloc_submit_short()
         self._short_index[short] = self._short_item(task_id, sandbox_id, key=key)
         self._save_short_index()
         return short
@@ -1086,28 +1142,71 @@ class AntigravitySandboxPlugin(Star):
             sandbox_id=sandbox_id or _as_str(item.get("sandbox_id")),
         ) or ""
 
-    def _resolve_ids(self, ref: str) -> tuple[str, str, str] | None:
+    def _resolve_index_entry(self, ref: str) -> tuple[str, dict[str, str]] | None:
         ref = _as_str(ref)
         if not ref:
             return None
-        item = None
+        keys: list[str] = [ref]
+        matched = CONTINUE_SHORT_RE.fullmatch(ref)
+        if matched:
+            prefix_n = int(matched.group(1))
+            suffix = matched.group(2)
+            keys.extend(
+                [
+                    f"{prefix_n}_{suffix}",
+                    f"{prefix_n:04d}_{suffix}",
+                    f"{prefix_n:05d}_{suffix}",
+                ]
+            )
         n = _parse_short_int(ref)
         if n is not None:
-            item = self._short_index.get(_format_short(n))
-        if not item:
-            item = self._short_index.get(ref)
-        if not item:
-            for value in self._short_index.values():
-                if value.get("task_id") == ref:
-                    item = value
-                    break
-        if not item:
+            keys.extend([_format_short(n), f"{n:05d}", str(n)])
+        seen: set[str] = set()
+        for key in keys:
+            if key in seen:
+                continue
+            seen.add(key)
+            item = self._short_index.get(key)
+            if isinstance(item, dict):
+                return key, item
+        for key, value in self._short_index.items():
+            if value.get("task_id") == ref:
+                return key, value
+        return None
+
+    def _resolve_ids(self, ref: str) -> tuple[str, str, str] | None:
+        found = self._resolve_index_entry(ref)
+        if not found:
             return None
+        _short, item = found
         task_id = _as_str(item.get("task_id"))
         sandbox_id = _as_str(item.get("sandbox_id"))
         if not task_id or not sandbox_id:
             return None
         return task_id, sandbox_id, self._bound_key_of(item, task_id=task_id, sandbox_id=sandbox_id)
+
+    def _follow_latest_on_sandbox(
+        self, task_id: str, sandbox_id: str, assigned_key: str
+    ) -> tuple[str, str, str, str]:
+        """续接必须接到该沙盒最新一轮，不能从祖先 interaction 分叉。"""
+        latest_short = self._latest_short_for_sandbox(sandbox_id)
+        user_short = self._short_for_task(task_id)
+        if not latest_short:
+            return task_id, sandbox_id, assigned_key, user_short
+        item = self._short_index.get(latest_short) or {}
+        latest_tid = _as_str(item.get("task_id"))
+        latest_sid = _as_str(item.get("sandbox_id")) or sandbox_id
+        if not latest_tid:
+            return task_id, sandbox_id, assigned_key, user_short or latest_short
+        latest_key = self._bound_key_of(
+            item, task_id=latest_tid, sandbox_id=latest_sid
+        )
+        return (
+            latest_tid,
+            latest_sid,
+            latest_key or assigned_key,
+            user_short or latest_short,
+        )
 
     def _latest_short_for_sandbox(self, sandbox_id: str) -> str:
         sandbox_id = _as_str(sandbox_id)
@@ -1120,7 +1219,14 @@ class AntigravitySandboxPlugin(Star):
             if _as_str(item.get("sandbox_id")) != sandbox_id:
                 continue
             ts = _parse_iso(_as_str(item.get("recorded_at")))
-            n = _parse_short_int(short) or -1
+            matched = CONTINUE_SHORT_RE.fullmatch(short)
+            if matched:
+                n = int(matched.group(1)) * (10**CONTINUE_SHORT_TIME_WIDTH) + int(
+                    matched.group(2)
+                )
+            else:
+                parsed = _parse_short_int(short)
+                n = (parsed * (10**CONTINUE_SHORT_TIME_WIDTH)) if parsed is not None else -1
             rank = (1 if ts is not None else 0, ts or fallback, n)
             if best_rank is None or rank > best_rank:
                 best_rank = rank
@@ -1142,28 +1248,75 @@ class AntigravitySandboxPlugin(Star):
 
     def _command_ack(self, receipt: HandlerReceipt) -> str:
         url_block = self._url_block(receipt)
+        if receipt.continue_blocked:
+            short = self._public_task_short(receipt) or self._short_for_task(
+                receipt.task_id
+            ) or "(未知)"
+            status = receipt.status or "unknown"
+            return (
+                f"taskid: {short}\n"
+                f"status: {status}\n"
+                f"上一轮尚未 completed，已自动取回并中止续接。完成后再 /agcontinue {short} <任务文本>"
+            )
+        if not receipt.ok:
+            text = receipt.text or "提交失败。"
+            if "回执超时" in text:
+                return "提交超时，未取得任务 id。详情见后台日志。" + url_block
+            first = text.split("\n", 1)[0]
+            if receipt.status:
+                return f"{first}\nstatus: {receipt.status}"
+            return first
         if not receipt.task_id:
             text = receipt.text or "提交失败。"
             if "回执超时" in text:
                 return "提交超时，未取得任务 id。详情见后台日志。" + url_block
             return text.split("\n", 1)[0]
         short = self._public_task_short(receipt)
-        return (
-            f"taskid: {short}\n"
-            f"status: {receipt.status or 'unknown'}\n"
-            f"挂载文件数: {receipt.source_count}"
-            f"{url_block}\n"
-            f"后续用 /agretrieve {short} 取回，\n"
-            f"/agcontinue {short} <任务文本> 续接任务。"
+        lines = [
+            f"taskid: {short}",
+            f"status: {receipt.status or 'unknown'}",
+            f"挂载文件数: {receipt.source_count}",
+        ]
+        if receipt.auto_retrieved:
+            lines.append("已自动取回上一轮（completed）后提交续接。")
+        if url_block:
+            lines.append(url_block.lstrip("\n"))
+        lines.extend(
+            [
+                f"后续用 /agretrieve {short} 取回，",
+                f"/agcontinue {short} <任务文本> 续接任务。",
+                CONTINUE_GATE_HINT,
+            ]
         )
+        return "\n".join(lines)
 
     def _llm_ack(self, receipt: HandlerReceipt) -> str:
         url_block = self._url_block(receipt)
+        if receipt.continue_blocked:
+            short = self._public_task_short(receipt) or self._short_for_task(
+                receipt.task_id
+            ) or "(未知)"
+            status = receipt.status or "unknown"
+            lines = [
+                "【续接已中止】",
+                f"taskid: {short}",
+                f"status: {status}",
+                "上一轮交互尚未 completed，已自动取回当前状态，未提交续接。",
+                "请等待 completed 后再调用 continue_sandbox_task。",
+            ]
+            output = (receipt.output or "").strip()
+            if output:
+                clipped = output if len(output) <= 800 else output[:800] + "\n…(截断)"
+                lines.extend(["", "当前 output_text:", clipped])
+            return "\n".join(lines)
         if not receipt.ok or not receipt.task_id:
             text = receipt.text or "提交失败。"
             if "回执超时" in text:
                 return "提交超时，未取得任务 id。详情见后台日志。" + url_block
-            return text.split("\n", 1)[0] + url_block
+            first = text.split("\n", 1)[0]
+            if receipt.status:
+                return f"{first}\nstatus: {receipt.status}" + url_block
+            return first + url_block
         short = self._public_task_short(receipt)
         lines = [
             "【Antigravity 沙盒任务已受理】",
@@ -1171,6 +1324,8 @@ class AntigravitySandboxPlugin(Star):
             f"status: {receipt.status or 'unknown'}",
             f"挂载文件数: {receipt.source_count}",
         ]
+        if receipt.auto_retrieved:
+            lines.append("已自动取回上一轮（completed）后提交续接。")
         if url_block:
             lines.append(url_block.lstrip("\n"))
         lines.extend(
@@ -1178,6 +1333,7 @@ class AntigravitySandboxPlugin(Star):
                 "",
                 f"后续调用 retrieve_sandbox_task，传入 task_id={short} 取回；"
                 f"调用 continue_sandbox_task，传入 task_id={short} 与 prompt 续接。",
+                CONTINUE_GATE_HINT,
                 "只使用短号 taskid，不要向用户发送内部长 ID。",
             ]
         )
@@ -1492,6 +1648,7 @@ class AntigravitySandboxPlugin(Star):
                 "",
                 f"短号 taskid: {short or '(未分配)'}",
                 "请注意：不要将内部长 task_id 和 sandbox_id 发送给用户。后续取回/续接只使用短号 taskid。",
+                CONTINUE_GATE_HINT,
                 "请根据产物类型自行判断：稍后下载并直接发送给用户，或让用户稍后访问上述地址。",
                 "提交工具不轮询；需要确认状态或读取最终回执时，再调用 retrieve_sandbox_task。",
             ]
@@ -1538,10 +1695,18 @@ class AntigravitySandboxPlugin(Star):
         if not prompt_str:
             return HandlerReceipt("续接交互失败: prompt 不能为空。", ok=False)
         resolved = self._resolve_ids(task_id)
+        overwrite_short = ""
         if resolved:
             task_id, sandbox_id, assigned_key = resolved
+            task_id, sandbox_id, assigned_key, overwrite_short = self._follow_latest_on_sandbox(
+                task_id, sandbox_id, assigned_key
+            )
         else:
             assigned_key = self._find_key_for(task_id=task_id, sandbox_id=sandbox_id) or ""
+            if sandbox_id:
+                task_id, sandbox_id, assigned_key, overwrite_short = (
+                    self._follow_latest_on_sandbox(task_id, sandbox_id, assigned_key)
+                )
         if not task_id or not sandbox_id:
             return HandlerReceipt(
                 "续接交互失败: 未找到该 taskid。请使用提交回执中的短号 taskid。",
@@ -1549,6 +1714,45 @@ class AntigravitySandboxPlugin(Star):
             )
         if ".." in task_id or ".." in sandbox_id or "\x00" in task_id + sandbox_id:
             return HandlerReceipt("续接交互失败: id 含非法路径字符。", ok=False)
+
+        gate_short = overwrite_short or self._short_for_task(task_id)
+        auto_retrieved = False
+        if not self._short_retrieved_completed(gate_short):
+            pre = await self._do_retrieve(
+                task_id=task_id, sandbox_id=sandbox_id, cancel_auto=True
+            )
+            if not pre.ok:
+                return HandlerReceipt(
+                    f"续接交互失败: 自动取回失败。\n{pre.text}",
+                    ok=False,
+                    task_id=pre.task_id or task_id,
+                    sandbox_id=pre.sandbox_id or sandbox_id,
+                    status=pre.status,
+                )
+            status = _as_str(pre.status).lower() or "unknown"
+            if status != "completed":
+                short_label = gate_short or self._short_for_task(pre.task_id) or "(未知)"
+                lines = [
+                    "【续接已中止】",
+                    f"短号 taskid: {short_label}",
+                    f"status: {pre.status or 'unknown'}",
+                    "上一轮交互尚未 completed，已自动取回当前状态，未提交续接。",
+                ]
+                output = (pre.output or "").strip()
+                if output:
+                    clipped = output if len(output) <= 800 else output[:800] + "\n…(截断)"
+                    lines.extend(["", "当前 output_text:", clipped])
+                return HandlerReceipt(
+                    "\n".join(lines),
+                    ok=False,
+                    task_id=pre.task_id or task_id,
+                    sandbox_id=pre.sandbox_id or sandbox_id,
+                    status=pre.status or "unknown",
+                    output=pre.output,
+                    steps=pre.steps,
+                    continue_blocked=True,
+                )
+            auto_retrieved = True
 
         stamp = _submit_stamp()
         expected_urls = self._expected_public_urls(output_files, stamp)
@@ -1609,6 +1813,7 @@ class AntigravitySandboxPlugin(Star):
             task_id=new_task_id,
             sandbox_id=returned_sandbox,
             previous_task_id=task_id,
+            overwrite_short=overwrite_short,
         )
         self._schedule_auto_retrieve(
             short, task_id=new_task_id, sandbox_id=returned_sandbox
@@ -1627,6 +1832,8 @@ class AntigravitySandboxPlugin(Star):
             f"model: {client.model_label}",
             f"background: {bg}",
         ]
+        if auto_retrieved:
+            lines.append("已自动取回上一轮（completed）后提交续接。")
         if stamped_names:
             lines.append("上传文件名已加提交时间戳前缀: " + ", ".join(stamped_names))
         if bg and (not output) and status in RUNNING_STATUS | {"", "unknown"}:
@@ -1643,6 +1850,7 @@ class AntigravitySandboxPlugin(Star):
                 "",
                 f"短号 taskid: {short or '(未分配)'}",
                 "请注意：不要将内部长 task_id 和 sandbox_id 发送给用户。后续取回/续接只使用短号 taskid。",
+                CONTINUE_GATE_HINT,
             ]
         )
         return HandlerReceipt(
@@ -1653,6 +1861,7 @@ class AntigravitySandboxPlugin(Star):
             source_count=0,
             output=output,
             expected_urls=expected_urls,
+            auto_retrieved=auto_retrieved,
         )
 
     async def handle_retrieve(
@@ -1719,6 +1928,7 @@ class AntigravitySandboxPlugin(Star):
             self._touch_sandbox(sandbox_id, status=status)
         if cancel_auto and short:
             self._cancel_auto_retrieve(short)
+            self._mark_short_retrieved(short, status)
         output = extract_output_text(data)
         steps = summarize_steps(data)
         lines = [
@@ -1796,7 +2006,7 @@ class AntigravitySandboxPlugin(Star):
         resolved = self._resolve_ids(task_ref)
         if not resolved:
             yield event.plain_result(
-                "未找到该 taskid。请使用提交回执中的 taskid，例如 /agretrieve 00512"
+                "未找到该 taskid。请使用提交回执中的 taskid，例如 /agretrieve 0001"
             )
             return
         task_id, sandbox_id, _assigned_key = resolved
@@ -1820,7 +2030,7 @@ class AntigravitySandboxPlugin(Star):
         resolved = self._resolve_ids(task_ref)
         if not resolved:
             yield event.plain_result(
-                "未找到该 taskid。请使用提交回执中的 taskid，例如 /agcontinue 00512 继续查"
+                "未找到该 taskid。请使用提交回执中的 taskid，例如 /agcontinue 0001 继续查"
             )
             return
         task_id, sandbox_id, _assigned_key = resolved
@@ -1847,7 +2057,8 @@ class AntigravitySandboxPlugin(Star):
             "  取回任务回执\n"
             "/agcontinue <taskid> <任务文本> [类型...]\n"
             "  在同一沙盒会话中续接；默认产出 result.md，末尾可指定类型。"
-            "续接后使用新的 taskid。续接不能再挂新文件。\n"
+            "续接后短号不变，覆盖为该沙盒最新一轮。续接不能再挂新文件。\n"
+            "  若上一轮尚未取回会先自动取回；status 不是 completed 则只返回当前状态、不续接。\n"
             "/agenvlist\n"
             "  管理员：列出当前项目沙盒环境数量与占用。\n"
             "/agencleanup [all]\n"
