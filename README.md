@@ -4,7 +4,7 @@ AstrBot 插件：用 Google **Antigravity** 托管智能体在云端沙盒里跑
 
 - 插件名：`astrbot_plugin_antigravity_sandbox`
 - 作者：珂夜
-- 版本：1.5.3
+- 版本：1.5.4
 - 需要 AstrBot `>=4.5.7,<5`
 
 ## 介绍
@@ -30,7 +30,7 @@ Google 提供了云端 Linux 沙盒智能体（Antigravity）。装好本插件�
 填写的是 **Google AI Studio** 的 Gemini API Key（不是 OpenAI Key）。
 
 - 免费层级大约每天 **100 次**调用，适合偶尔提交沙盒任务，不适合高频刷。
-- Key 只写在本插件设置里，不要发到聊天。
+- Key 只写在本插件设置里，不要发到聊天。任务绑定只保存指纹，不会把明文 Key 写进状态文件。
 - 可填多个 Key：按顺序轮询；遇到 401 / 403 / 普通 429 会换下一个。
 - Antigravity 属于预览能力，接口和配额可能变化。
 
@@ -74,6 +74,8 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | `env_auto_cleanup` | 默认开启：自动回收闲置沙盒，避免存储配额打满 |
 | `env_idle_ttl_hours` | 默认 24：闲置多久可回收 |
 | `env_cleanup_scope` | 建议保持 `tracked`（只删本插件建过的）。`all` 可能影响同一 Key 下其它工具 |
+
+运行时状态（短号索引、环境记录、自动取回队列）保存在 AstrBot 的 `data/plugin_data/astrbot_plugin_antigravity_sandbox/`。升级或重装插件不会覆盖这些数据。旧版本写在插件目录里的 `task_keys.json` / `task_index.json` / `env_meta.json` / `auto_retrieve.json` 会在启动时自动迁过去，并去掉明文 Key。
 
 
 

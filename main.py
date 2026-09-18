@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,7 +30,7 @@ from typing import Any
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
@@ -58,6 +61,13 @@ except ImportError:  # loaded as a loose main.py, not a package
         summarize_steps,
     )
 
+PLUGIN_NAME = "astrbot_plugin_antigravity_sandbox"
+STATE_FILES = (
+    "task_keys.json",
+    "task_index.json",
+    "env_meta.json",
+    "auto_retrieve.json",
+)
 ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 SHORT_INDEX_LIMIT = 2000
 SHORT_INDEX_DROP = 1000
@@ -144,6 +154,41 @@ def _as_str(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _looks_like_api_key(value: str) -> bool:
+    text = _as_str(value)
+    if not text or len(text) < 16:
+        return False
+    if text.startswith("AQ.") or text.startswith("AIza"):
+        return True
+    return "sha256:" not in text and len(text) >= 24 and " " not in text
+
+
+def _key_fingerprint(value: str) -> str:
+    text = _as_str(value)
+    if not text:
+        return ""
+    if text.startswith("sha256:"):
+        return text
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _chmod_secret(path: Path) -> None:
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
+def _write_json(path: Path, data: Any, *, secret: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    if secret:
+        _chmod_secret(path)
 
 
 def _now() -> datetime:
@@ -419,11 +464,13 @@ class AntigravitySandboxPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._data_dir = self._resolve_data_dir()
+        self._migrate_legacy_state_files()
         self._key_mapping: dict[str, str] = self._load_key_mapping()
         self._short_index: dict[str, dict[str, str]] = self._load_short_index()
         self._env_meta: dict[str, dict[str, str]] = self._load_env_meta()
         self._pending_retrieve: dict[str, dict[str, str]] = self._load_pending_retrieve()
-        self._persist_bound_keys()
+        self._scrub_persisted_secrets()
         self._cleanup_lock = asyncio.Lock()
         self._startup_task: asyncio.Task[None] | None = None
         self._auto_retrieve_task: asyncio.Task[None] | None = None
@@ -453,30 +500,123 @@ class AntigravitySandboxPlugin(Star):
         except Exception as e:
             logger.warning(f"启动时环境回收失败: {e}")
 
+    def _resolve_data_dir(self) -> Path:
+        try:
+            return Path(StarTools.get_data_dir(PLUGIN_NAME)).resolve()
+        except Exception:
+            from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+
+            path = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
+            path.mkdir(parents=True, exist_ok=True)
+            return path.resolve()
+
+    def _legacy_plugin_dir(self) -> Path:
+        return Path(__file__).resolve().parent
+
+    def _migrate_legacy_state_files(self) -> None:
+        src_dir = self._legacy_plugin_dir()
+        dst_dir = self._data_dir
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for name in STATE_FILES:
+            src = src_dir / name
+            dst = dst_dir / name
+            if not src.is_file():
+                continue
+            try:
+                if not dst.exists():
+                    shutil.copy2(src, dst)
+                    _chmod_secret(dst)
+                    logger.info(f"已迁移状态文件到 plugin_data: {name}")
+                src.unlink()
+                logger.info(f"已从插件目录移除状态文件: {name}")
+            except OSError as e:
+                logger.warning(f"迁移状态文件 {name} 失败: {e}")
+
     def _mapping_file(self) -> Path:
-        return Path(__file__).parent / "task_keys.json"
+        return self._data_dir / "task_keys.json"
 
     def _short_index_file(self) -> Path:
-        return Path(__file__).parent / "task_index.json"
+        return self._data_dir / "task_index.json"
 
     def _env_meta_file(self) -> Path:
-        return Path(__file__).parent / "env_meta.json"
+        return self._data_dir / "env_meta.json"
 
     def _pending_retrieve_file(self) -> Path:
-        return Path(__file__).parent / "auto_retrieve.json"
+        return self._data_dir / "auto_retrieve.json"
 
-    def _persist_bound_keys(self) -> None:
-        changed = False
+    def _configured_api_keys(self) -> list[str]:
+        cfg = self.config or {}
+        configured = cfg.get("gemini_api_keys") or []
+        if isinstance(configured, str):
+            configured = [configured]
+        keys = [_as_str(key) for key in configured if _as_str(key)]
+        legacy_key = _as_str(cfg.get("gemini_api_key"))
+        if legacy_key:
+            keys.append(legacy_key)
+        return list(dict.fromkeys(keys))
+
+    def _materialize_key(self, stored: str) -> str:
+        stored = _as_str(stored)
+        if not stored:
+            return ""
+        if _looks_like_api_key(stored) and not stored.startswith("sha256:"):
+            return stored
+        fp = _key_fingerprint(stored)
+        for key in self._configured_api_keys():
+            if _key_fingerprint(key) == fp:
+                return key
+        return ""
+
+    def _stored_key_ref(self, key: str) -> str:
+        key = _as_str(key)
+        if not key:
+            return ""
+        return _key_fingerprint(key)
+
+    def _scrub_persisted_secrets(self) -> None:
+        mapping_changed = False
+        index_changed = False
+        cleaned_mapping: dict[str, str] = {}
+        for ident, stored in self._key_mapping.items():
+            ident = _as_str(ident)
+            stored = _as_str(stored)
+            if not ident or not stored:
+                continue
+            ref = self._stored_key_ref(stored)
+            if not ref:
+                continue
+            if stored != ref:
+                mapping_changed = True
+            cleaned_mapping[ident] = ref
+        if cleaned_mapping != self._key_mapping:
+            self._key_mapping = cleaned_mapping
+            mapping_changed = True
+        for item in self._short_index.values():
+            stored = _as_str(item.get("key"))
+            if not stored:
+                continue
+            ref = self._stored_key_ref(stored)
+            if stored != ref:
+                if ref:
+                    item["key"] = ref
+                else:
+                    item.pop("key", None)
+                index_changed = True
+            elif not stored.startswith("sha256:"):
+                item["key"] = ref
+                index_changed = True
         for item in self._short_index.values():
             if _as_str(item.get("key")):
                 continue
-            key = _as_str(self._key_mapping.get(_as_str(item.get("task_id")))) or _as_str(
+            ref = _as_str(self._key_mapping.get(_as_str(item.get("task_id")))) or _as_str(
                 self._key_mapping.get(_as_str(item.get("sandbox_id")))
             )
-            if key:
-                item["key"] = key
-                changed = True
-        if changed:
+            if ref:
+                item["key"] = self._stored_key_ref(ref)
+                index_changed = True
+        if mapping_changed:
+            self._save_key_mapping()
+        if index_changed:
             self._save_short_index()
 
     def _load_key_mapping(self) -> dict[str, str]:
@@ -494,12 +634,18 @@ class AntigravitySandboxPlugin(Star):
     def _save_key_mapping(self) -> None:
         path = self._mapping_file()
         try:
+            sanitized: dict[str, str] = {}
+            for ident, stored in self._key_mapping.items():
+                ident = _as_str(ident)
+                ref = self._stored_key_ref(stored)
+                if ident and ref:
+                    sanitized[ident] = ref
+            self._key_mapping = sanitized
             if len(self._key_mapping) > 2000:
                 keys_to_del = list(self._key_mapping.keys())[:-2000]
                 for k in keys_to_del:
                     self._key_mapping.pop(k, None)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._key_mapping, f, ensure_ascii=False, indent=2)
+            _write_json(path, self._key_mapping, secret=True)
         except Exception as e:
             logger.warning(f"写入 task_keys.json 失败: {e}")
 
@@ -512,14 +658,14 @@ class AntigravitySandboxPlugin(Star):
         previous_task_id: str = "",
         overwrite_short: str = "",
     ) -> str:
-        key = _as_str(key)
-        if key:
+        stored = self._stored_key_ref(key)
+        if stored:
             updated = False
             if task_id:
-                self._key_mapping[task_id] = key
+                self._key_mapping[task_id] = stored
                 updated = True
             if sandbox_id:
-                self._key_mapping[sandbox_id] = key
+                self._key_mapping[sandbox_id] = stored
                 updated = True
             if updated:
                 self._save_key_mapping()
@@ -529,7 +675,7 @@ class AntigravitySandboxPlugin(Star):
                 task_id,
                 sandbox_id,
                 previous_task_id=previous_task_id,
-                key=key,
+                key=stored,
                 overwrite_short=overwrite_short,
             )
         return short
@@ -569,8 +715,7 @@ class AntigravitySandboxPlugin(Star):
                 )
                 for key, _ in ranked[: len(self._env_meta) - ENV_META_LIMIT]:
                     self._env_meta.pop(key, None)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._env_meta, f, ensure_ascii=False, indent=2)
+            _write_json(path, self._env_meta)
         except Exception as e:
             logger.warning(f"写入 env_meta.json 失败: {e}")
 
@@ -606,8 +751,7 @@ class AntigravitySandboxPlugin(Star):
     def _save_pending_retrieve(self) -> None:
         path = self._pending_retrieve_file()
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._pending_retrieve, f, ensure_ascii=False, indent=2)
+            _write_json(path, self._pending_retrieve)
         except Exception as e:
             logger.warning(f"写入 auto_retrieve.json 失败: {e}")
 
@@ -885,22 +1029,23 @@ class AntigravitySandboxPlugin(Star):
         }
 
     def _find_key_for(self, *, task_id: str = "", sandbox_id: str = "") -> str | None:
+        candidates: list[str] = []
         if task_id and task_id in self._key_mapping:
-            return self._key_mapping[task_id]
+            candidates.append(self._key_mapping[task_id])
         if sandbox_id and sandbox_id in self._key_mapping:
-            return self._key_mapping[sandbox_id]
+            candidates.append(self._key_mapping[sandbox_id])
         if task_id:
             for item in self._short_index.values():
                 if _as_str(item.get("task_id")) == task_id:
-                    key = _as_str(item.get("key"))
-                    if key:
-                        return key
+                    candidates.append(_as_str(item.get("key")))
         if sandbox_id:
             for item in self._short_index.values():
                 if _as_str(item.get("sandbox_id")) == sandbox_id:
-                    key = _as_str(item.get("key"))
-                    if key:
-                        return key
+                    candidates.append(_as_str(item.get("key")))
+        for stored in candidates:
+            key = self._materialize_key(stored)
+            if key:
+                return key
         return None
 
     def _forget_sandbox(self, sandbox_id: str, *, save: bool = True) -> bool:
@@ -963,7 +1108,7 @@ class AntigravitySandboxPlugin(Star):
                         "task_id": str(value["task_id"]),
                         "sandbox_id": str(value["sandbox_id"]),
                     }
-                    bound_key = _as_str(value.get("key"))
+                    bound_key = self._stored_key_ref(value.get("key"))
                     if bound_key:
                         item["key"] = bound_key
                     recorded_at = _as_str(value.get("recorded_at"))
@@ -984,8 +1129,16 @@ class AntigravitySandboxPlugin(Star):
     def _save_short_index(self) -> None:
         path = self._short_index_file()
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._short_index, f, ensure_ascii=False, indent=2)
+            for item in self._short_index.values():
+                stored = _as_str(item.get("key"))
+                if not stored:
+                    continue
+                ref = self._stored_key_ref(stored)
+                if ref:
+                    item["key"] = ref
+                else:
+                    item.pop("key", None)
+            _write_json(path, self._short_index, secret=True)
         except Exception as e:
             logger.warning(f"写入 task_index.json 失败: {e}")
 
@@ -1050,9 +1203,9 @@ class AntigravitySandboxPlugin(Star):
             "sandbox_id": sandbox_id,
             "recorded_at": recorded_at or _now_iso(),
         }
-        key = _as_str(key)
-        if key:
-            item["key"] = key
+        stored = self._stored_key_ref(key)
+        if stored:
+            item["key"] = stored
         return item
 
     def _copy_retrieve_meta(self, src: dict[str, str], dest: dict[str, str]) -> None:
@@ -1134,7 +1287,7 @@ class AntigravitySandboxPlugin(Star):
 
     def _bound_key_of(self, item: dict[str, str] | None, *, task_id: str = "", sandbox_id: str = "") -> str:
         item = item or {}
-        key = _as_str(item.get("key"))
+        key = self._materialize_key(item.get("key"))
         if key:
             return key
         return self._find_key_for(
@@ -1428,14 +1581,7 @@ class AntigravitySandboxPlugin(Star):
             max_tokens = int(cfg.get("max_total_tokens") or 0)
         except (TypeError, ValueError):
             max_tokens = 0
-        configured = cfg.get("gemini_api_keys") or []
-        if isinstance(configured, str):
-            configured = [configured]
-        keys = [str(key).strip() for key in configured if str(key).strip()]
-        legacy_key = _as_str(cfg.get("gemini_api_key"))
-        if legacy_key:
-            keys.append(legacy_key)
-        keys = list(dict.fromkeys(keys))
+        keys = self._configured_api_keys()
         return GeminiSandboxClient(
             api_keys=keys,
             default_model=_as_str(cfg.get("default_model")) or "auto",
