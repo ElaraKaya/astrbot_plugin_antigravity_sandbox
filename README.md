@@ -4,7 +4,7 @@ AstrBot 插件：用 Google **Antigravity** 托管智能体在云端沙盒里跑
 
 - 插件名：`astrbot_plugin_antigravity_sandbox`
 - 作者：珂夜
-- 版本：1.5.4
+- 版本：1.5.5
 - 需要 AstrBot `>=4.5.7,<5`
 
 ## 介绍
@@ -89,8 +89,8 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | `/agsubmit 任务内容` | 提交新沙盒任务 |
 | `/agretrieve <task_id> <sandbox_id>` | 取回执 |
 | `/agcontinue <sandbox_id> <上一轮 task_id> 续写内容` | 同沙盒续跑 |
-| `/agenvlist` | 查看本插件记录的环境 |
-| `/agencleanup` | 回收闲置环境（慎用 `all`） |
+| `/agenvlist` | 查看当前项目沙盒占用 |
+| `/agenvcleanup` | 回收闲置环境。加 `all` 扫整个项目；加短号（如 `0002`）立即删指定沙盒 |
 
 短号是四位数字（如 `0001`）。续接不换号，覆盖为该沙盒最新一轮；不能从更早的祖先 id 分叉。  
 续接前若未取回会先自动取回上一轮；`status` 不是 `completed` 则只返回当前状态、不续接。
@@ -114,9 +114,11 @@ Google 侧闲置环境不一定马上删，但项目**环境存储配额**容易
 Project environment storage quota exceeded
 ```
 
-所以插件会在启动时、下次新建任务前，按默认 24 小时 TTL 回收闲置环境；配额 429 时也会先清再建。
+所以插件会在启动时、下次新建任务前，按默认 24 小时 TTL 回收闲置环境；配额 429 时也会先清再建。每个 Key 还会先留最近 `env_keep_recent` 个（默认 2），方便续接。
 
-默认只动本插件跟踪过的沙盒。
+`/agenvcleanup` 不带参数：只扫本插件记录过、且已过 TTL / 不在最近保留里的闲置沙盒。  
+`/agenvcleanup all`：范围换成整个 Gemini 项目，TTL 和最近保留保护仍然生效，所以刚用过的也删不掉。  
+`/agenvcleanup 0002`：按短号立即删除对应沙盒，不受 TTL / 最近保留限制。
 
 ## 更新日志
 

@@ -1028,6 +1028,69 @@ class AntigravitySandboxPlugin(Star):
             "bytes_freed": bytes_freed,
         }
 
+    def _format_sweep_result(self, *, scope: str, result: dict[str, int]) -> str:
+        return (
+            f"环境回收完成（scope={scope}）\n"
+            f"列出 {result['listed']} 个，删除 {result['deleted']} 个，"
+            f"跳过 {result['skipped']} 个，失败 {result['failed']} 个，"
+            f"释放 {_fmt_bytes(result['bytes_freed'])}。\n"
+            "不带参数只扫本插件记录过的闲置沙盒；all 扫整个项目里可回收的。"
+            "两者都会跳过未过 TTL、正在跑、以及每个 Key 最近保留的。"
+            "要立刻删某个沙盒，用 /agenvcleanup <短号>。"
+        )
+
+    async def _delete_sandbox_target(self, ref: str) -> str:
+        ref = _as_str(ref)
+        sandbox_id = ""
+        short = ""
+        assigned_key = ""
+        found = self._resolve_index_entry(ref)
+        if found:
+            short, item = found
+            sandbox_id = _as_str(item.get("sandbox_id"))
+            assigned_key = self._bound_key_of(item, sandbox_id=sandbox_id)
+        elif SANDBOX_ID_RE.fullmatch(ref):
+            sandbox_id = ref.lower()
+            short = self._latest_short_for_sandbox(sandbox_id)
+            assigned_key = self._find_key_for(sandbox_id=sandbox_id) or ""
+        else:
+            return (
+                f"未找到 {ref}。"
+                "用法: /agenvcleanup、/agenvcleanup all、/agenvcleanup <短号>"
+            )
+        if not sandbox_id:
+            return f"短号 {short or ref} 没有绑定 sandbox。"
+        client = self._client()
+        keys = [assigned_key] if assigned_key else list(client.api_keys)
+        keys = [k for k in keys if k]
+        if not keys:
+            return "未配置 Gemini API Key。"
+        last_error = ""
+        missing = False
+        deleted = False
+        for key in keys:
+            try:
+                await client.delete_environment(sandbox_id, api_key=key)
+                deleted = True
+                break
+            except GeminiClientError as e:
+                msg = str(e)
+                last_error = msg
+                lowered = msg.lower()
+                if "404" in msg or "not_found" in lowered or "not found" in lowered:
+                    missing = True
+                continue
+            except Exception as e:
+                last_error = str(e)
+                continue
+        if not deleted and not missing:
+            return f"删除失败: {last_error or '未知错误'}"
+        self._forget_sandbox(sandbox_id)
+        label = short or f"{sandbox_id[:8]}…"
+        if deleted:
+            return f"已删除沙盒 {label}。"
+        return f"远端已不存在 {label}，已清本地记录。"
+
     def _find_key_for(self, *, task_id: str = "", sandbox_id: str = "") -> str | None:
         candidates: list[str] = []
         if task_id and task_id in self._key_mapping:
@@ -2207,9 +2270,10 @@ class AntigravitySandboxPlugin(Star):
             "  若上一轮尚未取回会先自动取回；status 不是 completed 则只返回当前状态、不续接。\n"
             "/agenvlist\n"
             "  管理员：列出当前项目沙盒环境数量与占用。\n"
-            "/agencleanup [all]\n"
-            "  管理员：回收闲置沙盒。默认只删本插件建过的；"
-            "all 清理整个 Gemini 项目里可回收的环境。\n"
+            "/agenvcleanup [all|短号]\n"
+            "  管理员：回收沙盒。不带参数只扫本插件建过且已闲置的；"
+            "all 扫整个 Gemini 项目里可回收的闲置环境（仍跳过未过 TTL、正在跑、最近保留的）。"
+            "指定短号（如 0002）立即删除该沙盒，不受闲置时间限制。\n"
             "/aghelp\n"
             "  查看本说明"
         )
@@ -2252,26 +2316,24 @@ class AntigravitySandboxPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("agencleanup")
-    async def agencleanup(self, event: AstrMessageEvent, scope: str = ""):
-        """回收闲置沙盒环境。默认 tracked；参数 all 清理整个项目。管理员指令。"""
-        raw = _as_str(scope).lower()
-        if raw and raw not in {"all", "tracked"}:
-            yield event.plain_result("用法: /agencleanup 或 /agencleanup all")
+    @filter.command("agenvcleanup")
+    async def agenvcleanup(self, event: AstrMessageEvent, target: str = ""):
+        """回收沙盒。默认 tracked；all 扫整个项目闲置环境；短号立即删除指定沙盒。管理员指令。"""
+        raw = _as_str(target).strip()
+        raw_l = raw.lower()
+        if raw_l in {"", "all", "tracked"}:
+            chosen = "all" if raw_l == "all" else (raw_l or self._env_cleanup_scope())
+            try:
+                result = await self._sweep_environments(scope=chosen, reason="command")
+            except Exception as e:
+                yield event.plain_result(f"环境回收失败: {e}")
+                return
+            yield event.plain_result(self._format_sweep_result(scope=chosen, result=result))
             return
-        chosen = "all" if raw == "all" else (raw or self._env_cleanup_scope())
         try:
-            result = await self._sweep_environments(scope=chosen, reason="command")
+            yield event.plain_result(await self._delete_sandbox_target(raw))
         except Exception as e:
-            yield event.plain_result(f"环境回收失败: {e}")
-            return
-        yield event.plain_result(
-            "环境回收完成"
-            f"（scope={chosen}）\n"
-            f"列出 {result['listed']} 个，删除 {result['deleted']} 个，"
-            f"跳过 {result['skipped']} 个，失败 {result['failed']} 个，"
-            f"释放 {_fmt_bytes(result['bytes_freed'])}。"
-        )
+            yield event.plain_result(f"删除沙盒失败: {e}")
 
     async def terminate(self):
         for task in (self._startup_task, self._auto_retrieve_task):
