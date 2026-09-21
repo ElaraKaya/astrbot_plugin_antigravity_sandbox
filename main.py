@@ -292,24 +292,30 @@ def _token_exts(token: str) -> list[str] | None:
 
 
 def _parse_command_prompt(raw: str, *, default_ext: str | None = "md") -> tuple[str, str]:
+    """Parse `/agsubmit [类型...] <任务文本>` / continue 的同类写法。
+
+    类型必须写在任务文本前面；吃完类型后，剩余字符串原样当任务文本
+    （只去掉两端空白，中间空格保留），避免从末尾剥类型时把最后一个词吃掉。
+    """
     text = _as_str(raw)
     default_files = f"result.{default_ext}" if default_ext else ""
     if not text:
         return "", default_files
-    parts = text.split()
+    rest = text
     groups: list[list[str]] = []
-    while parts:
-        parsed = _token_exts(parts[-1])
+    while rest:
+        parts = rest.split(None, 1)
+        parsed = _token_exts(parts[0])
         if not parsed:
             break
         groups.append(parsed)
-        parts.pop()
-    prompt = " ".join(parts).strip()
-    if not prompt or not groups:
-        return text, default_files
+        rest = parts[1] if len(parts) > 1 else ""
+    prompt = rest.strip()
+    if not groups:
+        return prompt, default_files
     exts: list[str] = []
     seen: set[str] = set()
-    for group in reversed(groups):
+    for group in groups:
         for ext in group:
             if ext in seen:
                 continue
@@ -1472,7 +1478,7 @@ class AntigravitySandboxPlugin(Star):
             return (
                 f"taskid: {short}\n"
                 f"status: {status}\n"
-                f"上一轮尚未 completed，已自动取回并中止续接。完成后再 /agcontinue {short} <任务文本>"
+                f"上一轮尚未 completed，已自动取回并中止续接。完成后再 /agcontinue {short} [类型...] <任务文本>"
             )
         if not receipt.ok:
             text = receipt.text or "提交失败。"
@@ -1500,7 +1506,7 @@ class AntigravitySandboxPlugin(Star):
         lines.extend(
             [
                 f"后续用 /agretrieve {short} 取回，",
-                f"/agcontinue {short} <任务文本> 续接任务。",
+                f"/agcontinue {short} [类型...] <任务文本> 续接任务。",
                 CONTINUE_GATE_HINT,
             ]
         )
@@ -2186,11 +2192,11 @@ class AntigravitySandboxPlugin(Star):
 
     @filter.command("agsubmit")
     async def agsubmit(self, event: AstrMessageEvent, prompt: GreedyStr):
-        """提交 Antigravity 沙盒任务。默认产出 md；末尾可写一种或多种类型，如 png 或 svg png。"""
+        """提交 Antigravity 沙盒任务。默认产出 md；类型写在任务文本前，如 png 或 svg png。"""
         prompt_text, output_files = _parse_command_prompt(str(prompt), default_ext="md")
         file_list = await self._collect_event_file_paths(event)
         if not prompt_text and not file_list:
-            yield event.plain_result("用法: /agsubmit <任务文本> [类型...]")
+            yield event.plain_result("用法: /agsubmit [类型...] <任务文本>")
             return
         if not prompt_text:
             prompt_text = "请查看已挂载到 /workspace 的用户附件并完成相应处理。"
@@ -2230,11 +2236,11 @@ class AntigravitySandboxPlugin(Star):
         task_ref: str = "",
         prompt: GreedyStr = "",
     ):
-        """在已有沙盒会话中续接任务: /agcontinue <taskid> <任务文本> [类型]"""
+        """在已有沙盒会话中续接任务: /agcontinue <taskid> [类型...] <任务文本>"""
         task_ref = str(task_ref).strip()
         prompt_text, output_files = _parse_command_prompt(str(prompt), default_ext="md")
         if not task_ref or not prompt_text:
-            yield event.plain_result("用法: /agcontinue <taskid> <任务文本> [类型...]")
+            yield event.plain_result("用法: /agcontinue <taskid> [类型...] <任务文本>")
             return
         resolved = self._resolve_ids(task_ref)
         if not resolved:
@@ -2257,15 +2263,16 @@ class AntigravitySandboxPlugin(Star):
         """查看 Antigravity 沙盒指令说明。"""
         yield event.plain_result(
             "Antigravity 沙盒指令：\n"
-            "/agsubmit <任务文本> [类型...]\n"
+            "/agsubmit [类型...] <任务文本>\n"
             "  提交新任务。默认产出 result.md。"
-            "末尾可指定一种或多种类型，例如：/agsubmit 查询今日新闻 png\n"
-            "  或：/agsubmit 查询今日新闻 svg png\n"
+            "类型写在任务文本前面，避免任务里的空格把内容截断。"
+            "例如：/agsubmit png 查询今日新闻\n"
+            "  或：/agsubmit svg png 查询今日新闻\n"
             "  可在本条消息附带图片/文件，或回复一条带图/文件的消息后再发送本指令。\n"
             "/agretrieve <taskid>\n"
             "  取回任务回执\n"
-            "/agcontinue <taskid> <任务文本> [类型...]\n"
-            "  在同一沙盒会话中续接；默认产出 result.md，末尾可指定类型。"
+            "/agcontinue <taskid> [类型...] <任务文本>\n"
+            "  在同一沙盒会话中续接；默认产出 result.md，类型同样写在任务文本前面。"
             "续接后短号不变，覆盖为该沙盒最新一轮。续接不能再挂新文件。\n"
             "  若上一轮尚未取回会先自动取回；status 不是 completed 则只返回当前状态、不续接。\n"
             "/agenvlist\n"

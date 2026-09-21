@@ -4,7 +4,7 @@ AstrBot 插件：用 Google **Antigravity** 托管智能体在云端沙盒里跑
 
 - 插件名：`astrbot_plugin_antigravity_sandbox`
 - 作者：珂夜
-- 版本：1.5.5
+- 版本：1.5.6
 - 需要 AstrBot `>=4.5.7,<5`
 
 ## 介绍
@@ -86,11 +86,21 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | 指令 | 作用 |
 | --- | --- |
 | `/aghelp` | 帮助 |
-| `/agsubmit 任务内容` | 提交新沙盒任务 |
-| `/agretrieve <task_id> <sandbox_id>` | 取回执 |
-| `/agcontinue <sandbox_id> <上一轮 task_id> 续写内容` | 同沙盒续跑 |
+| `/agsubmit [类型...] <任务文本>` | 提交新沙盒任务。默认产出 `result.md` |
+| `/agretrieve <taskid>` | 按短号取回执 |
+| `/agcontinue <taskid> [类型...] <任务文本>` | 同沙盒续跑 |
 | `/agenvlist` | 查看当前项目沙盒占用 |
 | `/agenvcleanup` | 回收闲置环境。加 `all` 扫整个项目；加短号（如 `0002`）立即删指定沙盒 |
+
+类型写在任务文本**前面**，任务文本可含空格，整段原样交给沙盒。例如：
+
+```text
+/agsubmit png 查询今日新闻
+/agsubmit svg png 画一张示意图
+/agcontinue 0001 html 把上一轮结果改成网页
+```
+
+不要把类型写在最后：解析器从前往后吃类型，后面全部当任务文本，避免空格截断或把任务末尾单词误当成类型丢掉。
 
 短号是四位数字（如 `0001`）。续接不换号，覆盖为该沙盒最新一轮；不能从更早的祖先 id 分叉。  
 续接前若未取回会先自动取回上一轮；`status` 不是 `completed` 则只返回当前状态、不续接。
