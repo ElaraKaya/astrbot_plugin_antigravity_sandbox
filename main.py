@@ -3807,6 +3807,13 @@ class AntigravitySandboxPlugin(Star):
             return by_name[0]
         return None
 
+    @staticmethod
+    def _chat_pull_blocked(match: dict[str, Any]) -> bool:
+        """聊天和指令不能拉出上传令牌。WebUI 下载不走这里。"""
+        path = _as_str(match.get("path")).replace("\\", "/").rstrip("/")
+        fname = _as_str(match.get("name")) or PurePosixPath(path).name
+        return fname.lower().endswith(".token") or path.lower().endswith(".token")
+
     async def handle_list_files(self, task_ref: str) -> str:
         try:
             return await asyncio.wait_for(
@@ -3933,6 +3940,8 @@ class AntigravitySandboxPlugin(Star):
         match = self._match_listed_file(files, name)
         if not match or _as_str(match.get("type")) == "directory":
             return MSG_FILE_MISSING, None, ""
+        if self._chat_pull_blocked(match):
+            return "该文件不能通过聊天或指令拉取。", None, ""
         size = int(match.get("size_bytes") or 0)
         if size > CHAT_PULL_MAX_BYTES:
             return MSG_FILE_TOO_LARGE, None, ""

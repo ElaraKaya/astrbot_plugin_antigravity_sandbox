@@ -410,6 +410,7 @@ class SourceTests(unittest.TestCase):
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_upload_file_bytes":
                 upload_src = ast.get_source_segment(MAIN.read_text(encoding="utf-8"), node) or ""
         self.assertNotIn("_ui_pull_sem", chat_src)
+        self.assertIn("_chat_pull_blocked", chat_src)
         self.assertIn("_ui_pull_sem", ui_src)
         self.assertIn("use_proxy=False", upload_src)
         text = MAIN.read_text(encoding="utf-8")
@@ -430,6 +431,8 @@ class SourceTests(unittest.TestCase):
         self.assertIn("/agls <任务编号>", text)
         self.assertIn("/agretrieve 或 /agr <任务编号>", text)
         self.assertIn("未完成任务无法续接", text)
+        self.assertIn("def _chat_pull_blocked", text)
+        self.assertIn('endswith(".token")', text)
         # 续接说明按新修订：默认 md 那句单独成行，附件提示另起一句
         self.assertIn(
             "  在同一沙盒会话中续接任务。不写类型时默认 md，并返回对应预期网址。\\n",
