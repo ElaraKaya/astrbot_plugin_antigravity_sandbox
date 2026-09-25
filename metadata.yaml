@@ -1,7 +1,7 @@
 name: astrbot_plugin_antigravity_sandbox
 display_name: Antigravity 沙盒任务
-desc: 向 Google Antigravity 托管智能体提交沙盒任务并取回产物
-version: 1.5.6
+desc: 向 Google Antigravity 托管智能体提交沙盒任务并取回产物；Dashboard 沙盒文件页支持浏览/下载/上传/删除
+version: "1.6"
 author: 珂夜
 repo: https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 astrbot_version: ">=4.5.7,<5"

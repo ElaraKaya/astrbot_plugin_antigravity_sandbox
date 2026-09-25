@@ -1,93 +1,176 @@
 {
-  "gemini_api_keys": {
-    "description": "Google Gemini API Key 列表",
-    "type": "list",
-    "hint": "支持填写多个 Key；每次请求按顺序轮询，遇到 401、403 或 429 自动尝试下一个。不会写入日志。",
+  "model": {
+    "description": "接入与模型",
+    "hint": "Gemini Key、沙盒型号，以及提交时带给 Interactions API 的参数。",
+    "type": "object",
     "items": {
-      "type": "string",
-      "description": "Gemini API Key"
-    },
-    "default": [],
-    "secret": true
+      "gemini_api_keys": {
+        "description": "Gemini API Key",
+        "type": "list",
+        "hint": "可填多个。按顺序轮询，遇到 401、403 或 429 自动换下一个。不会写入日志。",
+        "items": {
+          "type": "string",
+          "description": "Gemini API Key"
+        },
+        "default": [],
+        "secret": true
+      },
+      "default_model": {
+        "description": "底层模型",
+        "type": "string",
+        "hint": "写入 agent_config.model。auto 或留空时不发送该字段，由服务端默认路由。可填 gemini-3.8-flash 等模型名。",
+        "default": "auto"
+      },
+      "sandbox_agent": {
+        "description": "沙盒 agent 型号",
+        "type": "string",
+        "hint": "Interactions 请求的 agent 字段，默认 antigravity-preview-05-2026。Google 发布新沙盒版本后只改这里。不要填 gemini-* 模型名，底层模型填上面的「底层模型」。",
+        "default": "antigravity-preview-05-2026"
+      },
+      "submit_background": {
+        "description": "提交后立即返回",
+        "type": "bool",
+        "hint": "对应 background=true：立刻返回任务 id，稍后取回。关闭后提交会同步等待整段智能体循环，最长约 120 秒。",
+        "default": true
+      },
+      "max_total_tokens": {
+        "description": "单次 token 上限",
+        "type": "int",
+        "hint": "写入 agent_config.max_total_tokens，统计 input、output 与 thinking，不含 cached。0 表示不发送该字段。触达后 status 为 incomplete。",
+        "default": 0
+      },
+      "max_in_progress_per_key": {
+        "description": "单 Key 进行中任务上限",
+        "type": "int",
+        "hint": "每个 Gemini Key 同时处于 in_progress 的任务数，默认 1。只统计本地缓存。新建任务会换到仍有空闲的 Key；全部占满时先对相关短号 GET 刷新一次，仍无空闲则提示目前无空余沙盒分配。续接不换 Key，达到上限直接拒绝。",
+        "default": 1
+      }
+    }
   },
-  "default_model": {
-    "description": "Antigravity agent_config.model",
-    "type": "string",
-    "hint": "auto 或留空：不发送 model，省略 agent_config.model 由服务端默认路由（官方 2026-09-08 默认 gemini-3.8-flash）。可自定义填写任意模型名称，如 gemini-3.8-flash、gemini-3.7-flash 等。",
-    "default": "auto"
+  "network": {
+    "description": "网络代理",
+    "hint": "插件访问 Gemini 的出站代理。留空表示直连。图床 Webhook 不走这里，沙盒内部出网也无法被此代理覆盖。",
+    "type": "object",
+    "items": {
+      "proxy": {
+        "description": "HTTP 代理",
+        "type": "string",
+        "hint": "例如 http://127.0.0.1:7890。留空表示不使用代理。作用于本插件发起的 Gemini 请求，包括提交、取回、列文件和拉取。图床 Webhook 不走该代理。",
+        "default": ""
+      }
+    }
   },
-  "submit_background": {
-    "description": "提交时使用 background=true（立即返回 id，稍后取回）",
-    "type": "bool",
-    "hint": "官方 Interactions API 支持 background。关闭后提交会同步等待整段智能体循环（最长约 120 秒超时）。",
-    "default": true
+  "receipt": {
+    "description": "取回回执",
+    "hint": "控制取回结果怎么发到聊天。图片回执只用于状态为 completed 的取回。",
+    "type": "object",
+    "items": {
+      "image_receipt": {
+        "description": "图片回执",
+        "type": "bool",
+        "hint": "开启后，仅当取回回执状态为 completed（完成）且达到字数阈值时渲染成图片发送。进行中、失败或其它状态仍发文本。关闭后一律发文本。",
+        "default": true
+      },
+      "image_receipt_min_length": {
+        "description": "触发图片回执的最少字符数。开启图片回执且状态为 completed 时，仅当回执内容长度大于或等于此阈值时才会渲染成图片，否则保持纯文本发送。",
+        "type": "int",
+        "hint": "触发图片回执的最少字符数。开启图片回执且状态为 completed 时，仅当回执内容长度大于或等于此阈值时才会渲染成图片，否则保持纯文本发送。",
+        "default": 200
+      },
+      "truncate_chars": {
+        "description": "回执截断字符数",
+        "type": "int",
+        "hint": "文本回执超过该长度时截断，默认 2000。只有确定会发送图片回执时不截断，其余一律按此值截断。0 或负数表示不截断。",
+        "default": 2000
+      },
+      "receipt_template": {
+        "description": "渲染模板",
+        "type": "string",
+        "hint": "渲染回执图片所用的 t2i 模板名称（如 base、astrbot_vitepress、astrbot_powershell 或自定义模板名）。留空表示沿用 AstrBot 当前选中的模板。",
+        "default": ""
+      },
+      "auto_retrieve": {
+        "description": "1 小时后自动取回",
+        "type": "bool",
+        "hint": "提交或续接满 1 小时仍未手动取回时，后台查询一次并写日志，不推送到会话。手动取回会取消这次等待。",
+        "default": true
+      }
+    }
   },
-  "max_total_tokens": {
-    "description": "agent_config.max_total_tokens（0 表示不发送该字段）",
-    "type": "int",
-    "hint": "限制单次交互 token 总量（input+output+thinking，不含 cached）。触达后 status=incomplete。",
-    "default": 0
+  "image_host": {
+    "description": "图床上传",
+    "hint": "沙盒产物与插件生成的 md 走这里。关闭总开关后不再上传，地址和 Token 仍保留。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用上传图床",
+        "type": "bool",
+        "hint": "关闭后不挂载上传 Token、不要求沙盒上传文件，也不上传 md。重新打开即恢复。",
+        "default": true
+      },
+      "webhook_url": {
+        "description": "上传 Webhook 地址",
+        "type": "string",
+        "hint": "完整 POST 上传接口，例如 https://example.com/Webhook/upload。插件不会自动拼接路径。",
+        "default": ""
+      },
+      "public_base_url": {
+        "description": "公网访问基础地址",
+        "type": "string",
+        "hint": "用于拼接上传后的文件 URL，例如 https://example.com。",
+        "default": ""
+      },
+      "token": {
+        "description": "Bearer Token",
+        "type": "string",
+        "hint": "仅在提交任务时挂载为 /workspace/upload.token。不写日志、不回显。",
+        "default": "",
+        "secret": true
+      },
+      "prefix": {
+        "description": "默认上传目录",
+        "type": "string",
+        "hint": "例如 agysb。Agent 和插件上传文件时使用此目录。",
+        "default": "agysb"
+      }
+    }
   },
-  "upload_webhook_url": {
-    "description": "图床上传 Webhook 地址",
-    "type": "string",
-    "hint": "完整 POST 上传接口，例如 https://example.com/Webhook/upload。插件不会自动拼接路径。",
-    "default": ""
-  },
-  "upload_public_base_url": {
-    "description": "图床公网访问基础地址",
-    "type": "string",
-    "hint": "用于拼接上传后文件 URL，例如 https://example.com。",
-    "default": ""
-  },
-  "upload_token": {
-    "description": "图床 Bearer Token",
-    "type": "string",
-    "hint": "用户在此填写；仅在提交任务时挂载为 /workspace/upload.token，不写日志、不回显。",
-    "default": "",
-    "secret": true
-  },
-  "upload_prefix": {
-    "description": "图床默认上传目录",
-    "type": "string",
-    "hint": "例如 agysb。Agent 上传文件时使用此目录。",
-    "default": "agysb"
-  },
-  "env_auto_cleanup": {
-    "description": "自动回收闲置沙盒环境",
-    "type": "bool",
-    "hint": "启动时以及每次新建任务提交前，按 TTL 删除可回收的 environment，避免项目环境存储配额 429。2026-09-08 起。",
-    "default": true
-  },
-  "env_idle_ttl_hours": {
-    "description": "沙盒闲置多久后可回收（小时）",
-    "type": "int",
-    "hint": "从本插件最后一次 submit/retrieve/continue 或 Google last_accessed 起算。默认 24 小时，以便当天还能 /agcontinue。2026-09-08 起。",
-    "default": 24
-  },
-  "env_keep_recent": {
-    "description": "每个 Key 至少保留的最近沙盒数",
-    "type": "int",
-    "hint": "即使已过 TTL 也先留着，方便续接最近任务。按 last_accessed / last_used_at 取最新。2026-09-08 起。",
-    "default": 2
-  },
-  "env_cleanup_scope": {
-    "description": "自动回收范围",
-    "type": "string",
-    "hint": "tracked：只删本插件记录过的 sandbox_id。all：删除该 Gemini 项目里所有可回收环境（可能影响同一 Key 的其它工具）。2026-09-08 起。",
-    "options": ["tracked", "all"],
-    "default": "tracked"
-  },
-  "env_cleanup_on_quota": {
-    "description": "存储配额 429 时紧急回收并重试",
-    "type": "bool",
-    "hint": "遇到 Project environment storage quota exceeded 时，先在当前 Key 的项目里紧急删除闲置环境，再用同一把 Key 重试提交，而不是只换备用 Key。2026-09-08 起。",
-    "default": true
-  },
-  "auto_retrieve": {
-    "description": "提交/续接 1 小时后自动取回",
-    "type": "bool",
-    "hint": "任务产物会发布到公网链接，用户可能不手动取回。开启后，每次提交或续接满 1 小时若仍未被取回，后台自动查询一次状态并写日志，不推送到会话。手动取回会取消等待。默认开启。",
-    "default": true
+  "environment": {
+    "description": "沙盒环境回收",
+    "hint": "按闲置时间回收 environment，避免项目存储配额被打满。",
+    "type": "object",
+    "items": {
+      "auto_cleanup": {
+        "description": "自动回收闲置环境",
+        "type": "bool",
+        "hint": "启动时以及每次新建任务提交前，按闲置时间删除可回收的 environment。",
+        "default": true
+      },
+      "idle_ttl_hours": {
+        "description": "闲置多久可回收（小时）",
+        "type": "int",
+        "hint": "从本插件最后一次 submit、retrieve、continue，或 Google last_accessed 起算。默认 24 小时，方便当天继续 /agcontinue。",
+        "default": 24
+      },
+      "keep_recent": {
+        "description": "每个 Key 至少保留的最近沙盒数",
+        "type": "int",
+        "hint": "即使已过闲置时间也先留着，方便续接最近任务。按 last_accessed 或 last_used_at 取最新。",
+        "default": 2
+      },
+      "scope": {
+        "description": "自动回收范围",
+        "type": "string",
+        "hint": "tracked：只删本插件记录过的 sandbox。all：删除该 Gemini 项目里所有可回收环境，可能影响同一 Key 的其它工具。",
+        "options": ["tracked", "all"],
+        "default": "tracked"
+      },
+      "on_quota": {
+        "description": "配额打满时紧急回收并重试",
+        "type": "bool",
+        "hint": "遇到 Project environment storage quota exceeded 时，先在当前 Key 的项目里删除闲置环境，再用同一把 Key 重试提交。",
+        "default": true
+      }
+    }
   }
 }

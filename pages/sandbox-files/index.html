@@ -1,0 +1,1191 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>沙盒文件</title>
+  <style>
+    :root {
+      --font: "Noto Sans SC", "Roboto", system-ui, -apple-system, sans-serif;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      --radius: 10px;
+      --shadow: 0 1px 2px rgba(0,0,0,.06), 0 8px 24px rgba(0,0,0,.04);
+    }
+
+    html[data-theme="light"] {
+      --primary: #3c96ca;
+      --secondary: #2f86bd;
+      --success: #00c853;
+      --warning: #ffc107;
+      --error: #f44336;
+      --info: #03c9d7;
+      --bg: #ffffff;
+      --surface: #fff;
+      --lightprimary: #eef2f6;
+      --border: #d0d0d0;
+      --border-soft: #e8e8e8;
+      --text: #1b1c1d;
+      --text2: rgba(0,0,0,.66);
+      --muted: rgba(0,0,0,.45);
+      --chip: #ecf2faff;
+      --hover: rgba(60,150,202,.08);
+      --active: rgba(60,150,202,.14);
+      --progress-track: #e8eef3;
+      --code-bg: #ececec;
+    }
+
+    html[data-theme="dark"] {
+      --primary: #5ba4d4;
+      --secondary: #4a95c4;
+      --success: #52c41a;
+      --warning: #faad14;
+      --error: #ff4d4f;
+      --info: #03c9d7;
+      --bg: #1a1a1a;
+      --surface: #242424;
+      --lightprimary: #1a2e3d;
+      --border: #333333ee;
+      --border-soft: #2e2e2e;
+      --text: #e8eaed;
+      --text2: rgba(255,255,255,.72);
+      --muted: rgba(255,255,255,.45);
+      --chip: #2a2a2a;
+      --hover: rgba(91,164,212,.12);
+      --active: rgba(91,164,212,.2);
+      --progress-track: #2a3340;
+      --code-bg: #282833;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+
+    .topbar {
+      height: 56px; display: flex; align-items: center; justify-content: space-between;
+      padding: 0 20px; border-bottom: 1px solid var(--border); background: var(--surface);
+      gap: 12px;
+    }
+    .topbar h1 { margin: 0; font-size: 16px; font-weight: 600; }
+    .topbar .sub { color: var(--muted); font-size: 12px; margin-left: 8px; font-weight: 400; }
+    .top-actions { display: flex; align-items: center; gap: 8px; }
+
+    .content {
+      flex: 1; padding: 16px 20px 24px;
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      gap: 16px;
+      min-height: 0;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      display: flex; flex-direction: column;
+      min-height: 0;
+    }
+    .card-hd {
+      padding: 12px 14px; border-bottom: 1px solid var(--border-soft);
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      font-size: 13px; font-weight: 600;
+    }
+    .card-bd { padding: 12px 14px; overflow: auto; flex: 1; }
+
+    .btn {
+      appearance: none; border: 1px solid var(--border);
+      background: var(--surface); color: var(--text);
+      border-radius: 8px; padding: 7px 12px; font-size: 13px;
+      cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+      font-family: inherit; line-height: 1.2;
+    }
+    .btn:hover { background: var(--hover); border-color: var(--primary); }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+    .btn-primary:hover { filter: brightness(1.05); background: var(--primary); }
+    .btn-danger { color: var(--error); border-color: color-mix(in srgb, var(--error) 40%, var(--border)); }
+    .btn-danger-solid { background: var(--error); color: #fff; border-color: var(--error); }
+    .btn-sm { padding: 4px 8px; font-size: 12px; border-radius: 6px; }
+
+    .badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 11px; padding: 2px 8px; border-radius: 999px;
+      background: var(--chip); color: var(--text2); border: 1px solid var(--border-soft);
+    }
+    .badge.ok { color: var(--success); background: color-mix(in srgb, var(--success) 12%, transparent); border-color: color-mix(in srgb, var(--success) 30%, transparent); }
+    .badge.warn { color: var(--warning); background: color-mix(in srgb, var(--warning) 14%, transparent); }
+    .badge.run { color: var(--primary); background: var(--lightprimary); }
+    .badge.err { color: var(--error); background: color-mix(in srgb, var(--error) 12%, transparent); }
+
+    .task-list { display: flex; flex-direction: column; gap: 6px; }
+    .task {
+      border: 1px solid transparent; border-radius: 8px; padding: 10px 10px;
+      cursor: pointer; text-align: left; background: transparent; color: inherit; font-family: inherit;
+      width: 100%;
+    }
+    .task:hover { background: var(--hover); }
+    .task.on { background: var(--active); border-color: color-mix(in srgb, var(--primary) 35%, transparent); }
+    .task .id { font-family: var(--mono); font-size: 12px; color: var(--primary); }
+    .task .meta { font-size: 12px; color: var(--muted); margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .empty { color: var(--muted); font-size: 13px; padding: 18px 8px; text-align: center; line-height: 1.6; }
+
+    .toolbar {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      padding: 10px 14px; border-bottom: 1px solid var(--border-soft);
+      background: color-mix(in srgb, var(--surface) 92%, var(--lightprimary));
+    }
+    .path-bar {
+      font-family: var(--mono); font-size: 12px; color: var(--text2);
+      background: var(--code-bg); padding: 5px 10px; border-radius: 6px;
+      flex: 1; min-width: 160px; overflow-x: auto; white-space: nowrap;
+      display: inline-flex; align-items: center; gap: 3px; scrollbar-width: none;
+    }
+    .path-bar::-webkit-scrollbar { display: none; }
+    .path-seg {
+      cursor: pointer; padding: 2px 5px; border-radius: 4px; color: var(--text2);
+      transition: background .15s ease, color .15s ease;
+    }
+    .path-seg:hover { background: var(--hover); color: var(--primary); text-decoration: underline; }
+    .path-seg.cur { font-weight: 600; color: var(--text); cursor: default; }
+    .path-seg.cur:hover { background: transparent; text-decoration: none; }
+    .path-sep { color: var(--muted); user-select: none; }
+
+    table.files { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.files th {
+      text-align: left; font-weight: 600; color: var(--muted); font-size: 11px;
+      text-transform: uppercase; letter-spacing: .04em;
+      padding: 8px 10px; border-bottom: 1px solid var(--border-soft);
+      position: sticky; top: 0; background: var(--surface); z-index: 1;
+    }
+    table.files td {
+      padding: 9px 10px; border-bottom: 1px solid var(--border-soft); vertical-align: middle;
+    }
+    table.files tr:hover td { background: var(--hover); }
+    table.files .mono { font-family: var(--mono); font-size: 12px; }
+    table.files .name { display: flex; align-items: center; gap: 8px; }
+    .check { width: 16px; height: 16px; accent-color: var(--primary); }
+
+    .transfers {
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      max-height: 220px; overflow: auto;
+    }
+    .xfer {
+      padding: 10px 14px; border-bottom: 1px solid var(--border-soft);
+      display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; align-items: center;
+    }
+    .xfer .title { font-size: 13px; display: flex; gap: 8px; align-items: center; min-width: 0; }
+    .xfer .title span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .xfer .stats { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+    .bar {
+      grid-column: 1 / -1; height: 6px; border-radius: 999px; background: var(--progress-track); overflow: hidden;
+    }
+    .bar > i {
+      display: block; height: 100%; width: 0%;
+      background: linear-gradient(90deg, var(--secondary), var(--primary));
+      border-radius: inherit; transition: width .25s ease;
+    }
+    .bar.err > i { background: var(--error); }
+    .bar.done > i { background: var(--success); }
+    .bar.indeterminate > i {
+      width: 40% !important;
+      animation: slide 1.2s ease-in-out infinite;
+    }
+    @keyframes slide {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(280%); }
+    }
+
+    .drop {
+      margin: 0 14px 12px; border: 1.5px dashed var(--border);
+      border-radius: 8px; padding: 14px; text-align: center; color: var(--muted); font-size: 13px;
+      background: color-mix(in srgb, var(--lightprimary) 40%, transparent);
+    }
+    .drop.over { border-color: var(--primary); color: var(--primary); background: var(--active); }
+
+    .toast {
+      position: fixed; right: 20px; bottom: 20px; z-index: 50;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 14px; box-shadow: var(--shadow); font-size: 13px; max-width: 360px;
+      display: none; white-space: pre-wrap;
+    }
+    .toast.show { display: block; }
+
+    .modal-mask {
+      position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 60;
+      display: none; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal-mask.show { display: flex; }
+    .modal {
+      background: var(--surface); color: var(--text);
+      border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow);
+      max-width: 420px; width: 100%; padding: 18px 18px 14px;
+    }
+    .modal h3 { margin: 0 0 8px; font-size: 15px; }
+    .modal p { margin: 0 0 14px; color: var(--text2); font-size: 13px; line-height: 1.5; }
+    .modal .actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+    @media (max-width: 960px) {
+      .content { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div style="display:flex;align-items:baseline;min-width:0">
+      <h1 id="pageTitle">沙盒文件</h1>
+      <span class="sub" id="pageSub">浏览 · 下载 · 上传 · 删除沙盒</span>
+    </div>
+    <div class="top-actions">
+      <button class="btn btn-sm" id="btnReloadTasks" type="button">刷新任务</button>
+    </div>
+  </header>
+
+  <div class="content">
+    <section class="card">
+      <div class="card-hd">
+        <span>任务 / 环境</span>
+        <span class="badge" id="taskCount">0</span>
+      </div>
+      <div class="card-bd">
+        <div class="task-list" id="taskList"></div>
+      </div>
+    </section>
+
+    <section class="card" style="min-height:520px">
+      <div class="card-hd">
+        <span>文件</span>
+        <span class="badge run" id="envBadge">未选择</span>
+      </div>
+      <div class="toolbar">
+        <button class="btn btn-sm" id="btnRefresh" type="button" disabled>刷新</button>
+        <button class="btn btn-sm" id="btnUp" type="button" disabled title="返回上一级目录">⬆ 上级</button>
+        <button class="btn btn-sm btn-primary" id="btnDl" type="button" disabled>下载选中</button>
+        <label class="btn btn-sm" id="btnUploadLabel" style="cursor:pointer;opacity:.45;pointer-events:none">
+          上传
+          <input id="fileInput" type="file" multiple hidden />
+        </label>
+        <button class="btn btn-sm" id="btnToggleSys" type="button" style="display:none" title="折叠/展开根目录下的系统目录">系统目录: 折叠</button>
+        <button class="btn btn-sm btn-danger" id="btnDelete" type="button" disabled>删除沙盒</button>
+        <div class="path-bar" id="cwd">/workspace</div>
+        <span class="badge" id="selMeta">已选 0</span>
+      </div>
+      <div class="drop" id="dropzone">选择左侧沙盒后，拖拽文件到此处上传到 /workspace</div>
+      <div class="card-bd" style="padding-top:0">
+        <table class="files">
+          <thead>
+            <tr>
+              <th style="width:36px"><input class="check" type="checkbox" id="checkAll" /></th>
+              <th>名称</th>
+              <th style="width:88px">类型</th>
+              <th style="width:96px">大小</th>
+              <th style="width:120px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="fileBody"></tbody>
+        </table>
+        <div class="empty" id="fileEmpty" style="display:none">请选择左侧任务以加载文件</div>
+      </div>
+      <div class="transfers" id="transfers">
+        <div class="xfer" style="color:var(--muted);font-size:12px">传输队列空闲 · 并发上限 2 · 进度约 500ms 节流</div>
+      </div>
+    </section>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <div class="modal-mask" id="deleteModal" role="dialog" aria-modal="true">
+    <div class="modal">
+      <h3>确认删除沙盒？</h3>
+      <p id="deleteMsg">将删除远端环境并清理本地短号索引。此操作不可恢复。</p>
+      <div class="actions">
+        <button class="btn btn-sm" type="button" id="deleteCancel">取消</button>
+        <button class="btn btn-sm btn-danger-solid" type="button" id="deleteConfirm">确认删除</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <script>
+    const MAX_CONCURRENT = 2;
+    const PROGRESS_THROTTLE_MS = 500;
+
+    const state = {
+      bridge: null,
+      tasks: [],
+      taskIdx: -1,
+      files: [],
+      currentPath: "workspace",
+      hideSystemDirs: true,
+      selected: new Set(),
+      transfers: [],
+      active: 0,
+      toastTimer: null,
+      loadingFiles: false,
+      deleteStep: 0,
+    };
+
+    function $(id) { return document.getElementById(id); }
+
+    function applyThemeFromBridge(ctx) {
+      const dark = !!(ctx && ctx.isDark);
+      const theme = dark ? "dark" : "light";
+      document.documentElement.setAttribute("data-theme", theme);
+    }
+
+    function fmtSize(n) {
+      if (n == null || n === "" || Number(n) === 0) return "—";
+      const num = Number(n);
+      if (!Number.isFinite(num)) return "—";
+      const u = ["B", "KB", "MB", "GB"];
+      let i = 0; let v = num;
+      while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+      return (i === 0 ? v : v.toFixed(v >= 10 ? 1 : 2)) + " " + u[i];
+    }
+
+    function toast(msg) {
+      const el = $("toast");
+      el.textContent = String(msg || "");
+      el.classList.add("show");
+      clearTimeout(state.toastTimer);
+      state.toastTimer = setTimeout(() => el.classList.remove("show"), 2800);
+    }
+
+    function errMsg(e) {
+      if (!e) return "未知错误";
+      if (typeof e === "string") return e;
+      return e.message || String(e);
+    }
+
+    function statusBadge(s) {
+      const v = String(s || "idle").toLowerCase();
+      if (v === "running" || v === "in_progress" || v === "queued") {
+        return '<span class="badge run">运行中</span>';
+      }
+      if (v === "failed" || v === "cancelled" || v === "incomplete" || v === "budget_exceeded") {
+        return '<span class="badge err">' + escapeHtml(v) + '</span>';
+      }
+      if (v === "completed") return '<span class="badge ok">已完成</span>';
+      return '<span class="badge ok">空闲</span>';
+    }
+
+    function escapeHtml(s) {
+      return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
+
+    function currentTask() {
+      if (state.taskIdx < 0 || state.taskIdx >= state.tasks.length) return null;
+      return state.tasks[state.taskIdx];
+    }
+
+    const SYSTEM_ROOT_DIRS = new Set([
+      ".agents",
+      ".google",
+      "app",
+      "bin",
+      "bin.usr-is-merged",
+      "boot",
+      "dev",
+      "etc",
+      "home",
+      "lib",
+      "lib.usr-is-merged",
+      "lib64",
+      "lost+found",
+      "media",
+      "mnt",
+      "opt",
+      "proc",
+      "root",
+      "run",
+      "sbin",
+      "sbin.usr-is-merged",
+      "srv",
+      "sys",
+      "tmp",
+      "usr",
+      "var",
+      "www-data-home",
+    ]);
+
+    function normalizeRelPath(p) {
+      if (!p) return "";
+      return String(p).replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+    }
+
+    function getParentPath(p) {
+      const norm = normalizeRelPath(p);
+      if (!norm) return "";
+      const parts = norm.split("/").filter(Boolean);
+      parts.pop();
+      return parts.join("/");
+    }
+
+    function resolveDirPath(entryPath) {
+      const p = normalizeRelPath(entryPath);
+      if (!p) return "";
+      const cur = normalizeRelPath(state.currentPath);
+      if (!cur) return p;
+      if (p === cur || p.startsWith(cur + "/")) return p;
+      return `${cur}/${p}`;
+    }
+
+    function isSystemEntry(f) {
+      const p = fileApiPath(f);
+      const top = p.split("/")[0].trim();
+      return SYSTEM_ROOT_DIRS.has(top);
+    }
+
+    function navigateTo(p) {
+      state.currentPath = normalizeRelPath(p);
+      state.selected.clear();
+      loadFiles();
+    }
+
+    function renderBreadcrumbs() {
+      const cwdEl = $("cwd");
+      const norm = normalizeRelPath(state.currentPath);
+      if (!norm) {
+        cwdEl.innerHTML = `<span class="path-seg cur" title="根目录">/ (根目录)</span>`;
+        return;
+      }
+      const parts = norm.split("/").filter(Boolean);
+      let html = `<span class="path-seg" data-path="" title="返回根目录">/</span>`;
+      let accum = "";
+      for (let i = 0; i < parts.length; i++) {
+        accum += (accum ? "/" : "") + parts[i];
+        const isLast = i === parts.length - 1;
+        html += `<span class="path-sep">/</span><span class="path-seg ${isLast ? "cur" : ""}" data-path="${escapeHtml(accum)}" title="${escapeHtml(accum)}">${escapeHtml(parts[i])}</span>`;
+      }
+      cwdEl.innerHTML = html;
+      cwdEl.querySelectorAll(".path-seg:not(.cur)").forEach((el) => {
+        el.addEventListener("click", () => navigateTo(el.dataset.path));
+      });
+    }
+
+    function setFileControlsEnabled(on) {
+      $("btnRefresh").disabled = !on;
+      $("btnDelete").disabled = !on;
+      $("btnUp").disabled = !on || !normalizeRelPath(state.currentPath);
+      $("btnUploadLabel").style.opacity = on ? "1" : ".45";
+      $("btnUploadLabel").style.pointerEvents = on ? "auto" : "none";
+      $("btnDl").disabled = !on || state.selected.size === 0;
+    }
+
+    function renderTasks() {
+      $("taskCount").textContent = String(state.tasks.length);
+      if (!state.tasks.length) {
+        $("taskList").innerHTML = '<div class="empty">暂无沙盒任务。<br/>提交任务后会显示在这里。</div>';
+        return;
+      }
+      $("taskList").innerHTML = state.tasks.map((t, i) => {
+        const label = t.label || t.short || ((t.sandbox_id || "").slice(0, 8) + "…");
+        const sid = t.sandbox_id || "";
+        return `
+          <button type="button" class="task ${i === state.taskIdx ? "on" : ""}" data-i="${i}">
+            <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+              <span class="id">/${escapeHtml(t.short || label)}</span>
+              ${statusBadge(t.status)}
+            </div>
+            <div style="font-size:13px;margin-top:4px">${escapeHtml(label)}</div>
+            <div class="meta"><span>${escapeHtml(sid.slice(0, 8))}${sid.length > 8 ? "…" : ""}</span><span>${escapeHtml(t.source || "local")}</span></div>
+          </button>`;
+      }).join("");
+      $("taskList").querySelectorAll(".task").forEach((el) => {
+        el.addEventListener("click", () => {
+          state.taskIdx = Number(el.dataset.i);
+          state.selected.clear();
+          state.currentPath = "workspace";
+          renderTasks();
+          loadFiles();
+        });
+      });
+    }
+
+    function fileApiPath(f) {
+      let p = (f && (f.path || f.name)) || "";
+      p = String(p).replace(/^\/+/, "");
+      return p;
+    }
+
+    function renderFiles() {
+      const t = currentTask();
+      const empty = $("fileEmpty");
+      const btnToggleSys = $("btnToggleSys");
+      if (!t) {
+        $("envBadge").textContent = "未选择";
+        $("cwd").textContent = "/workspace";
+        $("fileBody").innerHTML = "";
+        empty.style.display = "block";
+        empty.textContent = "请选择左侧任务以加载文件";
+        setFileControlsEnabled(false);
+        $("selMeta").textContent = "已选 0";
+        if (btnToggleSys) btnToggleSys.style.display = "none";
+        $("dropzone").textContent = "选择左侧沙盒后，拖拽文件到此处上传";
+        return;
+      }
+      setFileControlsEnabled(true);
+      empty.style.display = "none";
+      const sid = t.sandbox_id || "";
+      $("envBadge").textContent = "env · " + (sid.slice(0, 12) + (sid.length > 12 ? "…" : ""));
+      renderBreadcrumbs();
+      $("selMeta").textContent = "已选 " + state.selected.size;
+      $("btnDl").disabled = state.selected.size === 0;
+      $("btnUp").disabled = !normalizeRelPath(state.currentPath);
+
+      const curDisplay = normalizeRelPath(state.currentPath) ? `/${normalizeRelPath(state.currentPath)}` : "/";
+      $("dropzone").textContent = `拖拽文件到此处上传到 ${curDisplay}`;
+
+      if (state.loadingFiles) {
+        $("fileBody").innerHTML = "";
+        empty.style.display = "block";
+        empty.textContent = "正在加载文件列表…";
+        if (btnToggleSys) btnToggleSys.style.display = "none";
+        return;
+      }
+
+      if (!state.files.length) {
+        $("fileBody").innerHTML = "";
+        empty.style.display = "block";
+        empty.textContent = "当前路径没有文件（或沙盒已过期）";
+        if (btnToggleSys) btnToggleSys.style.display = "none";
+        return;
+      }
+
+      const isRoot = !normalizeRelPath(state.currentPath);
+      let userEntries = [];
+      let sysEntries = [];
+
+      if (isRoot) {
+        for (const f of state.files) {
+          if (isSystemEntry(f)) {
+            sysEntries.push(f);
+          } else {
+            userEntries.push(f);
+          }
+        }
+      } else {
+        userEntries = [...state.files];
+      }
+
+      if (isRoot && sysEntries.length > 0) {
+        btnToggleSys.style.display = "inline-flex";
+        btnToggleSys.textContent = state.hideSystemDirs ? `系统目录: 折叠(${sysEntries.length})` : `系统目录: 展开(${sysEntries.length})`;
+      } else {
+        btnToggleSys.style.display = "none";
+      }
+
+      function renderRow(f, isSys) {
+        const path = fileApiPath(f);
+        const isDir = String(f.type || "").toLowerCase() === "directory" || String(f.type || "").toLowerCase() === "dir";
+        const checked = state.selected.has(path) ? "checked" : "";
+        const dis = isDir ? "disabled" : "";
+        const size = f.size_bytes != null ? f.size_bytes : f.size;
+        const targetDirPath = isDir ? resolveDirPath(path) : "";
+        const rowStyle = isSys ? 'style="opacity:.65"' : '';
+        const nameClass = isDir ? 'name row-enter' : 'name';
+        const nameCursor = isDir ? 'cursor:pointer;' : '';
+        const nameColor = isDir ? 'color:var(--primary);font-weight:600;' : '';
+        return `
+          <tr data-path="${escapeHtml(path)}" ${rowStyle}>
+            <td><input class="check row-check" type="checkbox" data-path="${escapeHtml(path)}" ${checked} ${dis} /></td>
+            <td>
+              <div class="${nameClass}" data-dir="${escapeHtml(targetDirPath)}" style="${nameCursor}">
+                ${isDir ? "📂" : "📄"} <span class="mono" style="${nameColor}">${escapeHtml(f.name || path)}</span>
+                ${isSys ? '<span class="badge" style="margin-left:4px;font-size:10px;opacity:.75">系统</span>' : ''}
+              </div>
+              <div class="mono" style="color:var(--muted);font-size:11px;margin-top:2px">${escapeHtml(path)}</div>
+            </td>
+            <td>${escapeHtml(isDir ? "directory" : (f.type || "file"))}</td>
+            <td class="mono">${fmtSize(size)}</td>
+            <td>
+              ${isDir
+                ? `<button class="btn btn-sm row-enter" type="button" data-dir="${escapeHtml(targetDirPath)}" title="进入目录">进入</button>`
+                : `<button class="btn btn-sm btn-primary row-dl" type="button" data-path="${escapeHtml(path)}" data-name="${escapeHtml(f.name || path)}">下载</button>`}
+            </td>
+          </tr>`;
+      }
+
+      let rowsHtml = userEntries.map((f) => renderRow(f, false)).join("");
+
+      if (isRoot && sysEntries.length > 0) {
+        if (state.hideSystemDirs) {
+          rowsHtml += `
+            <tr id="rowExpandSys" style="cursor:pointer;background:color-mix(in srgb, var(--surface) 92%, var(--chip));">
+              <td colspan="5" style="text-align:center;padding:12px 10px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--border-soft);">
+                📁 已折叠 ${sysEntries.length} 个系统目录/文件（.agents、usr、etc 等） · <span style="color:var(--primary);text-decoration:underline;font-weight:600">点击展开</span>
+              </td>
+            </tr>`;
+        } else {
+          rowsHtml += `
+            <tr id="rowCollapseSys" style="cursor:pointer;background:color-mix(in srgb, var(--surface) 92%, var(--chip));">
+              <td colspan="5" style="text-align:center;padding:8px 10px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--border-soft);">
+                📁 系统目录已展开（${sysEntries.length} 项） · <span style="color:var(--primary);text-decoration:underline">点击折叠</span>
+              </td>
+            </tr>`;
+          rowsHtml += sysEntries.map((f) => renderRow(f, true)).join("");
+        }
+      }
+
+      if (!rowsHtml) {
+        $("fileBody").innerHTML = "";
+        empty.style.display = "block";
+        empty.textContent = "当前路径没有可见文件";
+        return;
+      }
+
+      $("fileBody").innerHTML = rowsHtml;
+
+      const expEl = $("rowExpandSys");
+      if (expEl) expEl.addEventListener("click", () => { state.hideSystemDirs = false; renderFiles(); });
+      const colEl = $("rowCollapseSys");
+      if (colEl) colEl.addEventListener("click", () => { state.hideSystemDirs = true; renderFiles(); });
+
+      $("fileBody").querySelectorAll(".row-enter").forEach((el) => {
+        el.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const target = el.dataset.dir;
+          if (target != null) navigateTo(target);
+        });
+      });
+
+      $("fileBody").querySelectorAll(".row-check").forEach((c) => {
+        c.addEventListener("change", () => {
+          if (c.checked) state.selected.add(c.dataset.path);
+          else state.selected.delete(c.dataset.path);
+          $("selMeta").textContent = "已选 " + state.selected.size;
+          $("btnDl").disabled = state.selected.size === 0;
+          syncCheckAll();
+        });
+      });
+      $("fileBody").querySelectorAll(".row-dl").forEach((b) => {
+        b.addEventListener("click", () => enqueueDownload([{ path: b.dataset.path, name: b.dataset.name }]));
+      });
+      syncCheckAll();
+    }
+
+    function syncCheckAll() {
+      const isRoot = !normalizeRelPath(state.currentPath);
+      const visibleFiles = state.files.filter((f) => {
+        const t = String(f.type || "").toLowerCase();
+        if (t === "directory" || t === "dir") return false;
+        if (isRoot && state.hideSystemDirs && isSystemEntry(f)) return false;
+        return true;
+      });
+      const all = visibleFiles.length && visibleFiles.every((f) => state.selected.has(fileApiPath(f)));
+      $("checkAll").checked = !!all;
+      $("checkAll").indeterminate = state.selected.size > 0 && !all;
+    }
+
+    function renderTransfers() {
+      const box = $("transfers");
+      if (!state.transfers.length) {
+        box.innerHTML = `<div class="xfer" style="color:var(--muted);font-size:12px">传输队列空闲 · 并发上限 ${MAX_CONCURRENT} · 进度约 ${PROGRESS_THROTTLE_MS}ms 节流</div>`;
+        return;
+      }
+      box.innerHTML = state.transfers.map((x) => {
+        const pct = Math.round(x.pct || 0);
+        const barClass = x.status === "error" ? "err"
+          : x.status === "done" ? "done"
+          : (x.status === "running" && x.indeterminate) ? "indeterminate" : "";
+        const label = x.status === "queued" ? "排队"
+          : x.status === "running" ? (x.kind === "upload" ? "上传中" : "下载中")
+          : x.status === "done" ? "完成"
+          : x.status === "cancelled" ? "已取消" : "失败";
+        const canCancel = x.status === "queued" || x.status === "running";
+        return `
+          <div class="xfer" data-id="${x.id}">
+            <div class="title">
+              <span class="badge ${x.status === "done" ? "ok" : x.status === "error" ? "warn" : "run"}">${label}</span>
+              <span title="${escapeHtml(x.path)}">${escapeHtml(x.name)}</span>
+            </div>
+            <div>
+              ${canCancel ? `<button class="btn btn-sm btn-danger x-cancel" type="button" data-id="${x.id}">取消</button>` : ""}
+            </div>
+            <div class="stats">${x.indeterminate && x.status === "running" ? "…" : (pct + "%")} · ${escapeHtml(x.speed || "—")}</div>
+            <div class="bar ${barClass}"><i style="width:${pct}%"></i></div>
+          </div>`;
+      }).join("");
+      box.querySelectorAll(".x-cancel").forEach((b) => {
+        b.addEventListener("click", () => cancelTransfer(b.dataset.id));
+      });
+    }
+
+    function enqueueDownload(items) {
+      const t = currentTask();
+      if (!t) return;
+      const uniq = [];
+      const seen = new Set();
+      for (const it of items) {
+        const path = typeof it === "string" ? it : it.path;
+        if (!path || seen.has(path)) continue;
+        seen.add(path);
+        const f = state.files.find((x) => fileApiPath(x) === path);
+        const isDir = f && (String(f.type).toLowerCase() === "directory" || String(f.type).toLowerCase() === "dir");
+        if (isDir) continue;
+        uniq.push({
+          path,
+          name: (typeof it === "object" && it.name) || (f && f.name) || path.split("/").pop(),
+          size: f ? (f.size_bytes != null ? f.size_bytes : f.size) : 0,
+        });
+      }
+      if (!uniq.length) return;
+      for (const u of uniq) {
+        state.transfers.unshift({
+          id: "t" + Date.now() + Math.random().toString(16).slice(2, 6),
+          kind: "download",
+          path: u.path,
+          name: u.name,
+          size: u.size || 0,
+          loaded: 0,
+          pct: 0,
+          speed: "等待中",
+          status: "queued",
+          indeterminate: true,
+          cancelled: false,
+          sandbox_id: t.sandbox_id,
+        });
+      }
+      renderTransfers();
+      pumpQueue();
+      toast("已加入下载队列 " + uniq.length + " 个文件");
+    }
+
+    function enqueueUpload(fileList) {
+      const t = currentTask();
+      if (!t) {
+        toast("请先选择沙盒");
+        return;
+      }
+      const files = [...fileList];
+      if (!files.length) return;
+      const targetDir = normalizeRelPath(state.currentPath);
+      for (const file of files) {
+        const destPath = targetDir ? `${targetDir}/${file.name}` : file.name;
+        state.transfers.unshift({
+          id: "u" + Date.now() + Math.random().toString(16).slice(2, 6),
+          kind: "upload",
+          path: destPath,
+          name: file.name,
+          size: file.size || 0,
+          loaded: 0,
+          pct: 0,
+          speed: "等待中",
+          status: "queued",
+          indeterminate: true,
+          cancelled: false,
+          sandbox_id: t.sandbox_id,
+          file,
+        });
+      }
+      renderTransfers();
+      pumpQueue();
+      toast("已加入上传队列 " + files.length + " 个文件");
+    }
+
+    function pumpQueue() {
+      while (state.active < MAX_CONCURRENT) {
+        const next = state.transfers.find((x) => x.status === "queued");
+        if (!next) break;
+        startTransfer(next);
+      }
+    }
+
+    function attachCancelGate(x) {
+      let rejectFn = null;
+      const gate = new Promise((_, reject) => {
+        rejectFn = reject;
+      });
+      x._cancelGate = () => {
+        if (rejectFn) {
+          const err = new Error("cancelled");
+          err.code = "CANCELLED";
+          rejectFn(err);
+          rejectFn = null;
+        }
+      };
+      return gate;
+    }
+
+    async function startTransfer(x) {
+      if (x.cancelled) {
+        x.status = "cancelled";
+        renderTransfers();
+        return;
+      }
+      x.status = "running";
+      x.speed = x.kind === "upload" ? "上传中" : "连接中";
+      x.indeterminate = x.kind === "upload";
+      x.pct = x.kind === "upload" ? 15 : 0;
+      state.active += 1;
+      renderTransfers();
+      const started = performance.now();
+      const cancelGate = attachCancelGate(x);
+      let tick = null;
+      if (x.kind === "upload") {
+        tick = setInterval(() => {
+          if (x.status !== "running") return;
+          const now = performance.now();
+          if (now - (x.lastUi || 0) >= PROGRESS_THROTTLE_MS) {
+            x.pct = Math.min(90, (x.pct || 10) + 8);
+            x.lastUi = now;
+            renderTransfers();
+          }
+        }, PROGRESS_THROTTLE_MS);
+      }
+
+      try {
+        if (!state.bridge) throw new Error("Plugin bridge 未就绪");
+        let work;
+        if (x.kind === "upload") {
+          work = state.bridge.upload(
+            "sandbox-files/upload/" + encodeURIComponent(x.sandbox_id) + "?path=" + encodeURIComponent(x.path),
+            x.file
+          );
+        } else {
+          work = pullDownload(x, cancelGate);
+        }
+        if (x.kind === "upload") {
+          work.catch(() => {});
+          await Promise.race([work, cancelGate]);
+        } else {
+          await work;
+        }
+        if (x.cancelled) throw Object.assign(new Error("cancelled"), { code: "CANCELLED" });
+        const elapsed = (performance.now() - started) / 1000;
+        x.pct = 100;
+        x.status = "done";
+        x.indeterminate = false;
+        x.speed = elapsed > 0.05 ? ("耗时 " + elapsed.toFixed(1) + "s") : "完成";
+        if (x.kind === "upload") {
+          scheduleRefreshFiles();
+        }
+      } catch (e) {
+        if (x.cancelled || (e && e.code === "CANCELLED") || errMsg(e) === "cancelled") {
+          x.status = "cancelled";
+          x.indeterminate = false;
+          x.speed = "已取消";
+          toast("已终止 " + x.name);
+        } else {
+          x.status = "error";
+          x.indeterminate = false;
+          x.speed = "失败";
+          toast((x.kind === "upload" ? "上传失败: " : "下载失败: ") + errMsg(e));
+        }
+      } finally {
+        if (tick) clearInterval(tick);
+        if (x._sse && state.bridge) {
+          const sub = x._sse;
+          x._sse = "";
+          state.bridge.unsubscribeSSE(sub).catch(() => {});
+        }
+        x._cancelGate = null;
+        state.active = Math.max(0, state.active - 1);
+        renderTransfers();
+        pumpQueue();
+      }
+    }
+
+    function applyPullProgress(x, data) {
+      if (!data || data.job_id && x.jobId && data.job_id !== x.jobId) return;
+      const now = performance.now();
+      const terminal = data.status === "done" || data.status === "error" || data.status === "cancelled";
+      if (!terminal && now - (x.lastUi || 0) < PROGRESS_THROTTLE_MS) return;
+      x.lastUi = now;
+      x.loaded = data.loaded || 0;
+      x.pct = typeof data.pct === "number" ? data.pct : x.pct;
+      x.indeterminate = !data.total && data.status === "running";
+      x.speed = data.speed || x.speed;
+      if (data.status === "queued") x.speed = "排队";
+      if (terminal) x._sseFinal = data;
+      renderTransfers();
+    }
+
+    async function pullDownload(x) {
+      const started = await state.bridge.apiPost("sandbox-files/pull", {
+        sandbox_id: x.sandbox_id,
+        path: x.path,
+        size_bytes: x.size || 0,
+      });
+      const jobId = started && (started.job_id || started.jobId);
+      if (!jobId) throw new Error("没有拿到拉取任务");
+      x.jobId = jobId;
+      if (x.cancelled) {
+        await state.bridge.apiPost("sandbox-files/pull/cancel", { job_id: jobId });
+        throw Object.assign(new Error("cancelled"), { code: "CANCELLED" });
+      }
+      const done = new Promise((resolve, reject) => {
+        x._finishPull = (err, data) => (err ? reject(err) : resolve(data));
+      });
+      x._sse = await state.bridge.subscribeSSE("sandbox-files/pull/events", {
+        onMessage(ev) {
+          const data = ev.parsed && typeof ev.parsed === "object" ? ev.parsed : {};
+          applyPullProgress(x, data);
+          if (!x._sseFinal || !x._finishPull) return;
+          const st = x._sseFinal.status;
+          const finish = x._finishPull;
+          x._finishPull = null;
+          if (st === "done") finish(null, x._sseFinal);
+          else if (st === "cancelled") finish(Object.assign(new Error("cancelled"), { code: "CANCELLED" }));
+          else finish(new Error(x._sseFinal.message || "下载失败"));
+        },
+        onError() {
+          if (x._finishPull && !x._sseFinal) {
+            const finish = x._finishPull;
+            x._finishPull = null;
+            finish(new Error("进度连接中断"));
+          }
+        },
+      }, { job_id: jobId });
+      const finalData = await done;
+      if (x.cancelled) throw Object.assign(new Error("cancelled"), { code: "CANCELLED" });
+      await state.bridge.download("sandbox-files/pull/file", { job_id: jobId }, x.name);
+      return finalData;
+    }
+
+    let refreshTimer = null;
+    function scheduleRefreshFiles() {
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => loadFiles({ silent: true }), 600);
+    }
+
+    function cancelTransfer(id) {
+      const x = state.transfers.find((t) => t.id === id);
+      if (!x || (x.status !== "queued" && x.status !== "running")) return;
+      x.cancelled = true;
+      if (x.status === "queued") {
+        x.status = "cancelled";
+        x.speed = "已取消";
+        renderTransfers();
+        pumpQueue();
+        toast("已取消 " + x.name);
+        return;
+      }
+      if (x.jobId && state.bridge) {
+        state.bridge.apiPost("sandbox-files/pull/cancel", { job_id: x.jobId }).catch(() => {});
+      }
+      if (typeof x._cancelGate === "function") x._cancelGate();
+      if (x._finishPull) {
+        const finish = x._finishPull;
+        x._finishPull = null;
+        finish(Object.assign(new Error("cancelled"), { code: "CANCELLED" }));
+      }
+      renderTransfers();
+    }
+
+    function unwrapData(data) {
+      if (data == null) return data;
+      if (typeof data === "object" && data.data != null && (data.tasks == null) && (data.files == null)) {
+        return data.data;
+      }
+      return data;
+    }
+
+    async function loadTasks({ keepSelection = true } = {}) {
+      if (!state.bridge) return;
+      try {
+        const data = unwrapData(await state.bridge.apiGet("sandbox-files/tasks"));
+        const tasks = (data && data.tasks) || (Array.isArray(data) ? data : []) || [];
+        const prevId = keepSelection && currentTask() ? currentTask().sandbox_id : "";
+        state.tasks = Array.isArray(tasks) ? tasks : [];
+        if (prevId) {
+          const idx = state.tasks.findIndex((t) => t.sandbox_id === prevId);
+          state.taskIdx = idx >= 0 ? idx : (state.tasks.length ? 0 : -1);
+        } else {
+          state.taskIdx = state.tasks.length ? 0 : -1;
+        }
+        renderTasks();
+        if (state.taskIdx >= 0) await loadFiles({ silent: true });
+        else {
+          state.files = [];
+          state.selected.clear();
+          renderFiles();
+        }
+      } catch (e) {
+        toast("加载任务失败: " + errMsg(e));
+        state.tasks = [];
+        state.taskIdx = -1;
+        renderTasks();
+        renderFiles();
+      }
+    }
+
+    async function loadFiles({ silent = false } = {}) {
+      const t = currentTask();
+      if (!t || !state.bridge) {
+        state.files = [];
+        renderFiles();
+        return;
+      }
+      state.loadingFiles = true;
+      renderFiles();
+      try {
+        let reqPath = normalizeRelPath(state.currentPath);
+        let res;
+        try {
+          res = unwrapData(await state.bridge.apiGet("sandbox-files/files", {
+            sandbox_id: t.sandbox_id,
+            path: reqPath,
+            recursive: "1",
+          }));
+        } catch (err) {
+          const msg = errMsg(err).toLowerCase();
+          const isNotFound = msg.includes("404") || msg.includes("not_found") || msg.includes("not found") || msg.includes("不存在");
+          if (reqPath === "workspace" && isNotFound) {
+            reqPath = "";
+            state.currentPath = "";
+            res = unwrapData(await state.bridge.apiGet("sandbox-files/files", {
+              sandbox_id: t.sandbox_id,
+              path: "",
+              recursive: "1",
+            }));
+          } else {
+            throw err;
+          }
+        }
+        if (res && typeof res.path === "string") {
+          state.currentPath = normalizeRelPath(res.path);
+        }
+        state.files = (res && res.files) || [];
+        // drop selected paths that no longer exist
+        const alive = new Set(state.files.map(fileApiPath));
+        state.selected = new Set([...state.selected].filter((p) => alive.has(p)));
+        if (!silent) toast("已刷新文件列表");
+      } catch (e) {
+        state.files = [];
+        if (!silent) toast("加载文件失败: " + errMsg(e));
+      } finally {
+        state.loadingFiles = false;
+        renderFiles();
+      }
+    }
+
+    function openDeleteModal() {
+      const t = currentTask();
+      if (!t) return;
+      state.deleteStep = 1;
+      const label = t.short || t.label || t.sandbox_id;
+      $("deleteMsg").textContent = "即将删除沙盒「" + label + "」（" + (t.sandbox_id || "").slice(0, 12) + "…）。将移除远端环境并清理本地短号。请再次确认。";
+      $("deleteConfirm").textContent = "下一步";
+      $("deleteModal").classList.add("show");
+    }
+
+    function closeDeleteModal() {
+      state.deleteStep = 0;
+      $("deleteModal").classList.remove("show");
+      $("deleteConfirm").textContent = "确认删除";
+    }
+
+    async function confirmDelete() {
+      const t = currentTask();
+      if (!t) { closeDeleteModal(); return; }
+      if (state.deleteStep < 2) {
+        state.deleteStep = 2;
+        $("deleteMsg").textContent = "最后确认：删除后不可恢复。确定删除「" + (t.short || t.label || t.sandbox_id) + "」吗？";
+        $("deleteConfirm").textContent = "确定删除";
+        return;
+      }
+      $("deleteConfirm").disabled = true;
+      try {
+        const ref = t.short || t.sandbox_id;
+        const data = await state.bridge.apiPost("sandbox-files/delete", { ref });
+        const ok = data && data.ok;
+        toast((data && data.message) || (ok ? "已删除" : "删除未完成"));
+        closeDeleteModal();
+        state.files = [];
+        state.selected.clear();
+        state.taskIdx = -1;
+        await loadTasks({ keepSelection: false });
+      } catch (e) {
+        toast("删除失败: " + errMsg(e));
+      } finally {
+        $("deleteConfirm").disabled = false;
+      }
+    }
+
+    function wireEvents() {
+      $("checkAll").addEventListener("change", () => {
+        if ($("checkAll").checked) {
+          const isRoot = !normalizeRelPath(state.currentPath);
+          state.files.forEach((f) => {
+            const t = String(f.type || "").toLowerCase();
+            if (t === "directory" || t === "dir") return;
+            if (isRoot && state.hideSystemDirs && isSystemEntry(f)) return;
+            state.selected.add(fileApiPath(f));
+          });
+        } else {
+          state.selected.clear();
+        }
+        renderFiles();
+      });
+      $("btnDl").addEventListener("click", () => enqueueDownload([...state.selected]));
+      $("btnRefresh").addEventListener("click", () => loadFiles());
+      $("btnUp").addEventListener("click", () => navigateTo(getParentPath(state.currentPath)));
+      $("btnToggleSys").addEventListener("click", () => {
+        state.hideSystemDirs = !state.hideSystemDirs;
+        renderFiles();
+      });
+      $("btnReloadTasks").addEventListener("click", () => loadTasks());
+      $("btnDelete").addEventListener("click", openDeleteModal);
+      $("deleteCancel").addEventListener("click", closeDeleteModal);
+      $("deleteConfirm").addEventListener("click", confirmDelete);
+      $("deleteModal").addEventListener("click", (e) => {
+        if (e.target === $("deleteModal")) closeDeleteModal();
+      });
+      $("fileInput").addEventListener("change", (e) => {
+        enqueueUpload(e.target.files);
+        e.target.value = "";
+      });
+      const dz = $("dropzone");
+      ["dragenter", "dragover"].forEach((ev) => dz.addEventListener(ev, (e) => {
+        e.preventDefault(); dz.classList.add("over");
+      }));
+      ["dragleave", "drop"].forEach((ev) => dz.addEventListener(ev, (e) => {
+        e.preventDefault(); dz.classList.remove("over");
+      }));
+      dz.addEventListener("drop", (e) => enqueueUpload(e.dataTransfer.files));
+    }
+
+    async function waitForBridge(timeoutMs) {
+      const deadline = Date.now() + (timeoutMs || 8000);
+      while (Date.now() < deadline) {
+        const bridge = window.AstrBotPluginPage;
+        if (bridge && typeof bridge.ready === "function") return bridge;
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      return null;
+    }
+
+    async function boot() {
+      wireEvents();
+      renderTasks();
+      renderFiles();
+      renderTransfers();
+      const bridge = await waitForBridge(8000);
+      if (!bridge) {
+        toast("未检测到 AstrBot Plugin Page bridge，请在 Dashboard 插件页打开并硬刷新");
+        return;
+      }
+      state.bridge = bridge;
+      const ctx = await bridge.ready();
+      applyThemeFromBridge(ctx);
+      if (ctx && ctx.pageTitle) $("pageTitle").textContent = ctx.pageTitle;
+      if (typeof bridge.onContext === "function") {
+        bridge.onContext((next) => applyThemeFromBridge(next));
+      }
+      await loadTasks({ keepSelection: false });
+    }
+
+    boot().catch((e) => toast("初始化失败: " + errMsg(e)));
+  </script>
+</body>
+</html>
