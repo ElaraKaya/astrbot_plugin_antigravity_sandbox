@@ -7,7 +7,7 @@
       "gemini_api_keys": {
         "description": "Gemini API Key",
         "type": "list",
-        "hint": "可填多个。按顺序轮询，遇到 401、403 或 429 自动换下一个。不会写入日志。",
+        "hint": "可填多个。新建任务优先交给更空闲的 Key；剩余额度相同则用上一把的下一把。遇到 401、403 或 429 再换下一个仍有空闲的 Key。不会写入日志。",
         "items": {
           "type": "string",
           "description": "Gemini API Key"
@@ -42,7 +42,7 @@
       "max_in_progress_per_key": {
         "description": "单 Key 进行中任务上限",
         "type": "int",
-        "hint": "每个 Gemini Key 同时处于 in_progress 的任务数，默认 1。只统计本地缓存。新建任务会换到仍有空闲的 Key；全部占满时先对相关短号 GET 刷新一次，仍无空闲则提示目前无空余沙盒分配。续接不换 Key，达到上限直接拒绝。",
+        "hint": "每个 Gemini Key 同时处于 in_progress 的任务数，默认 1。只统计本地缓存。新建任务优先交给更空闲的 Key；剩余额度相同则提交到上一把 Key 的下一把。全部占满时先对相关短号 GET 刷新一次，仍无空闲则提示目前无空余沙盒分配。续接不换 Key，达到上限直接拒绝。",
         "default": 1
       }
     }

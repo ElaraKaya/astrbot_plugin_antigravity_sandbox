@@ -6,7 +6,7 @@ AstrBot 插件：用 Google **Antigravity** 托管智能体在云端沙盒里跑
 
 - 插件名：`astrbot_plugin_antigravity_sandbox`
 - 作者：珂夜
-- 版本：1.6.1
+- 版本：1.6.2
 - 需要 AstrBot `>=4.5.7,<5`
 
 ## 介绍
@@ -89,7 +89,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | 接入与模型 | `default_model` | 底层模型。默认 `auto`，一般不用改 |
 | 接入与模型 | `sandbox_agent` | 默认 `antigravity-preview-05-2026`。Google 发布新沙盒版本后只改这里，不要填 `gemini-*` 模型名 |
 | 接入与模型 | `submit_background` | 默认开启：提交后立刻回 ID，稍后取回 |
-| 接入与模型 | `max_in_progress_per_key` | 每个 Key 同时处于 `in_progress` 的任务上限，默认 1。新建任务换到空闲 Key；续接不换 Key |
+| 接入与模型 | `max_in_progress_per_key` | 每个 Key 同时处于 `in_progress` 的任务上限，默认 1。新建任务优先给更空闲的 Key；额度相同则轮到上一把的下一把。续接不换 Key |
 | 网络代理 | `proxy` | 插件访问 Gemini 的代理。留空直连。图床 Webhook 不走这里 |
 | 取回回执 | `image_receipt` | 图片回执。默认开启，仅对 status 为 `completed` 且达到字数阈值的取回生效；其它状态或字数不足时发纯文本 |
 | 取回回执 | `image_receipt_min_length` | 触发图片回执的最少字符数。默认 200。开启图片回执且 status 为 completed 时，仅当回执内容长度大于或等于此阈值时才会渲染成图片，否则保持纯文本发送。配置为 0 或负数时视为不限制长度（任意长度均转图） |
@@ -116,7 +116,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | 指令 | 作用 |
 | --- | --- |
 | `/aghelp` | 帮助 |
-| `/agsubmit` 或 `/ags` | 提交新沙盒任务。默认产出 `result.md`。进行中任务满了会换空闲 Key |
+| `/agsubmit` 或 `/ags` | 提交新沙盒任务。默认产出 `result.md`。优先用更空闲的 Key；进行中数量一样则换到上一把的下一把 |
 | `/agretrieve` 或 `/agr` | 按任务编号取回执。确定会发图片回执时不截断，其余按 `truncate_chars` |
 | `/agcontinue` 或 `/agc` | 同沙盒续跑，不换 Key。不写类型时默认 md 并返回预期网址。附件 PUT 进已有沙盒 |
 | `/agls <任务编号>` | 列出该沙盒 workspace 文件，渲染成表格图片发送 |
@@ -155,7 +155,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 
 插件会注册五个工具，对话里直接说「去沙盒做某某事」即可：
 
-- `submit_sandbox_task`：提交任务。Key 的进行中任务满了会换空闲 Key
+- `submit_sandbox_task`：提交任务。优先用更空闲的 Key；进行中数量一样则换到上一把的下一把
 - `retrieve_sandbox_task`：按短号取回。确定会发图片回执时插件直接把图片发给用户，工具只回简报
 - `continue_sandbox_task`：同沙盒续跑，不换 Key。附件 PUT 进 workspace，不走 interaction sources
 - `list_sandbox_task`：列出 workspace 文件
@@ -179,6 +179,8 @@ Project environment storage quota exceeded
 `/agenvcleanup 0002`：按短号立即删除对应沙盒，不受 TTL / 最近保留限制。
 
 ## 更新日志
+
+**1.6.2**：新建任务按各 Key 的进行中数量负载均衡。更空闲的优先；额度相同则提交到上一把 Key 的下一把。续接不换 Key。
 
 **1.6.1**：取回查询的 HTTP 500 并入超时 / 504 兜底，重试一次后仍失败则提示任务可能仍在跑。
 

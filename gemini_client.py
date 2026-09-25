@@ -239,6 +239,57 @@ def select_idle_keys(keys: list[str], counts: dict[str, int], limit: int) -> lis
     return idle
 
 
+def select_balanced_keys(
+    keys: list[str],
+    counts: dict[str, int],
+    limit: int,
+    current_key: str = "",
+) -> list[str]:
+    """Order a new submit: fewest in_progress first, then the key after current_key.
+
+    Keys at the cap are omitted. Ties keep a rotation through the configured
+    list, starting at the key immediately after current_key. With no current
+    key, equally idle keys stay in configured order. Later keys are fallbacks
+    for 401, 403, and 429.
+    """
+    try:
+        cap = int(limit)
+    except (TypeError, ValueError):
+        cap = DEFAULT_IN_PROGRESS_PER_KEY
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(key)
+    eligible: list[tuple[str, int]] = []
+    for key in ordered:
+        try:
+            count = int(counts.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count < cap:
+            eligible.append((key, count))
+    if not eligible:
+        return []
+    size = len(ordered)
+    current = (current_key or "").strip()
+    start = ordered.index(current) if current in ordered else -1
+
+    def rank(item: tuple[str, int]) -> tuple[int, int]:
+        key, count = item
+        index = ordered.index(key)
+        if start < 0:
+            rotation = index
+        else:
+            rotation = (index - start - 1) % size
+        return (count, rotation)
+
+    eligible.sort(key=rank)
+    return [key for key, _ in eligible]
+
+
 def clip_text(text: str, limit: int, *, keep_full: bool) -> str:
     """Truncate user-visible text. keep_full is only for a receipt that will be sent as an image."""
     body = text or ""

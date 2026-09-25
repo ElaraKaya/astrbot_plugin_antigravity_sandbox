@@ -77,7 +77,7 @@ try:
         files_error_kind,
         fixed_files_message,
         normalize_environment_file_path,
-        select_idle_keys,
+        select_balanced_keys,
         slim_environment_file_entry,
         summarize_steps,
         workspace_download_path,
@@ -116,7 +116,7 @@ except ImportError:  # loaded as a loose main.py, not a package
         files_error_kind,
         fixed_files_message,
         normalize_environment_file_path,
-        select_idle_keys,
+        select_balanced_keys,
         slim_environment_file_entry,
         summarize_steps,
         workspace_download_path,
@@ -133,6 +133,7 @@ STATE_FILES = (
     "task_index.json",
     "env_meta.json",
     "auto_retrieve.json",
+    "submit_key_cursor.json",
 )
 ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 SHORT_INDEX_LIMIT = 2000
@@ -1015,6 +1016,7 @@ class AntigravitySandboxPlugin(Star):
         self._data_dir = self._resolve_data_dir()
         self._migrate_legacy_state_files()
         self._key_mapping: dict[str, str] = self._load_key_mapping()
+        self._submit_key_fp = self._load_submit_key_cursor()
         self._short_index: dict[str, dict[str, str]] = self._load_short_index()
         self._env_meta: dict[str, dict[str, str]] = self._load_env_meta()
         self._pending_retrieve: dict[str, dict[str, str]] = self._load_pending_retrieve()
@@ -1954,9 +1956,57 @@ class AntigravitySandboxPlugin(Star):
         fp = self._stored_key_ref(key)
         return count_key_in_progress(list(self._short_index.values()), fp)
 
+    def _submit_key_cursor_file(self) -> Path:
+        return self._data_dir / "submit_key_cursor.json"
+
+    def _load_submit_key_cursor(self) -> str:
+        path = self._submit_key_cursor_file()
+        if not path.exists():
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.warning(f"读取 submit_key_cursor.json 失败: {e}")
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        raw = _as_str(data.get("key"))
+        return _key_fingerprint(raw) if raw else ""
+
+    def _save_submit_key_cursor(self) -> None:
+        fp = _as_str(self._submit_key_fp)
+        if not fp:
+            return
+        try:
+            _write_json(self._submit_key_cursor_file(), {"key": fp}, secret=True)
+        except Exception as e:
+            logger.warning(f"写入 submit_key_cursor.json 失败: {e}")
+
+    def _current_submit_key(self, keys: list[str]) -> str:
+        fp = _as_str(self._submit_key_fp)
+        if not fp:
+            return ""
+        for key in keys:
+            if self._stored_key_ref(key) == fp:
+                return key
+        return ""
+
+    def _remember_submit_key(self, key: str) -> None:
+        fp = self._stored_key_ref(key)
+        if not fp or fp == self._submit_key_fp:
+            return
+        self._submit_key_fp = fp
+        self._save_submit_key_cursor()
+
     def _idle_keys_from_cache(self, keys: list[str]) -> list[str]:
         counts = {key: self._in_progress_count(key) for key in keys}
-        return select_idle_keys(keys, counts, self._in_progress_limit())
+        return select_balanced_keys(
+            keys,
+            counts,
+            self._in_progress_limit(),
+            current_key=self._current_submit_key(keys),
+        )
 
     async def _refresh_in_progress_cache(self, client: GeminiSandboxClient) -> None:
         """GET each locally in_progress short once. Failures keep the old status."""
@@ -1979,7 +2029,7 @@ class AntigravitySandboxPlugin(Star):
             self._set_short_status(short, status)
 
     async def _idle_keys_for_new_task(self, client: GeminiSandboxClient) -> list[str]:
-        """Local cache first. Refresh once only when every key looks full."""
+        """Most-idle key first. Refresh once only when every key looks full."""
         keys = list(client.api_keys)
         idle = self._idle_keys_from_cache(keys)
         if idle:
@@ -2886,6 +2936,16 @@ class AntigravitySandboxPlugin(Star):
                     source_count=source_count,
                     expected_urls=expected_urls,
                 )
+            # 先记下这把 Key。额度相同的下一次提交才能轮到下一把，不用等本次 in_progress 写入缓存。
+            self._remember_submit_key(idle_keys[0])
+            try:
+                key_no = client.api_keys.index(idle_keys[0]) + 1
+            except ValueError:
+                key_no = 0
+            logger.info(
+                f"新建任务按负载分配到 Key #{key_no}"
+                f"（进行中 {self._in_progress_count(idle_keys[0])}/{self._in_progress_limit()}）"
+            )
             payload = client.build_create_payload(
                 prompt=_as_str(prompt),
                 new_sandbox=True,
@@ -2901,6 +2961,8 @@ class AntigravitySandboxPlugin(Star):
                 candidate_keys=idle_keys,
                 on_storage_quota=quota_hook,
             )
+            if used_key:
+                self._remember_submit_key(used_key)
         except GeminiSubmitTimeoutError as e:
             lines = [
                 "【Antigravity 沙盒提交回执超时】",

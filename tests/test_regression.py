@@ -41,6 +41,7 @@ from gemini_client import (  # noqa: E402
     environment_media_url,
     files_error_kind,
     fixed_files_message,
+    select_balanced_keys,
     select_idle_keys,
     slim_environment_file_entry,
     workspace_download_path,
@@ -118,6 +119,55 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(idle, ["key-b"])
         self.assertEqual(select_idle_keys(["key-a"], {"key-a": 1}, 1), [])
         self.assertEqual(MSG_NO_CAPACITY, "目前无空余沙盒分配")
+
+    def test_submit_balances_toward_idler_key_then_next_key(self):
+        keys = ["key-a", "key-b", "key-c"]
+        # 当前 Key 只剩 1 个额度（上限 3、进行中 2），换到更空闲的。
+        self.assertEqual(
+            select_balanced_keys(
+                keys,
+                {"key-a": 2, "key-b": 0, "key-c": 2},
+                3,
+                current_key="key-a",
+            )[0],
+            "key-b",
+        )
+        # 剩余额度相同：提交到当前 Key 的下一个，并绕回开头。
+        self.assertEqual(
+            select_balanced_keys(keys, {"key-a": 0, "key-b": 0, "key-c": 0}, 1, current_key="key-a"),
+            ["key-b", "key-c", "key-a"],
+        )
+        self.assertEqual(
+            select_balanced_keys(keys, {"key-a": 0, "key-b": 0, "key-c": 0}, 1, current_key="key-b")[0],
+            "key-c",
+        )
+        self.assertEqual(
+            select_balanced_keys(keys, {"key-a": 0, "key-b": 0, "key-c": 0}, 1, current_key="key-c")[0],
+            "key-a",
+        )
+        # 没有上一把时，同样空闲的 Key 保持配置顺序。
+        self.assertEqual(
+            select_balanced_keys(keys, {"key-a": 0, "key-b": 0, "key-c": 0}, 1),
+            ["key-a", "key-b", "key-c"],
+        )
+        # 已满的跳过，从当前 Key 后面继续转。
+        self.assertEqual(
+            select_balanced_keys(keys, {"key-a": 1, "key-b": 0, "key-c": 0}, 1, current_key="key-a"),
+            ["key-b", "key-c"],
+        )
+        self.assertEqual(
+            select_balanced_keys(
+                ["key-a", "", "key-a", "key-b"],
+                {"key-a": 0, "key-b": 0},
+                1,
+                current_key="key-a",
+            ),
+            ["key-b", "key-a"],
+        )
+        self.assertEqual(
+            select_balanced_keys(["key-a"], {"key-a": 1}, 1, current_key="key-a"),
+            [],
+        )
 
     def test_fixed_file_replies_are_distinct(self):
         self.assertEqual(fixed_files_message("env"), MSG_ENV_404)
