@@ -4,6 +4,7 @@ __pycache__/
 .ruff_cache/
 *.json
 !_conf_schema.json
+!.astrbot-plugin/i18n/*.json
 *.log
 .env
 *.bak*

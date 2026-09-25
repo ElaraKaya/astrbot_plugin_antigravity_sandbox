@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "display_name": "Antigravity Sandbox Tasks",
+    "short_desc": "Submit Antigravity sandbox tasks and retrieve outputs",
+    "desc": "Submit Google Antigravity managed-agent sandbox tasks and retrieve outputs. Includes a Dashboard Sandbox Files page for browse/download/upload/delete."
+  },
+  "pages": {
+    "sandbox-files": {
+      "title": "Sandbox Files",
+      "description": "Browse sandbox workspace files. Downloads show real progress, can be cancelled, and run two at a time."
+    }
+  }
+}

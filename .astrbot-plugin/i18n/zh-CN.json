@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "display_name": "Antigravity 沙盒任务",
+    "short_desc": "向 Google Antigravity 托管智能体提交沙盒任务并取回产物",
+    "desc": "向 Google Antigravity 托管智能体提交沙盒任务并取回产物。支持 Dashboard「沙盒文件」页面浏览、下载、上传与删除沙盒。"
+  },
+  "pages": {
+    "sandbox-files": {
+      "title": "沙盒文件",
+      "description": "浏览沙盒 workspace 文件。下载带真实进度，可取消，同时最多两路。"
+    }
+  }
+}
