@@ -1,5 +1,7 @@
 # Antigravity 沙盒任务
 
+目前 aistudio.google.com 对该沙盒 API 的免费层级，每日有 100 次免费调用额度。
+
 AstrBot 插件：用 Google **Antigravity** 托管智能体在云端沙盒里跑任务。提交后马上拿到任务 ID，需要时再取回结果。
 
 - 插件名：`astrbot_plugin_antigravity_sandbox`
@@ -48,7 +50,7 @@ API Key 不会下发到浏览器；服务端按沙盒绑定的 Key 访问 Gemini
 
 填写的是 **Google AI Studio** 的 Gemini API Key（不是 OpenAI Key）。
 
-- 免费层级大约每天 **100 次**调用，适合偶尔提交沙盒任务，不适合高频刷。
+- 免费层级每日 **100 次**调用，适合偶尔提交沙盒任务，不适合高频刷。
 - Key 只写在本插件设置里，不要发到聊天。任务绑定只保存指纹，不会把明文 Key 写进状态文件。
 - 可填多个 Key：按顺序轮询；遇到 401 / 403 / 普通 429 会换下一个。
 - Antigravity 属于预览能力，接口和配额可能变化。
