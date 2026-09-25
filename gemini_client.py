@@ -55,8 +55,9 @@ AUTO_MODEL_ALIASES = frozenset({"", "auto"})
 INLINE_PER_FILE_LIMIT = 1 * 1024 * 1024
 INLINE_TOTAL_LIMIT = 2 * 1024 * 1024
 SUBMIT_TIMEOUT = 30.0
-# 09 沙盒的取回 GET 会偶发 504/deadline_exceeded（任务仍在 Google 侧跑）。
-# 单个请求的超时压到 7s，超时/网关失败后原地重试一次；依旧失败才抛给上层。
+# 09 沙盒的取回 GET 会偶发 504/deadline_exceeded，以及 HTTP 500
+# Internal error encountered / api_error（任务仍在 Google 侧跑）。
+# 单个请求的超时压到 7s，超时、网关失败或 500 后原地重试一次；依旧失败才抛给上层。
 RETRIEVE_GET_TIMEOUT = 7.0
 RETRIEVE_GET_RETRIES = 1
 DOWNLOAD_TIMEOUT = 15 * 60.0
@@ -887,11 +888,17 @@ class GeminiSandboxClient:
                 last_query_error = GeminiRetrieveQueryError(
                     "查询任务超时或网络错误（可能仍在跑）"
                 )
+                preview = self._http_error_body_preview(resp)
                 if retrying:
                     logger.warning(
-                        f"查询任务 {attempt + 1}/{attempts} 命中网关失败，原地重试一次"
+                        f"查询任务 {attempt + 1}/{attempts} 命中网关失败"
+                        f"（HTTP {resp.status_code}），原地重试一次: {preview}"
                     )
                     continue
+                logger.warning(
+                    f"查询任务 {attempt + 1}/{attempts} 命中网关失败"
+                    f"（HTTP {resp.status_code}），已用尽重试: {preview}"
+                )
                 raise last_query_error
             return self._parse_json_response(resp, action="查询任务")
         # 循环只会在 raise 时退出；兜底以防 attempts 计算异常
@@ -901,10 +908,15 @@ class GeminiSandboxClient:
 
     @staticmethod
     def _is_retrieve_query_gateway_failure(resp: httpx.Response) -> bool:
-        """HTTP 504 / deadline_exceeded style failures when polling interaction."""
+        """Transient poll failures: HTTP 500/504, or deadline_exceeded.
+
+        500 here is Google's ``Internal error encountered`` / ``api_error`` on
+        interaction GET. The task state lives server-side, so the poll can be
+        retried. A 200 body may quote the same words and must not match.
+        """
         status = resp.status_code
         body = (resp.text or "").lower()
-        if status == 504:
+        if status in (500, 504):
             return True
         # Only on error responses — a 200 body may quote these strings (e.g. agent
         # edited this plugin's source) and must not be treated as a gateway failure.

@@ -6,7 +6,7 @@ AstrBot 插件：用 Google **Antigravity** 托管智能体在云端沙盒里跑
 
 - 插件名：`astrbot_plugin_antigravity_sandbox`
 - 作者：珂夜
-- 版本：1.6
+- 版本：1.6.1
 - 需要 AstrBot `>=4.5.7,<5`
 
 ## 介绍
@@ -179,6 +179,8 @@ Project environment storage quota exceeded
 `/agenvcleanup 0002`：按短号立即删除对应沙盒，不受 TTL / 最近保留限制。
 
 ## 更新日志
+
+**1.6.1**：取回查询的 HTTP 500 并入超时 / 504 兜底，重试一次后仍失败则提示任务可能仍在跑。
 
 **1.6**（接在 1.5.15 之后）：沙盒文件进度与并发、每 Key 进行中上限、续接 PUT、回执截断、出站代理、`/agls` 表格与 `/agget` 按路径拉取、短指令、帮助与回执文案、取回 7 秒超时并重试一次，以及后台任务自动 `store=true`。
 

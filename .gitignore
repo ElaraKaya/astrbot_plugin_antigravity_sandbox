@@ -10,3 +10,4 @@ __pycache__/
 *.bak*
 *.zip
 *.tar.gz
+data/

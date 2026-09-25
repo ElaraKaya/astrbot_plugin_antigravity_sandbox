@@ -340,6 +340,82 @@ class HttpTests(unittest.TestCase):
             _run(run())
         self.assertEqual(calls["n"], 2)
 
+    def test_retrieve_get_500_internal_error_retries_once_then_succeeds(self):
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(
+                    500,
+                    json={
+                        "error": {
+                            "message": "Internal error encountered.",
+                            "code": "api_error",
+                        }
+                    },
+                )
+            return httpx.Response(200, json={"id": "task1", "status": "completed"})
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["k"])
+
+        async def run():
+            return await client.get_interaction("task1", api_key="k")
+
+        data = _run(run())
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual(calls["n"], 2)
+
+    def test_retrieve_get_persistent_500_raises_query_error(self):
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(
+                500,
+                json={
+                    "error": {
+                        "message": "Internal error encountered.",
+                        "code": "api_error",
+                    }
+                },
+            )
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["k"])
+
+        async def run():
+            return await client.get_interaction("task1", api_key="k")
+
+        with self.assertRaises(GeminiRetrieveQueryError):
+            _run(run())
+        self.assertEqual(calls["n"], 2)
+
+    def test_retrieve_get_200_quoting_internal_error_is_not_gateway_failure(self):
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "id": "task1",
+                    "status": "completed",
+                    "output_text": (
+                        'HTTP 500: {"error":{"message":"Internal error encountered.",'
+                        '"code":"api_error"}}'
+                    ),
+                },
+            )
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["k"])
+
+        async def run():
+            return await client.get_interaction("task1", api_key="k")
+
+        data = _run(run())
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual(calls["n"], 1)
+
 
 class SourceTests(unittest.TestCase):
     def test_commands_aliases_and_tools(self):

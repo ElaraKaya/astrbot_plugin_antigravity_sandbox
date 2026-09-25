@@ -159,7 +159,7 @@ RETRIEVE_QUERY_FAIL_PREFIX = "取回失败（查询超时或网络错误）"
 
 
 def _retrieve_query_failure_message(short: str = "") -> str:
-    """User-facing receipt when interaction GET times out / network / 504."""
+    """User-facing receipt when interaction GET times out / network / 500 / 504."""
     short = (short or "").strip()
     retry = f"/agretrieve {short}" if short else "/agretrieve <short>"
     return (
@@ -183,6 +183,8 @@ def _is_retrieve_query_failure_text(text: str) -> bool:
         "deadline_exceeded",
         "deadline exceeded",
         "http 504",
+        "http 500",
+        "internal error encountered",
         "readtimeout",
         "connecttimeout",
         "timeoutexception",
@@ -3452,6 +3454,8 @@ class AntigravitySandboxPlugin(Star):
                 "timeout" in err
                 or "deadline" in err
                 or "504" in err
+                or "http 500" in err
+                or "internal error encountered" in err
                 or not str(e).strip()
             ):
                 fail_short = short or self._short_for_task(task_id)
