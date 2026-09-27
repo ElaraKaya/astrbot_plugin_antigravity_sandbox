@@ -6,7 +6,7 @@ AstrBot 插件：用 Google **Antigravity** 托管智能体在云端沙盒里跑
 
 - 插件名：`astrbot_plugin_antigravity_sandbox`
 - 作者：珂夜
-- 版本：1.6.2
+- 版本：1.6.3
 - 需要 AstrBot `>=4.5.7,<5`
 
 ## 介绍
@@ -17,7 +17,7 @@ Google 提供了云端 Linux 沙盒智能体（Antigravity）。装好本插件�
 2. **查询进度 / 取回文字回执**
 3. **在同一个沙盒里续跑**（不丢文件）
 
-产物建议让智能体直接传到你配置的图床；插件**不会**下载、解压整份环境快照。
+产物要求沙盒保存在工作空间，需要时用 `/agget` 拉取；图床开启时也可以让沙盒上传。插件**不会**下载、解压整份环境快照。
 无图床时也能够取回文本消息。
 
 相关链接：
@@ -95,10 +95,13 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | 取回回执 | `image_receipt_min_length` | 触发图片回执的最少字符数。默认 200。开启图片回执且 status 为 completed 时，仅当回执内容长度大于或等于此阈值时才会渲染成图片，否则保持纯文本发送。配置为 0 或负数时视为不限制长度（任意长度均转图） |
 | 取回回执 | `truncate_chars` | 文本回执截断字符数，默认 2000。只有确定会发图片回执时不截断 |
 | 取回回执 | `receipt_template` | 渲染模板。默认留空表示沿用 AstrBot 当前全局选中的模板，可指定 `base`、`astrbot_vitepress`、`astrbot_powershell` 或自定义模板名 |
+| 取回回执 | `sandbox_path_receipt` | 沙盒路径回执。默认开启。只决定提交、续接和取回的回执里写不写工作空间路径，以及 `/agget` 或 `get_sandbox_task` 提示。沙盒始终被要求把产物存到 `/workspace/` |
 | 取回回执 | `auto_retrieve` | 默认开启：提交或续接满 1 小时后后台查询一次，只写日志 |
-| 图床上传 | `enabled` | 启用上传图床。关闭后不挂载 Token、不上传文件，也不上传 md |
+| 图床上传 | `enabled` | 启用上传图床。关闭后不挂载 Token，也不要求沙盒上传。产物仍要求存到工作空间 |
 | 图床上传 | `webhook_url` | 图床上传地址（可选） |
-| 图床上传 | `public_base_url` | 图床公网基础地址（可选） |
+| 图床上传 | `public_base_url` | 图床公网基础地址（可选）。发给沙盒的地址用这个 |
+| 图床上传 | `receipt_base_url` | 回执基础地址。默认空。只替换回执链接的域名，空则用公网访问基础地址。QQ 群里频繁发送未备案域名，域名容易被标记 |
+| 图床上传 | `receipt_url` | 回执图床 URL。默认开启。关闭后回执不写图床链接。是否上传仍由总开关决定 |
 | 图床上传 | `token` | 图床 Token（可选，会挂到沙盒 `/workspace/upload.token`） |
 | 图床上传 | `prefix` | 默认上传目录，默认 `agysb` |
 | 沙盒环境回收 | `auto_cleanup` | 默认开启：自动回收闲置沙盒，避免存储配额打满 |
@@ -118,7 +121,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | `/aghelp` | 帮助 |
 | `/agsubmit` 或 `/ags` | 提交新沙盒任务。默认产出 `result.md`。优先用更空闲的 Key；进行中数量一样则换到上一把的下一把 |
 | `/agretrieve` 或 `/agr` | 按任务编号取回执。确定会发图片回执时不截断，其余按 `truncate_chars` |
-| `/agcontinue` 或 `/agc` | 同沙盒续跑，不换 Key。不写类型时默认 md 并返回预期网址。附件 PUT 进已有沙盒 |
+| `/agcontinue` 或 `/agc` | 同沙盒续跑，不换 Key。不写类型时默认 md，沙盒写入带时间戳的 `result.md`。附件 PUT 进已有沙盒 |
 | `/agls <任务编号>` | 列出该沙盒 workspace 文件，渲染成表格图片发送 |
 | `/agget <任务编号> <完整路径>` | 拉取文件发到聊天。超过 20MB 或 90 秒则中止 |
 | `/agenvlist` 或 `/agels` | 管理员：查看当前项目沙盒占用 |
@@ -137,7 +140,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 短号是四位数字（如 `0001`）。续接不换号，覆盖为该沙盒最新一轮；不能从更早的祖先 id 分叉。  
 续接前若未取回会先自动取回上一轮。上一轮已 `completed`、开启了图片回执且正文字数达标时，把回执图片直接发到聊天，否则发纯文本；`status` 不是 `completed` 则只返回当前状态、不续接。
 
-不写类型的续接不会再要求沙盒上传 `result.md`（避免复制旧报告交差），但会按 md 给出预期网址；取回 `completed` 且图床开启时，插件把本轮 `output_text` 做成带时间戳的 md 传到图床。续接附件用 PUT 写入已有环境，不走 interaction sources；没有后缀时按 `.md` 写入，某个文件失败不影响续接。聊天取回时，只有确定会发图片回执才不截断正文；否则按 `truncate_chars`（默认 2000）截断。渲染或发送失败时回退成截断后的纯文本。指定了 `html` / `png` 等类型时，仍由沙盒按该类型上传。
+不写类型时，提交和续接都默认产出 `result.md`。插件按这一轮的提交时间加上 `YYMMDDHHMMSS_` 前缀，并要求沙盒把产物保存到 `/workspace/` 下的这个文件名；md 写入本轮回复。图床总开关开启且 Webhook、公网地址、Token 齐全时，同时要求沙盒上传该文件。沙盒路径回执、回执图床 URL 两个开关只决定提交、续接和取回的回执里写不写路径或链接。回执里的图床链接可用「回执基础地址」换域名，发给沙盒的仍是公网访问基础地址。续接附件用 PUT 写入已有环境，不走 interaction sources；没有后缀时按 `.md` 写入，某个文件失败不影响续接。聊天取回时，只有确定会发图片回执才不截断正文；否则按 `truncate_chars`（默认 2000）截断。渲染或发送失败时回退成截断后的纯文本。写了 `html` / `png` 等类型时，沙盒按这些文件名保存，不再额外加一份 `result.md`。
 
 `/agls` 会把文件列表整理成表格图片发出来（目录在前、文件按大小降序），渲染失败时回退成原来的制表符文本。LLM 工具 `list_sandbox_task` 仍是文本列表，只保留 name / path / type / size_bytes。
 
@@ -157,7 +160,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 
 - `submit_sandbox_task`：提交任务。优先用更空闲的 Key；进行中数量一样则换到上一把的下一把
 - `retrieve_sandbox_task`：按短号取回。确定会发图片回执时插件直接把图片发给用户，工具只回简报
-- `continue_sandbox_task`：同沙盒续跑，不换 Key。附件 PUT 进 workspace，不走 interaction sources
+- `continue_sandbox_task`：同沙盒续跑，不换 Key。不写产出文件时默认 `result.md`。附件 PUT 进 workspace，不走 interaction sources
 - `list_sandbox_task`：列出 workspace 文件
 - `get_sandbox_task`：拉取单个文件。沙盒网络存疑，不一定能成功；超过 20MB 或 90 秒会中止
 
@@ -179,6 +182,8 @@ Project environment storage quota exceeded
 `/agenvcleanup 0002`：按短号立即删除对应沙盒，不受 TTL / 最近保留限制。
 
 ## 更新日志
+
+**1.6.3**：产物始终要求沙盒存到工作空间。图床开着才要求上传。去掉插件自己把回执文字上传成 md。新增沙盒路径回执、回执基础地址、回执图床 URL。
 
 **1.6.2**：新建任务按各 Key 的进行中数量负载均衡。更空闲的优先；额度相同则提交到上一把 Key 的下一把。续接不换 Key。
 

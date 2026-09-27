@@ -62,9 +62,15 @@
   },
   "receipt": {
     "description": "取回回执",
-    "hint": "控制取回结果怎么发到聊天。图片回执只用于状态为 completed 的取回。",
+    "hint": "控制回执怎么发到聊天。图片回执只用于状态为 completed 的取回。沙盒路径回执只决定回执里写不写工作空间路径。",
     "type": "object",
     "items": {
+      "sandbox_path_receipt": {
+        "description": "沙盒路径回执",
+        "type": "bool",
+        "hint": "开启后，提交、续接和取回的回执写上工作空间路径，并说明用 /agget 或 get_sandbox_task 拉取。关闭后回执不写路径。沙盒始终被要求把产物存到 /workspace 下，不受此开关影响。",
+        "default": true
+      },
       "image_receipt": {
         "description": "图片回执",
         "type": "bool",
@@ -99,13 +105,13 @@
   },
   "image_host": {
     "description": "图床上传",
-    "hint": "沙盒产物与插件生成的 md 走这里。关闭总开关后不再上传，地址和 Token 仍保留。",
+    "hint": "沙盒产物走这里。关闭总开关后不再要求上传，地址和 Token 仍保留。产物仍要求存到工作空间。",
     "type": "object",
     "items": {
       "enabled": {
         "description": "启用上传图床",
         "type": "bool",
-        "hint": "关闭后不挂载上传 Token、不要求沙盒上传文件，也不上传 md。重新打开即恢复。",
+        "hint": "关闭后不挂载上传 Token，也不要求沙盒上传图床。重新打开即恢复。沙盒仍会被要求把产物存到工作空间。",
         "default": true
       },
       "webhook_url": {
@@ -132,6 +138,18 @@
         "type": "string",
         "hint": "例如 agysb。Agent 和插件上传文件时使用此目录。",
         "default": "agysb"
+      },
+      "receipt_base_url": {
+        "description": "回执基础地址",
+        "type": "string",
+        "hint": "只替换回执里图床链接的域名，后面仍拼接上传目录和文件名。留空则使用公网访问基础地址。QQ 群中频繁发送未备案域名，域名容易被标记。不改变发给沙盒的公网地址。",
+        "default": ""
+      },
+      "receipt_url": {
+        "description": "回执图床 URL",
+        "type": "bool",
+        "hint": "开启后，提交、续接和取回的回执写上图床链接。关闭后不写。是否要求沙盒上传仍由「启用上传图床」决定。",
+        "default": true
       }
     }
   },

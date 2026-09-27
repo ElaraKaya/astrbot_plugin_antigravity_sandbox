@@ -30,6 +30,7 @@ import stat
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import astrbot.api.message_components as Comp
 import httpx
@@ -375,6 +376,7 @@ def grouped_config_from_flat(flat: dict[str, Any]) -> dict[str, Any]:
         },
         "receipt": {
             "image_receipt": True,
+            "sandbox_path_receipt": True,
             "image_receipt_min_length": _pick_flat(flat, "image_receipt_min_length", 200),
             "receipt_template": _as_str(_pick_flat(flat, "receipt_template", "")),
             "auto_retrieve": _as_bool(_pick_flat(flat, "auto_retrieve", True), True),
@@ -385,6 +387,8 @@ def grouped_config_from_flat(flat: dict[str, Any]) -> dict[str, Any]:
             "public_base_url": public_base,
             "token": _as_str(flat.get("upload_token")),
             "prefix": _as_str(_pick_flat(flat, "upload_prefix", "agysb")) or "agysb",
+            "receipt_base_url": "",
+            "receipt_url": True,
         },
         "environment": {
             "auto_cleanup": _as_bool(_pick_flat(flat, "env_auto_cleanup", True), True),
@@ -509,6 +513,12 @@ def _output_file_names(output_files: str) -> list[str]:
     return [x.strip() for x in _as_str(output_files).split(",") if x.strip()]
 
 
+def _default_output_files(output_files: str) -> str:
+    if _output_file_names(output_files):
+        return output_files
+    return "result.md"
+
+
 def _safe_upload_name(name: str) -> str:
     """把上传文件名清理成安全文件名，保留扩展名点号。
 
@@ -531,6 +541,48 @@ def _stamp_upload_name(name: str, stamp: str) -> str:
     if stamp and safe.startswith(f"{stamp}_"):
         return safe
     return f"{stamp}_{safe}" if stamp else safe
+
+
+def workspace_product_paths(names: list[str]) -> list[str]:
+    """沙盒工作空间里的预期产物路径，供 /agget 与 get_sandbox_task 使用。"""
+    paths: list[str] = []
+    for name in names:
+        cleaned = str(name or "").replace("\\", "/").strip().strip("/")
+        if not cleaned:
+            continue
+        paths.append("/workspace/" + cleaned.split("/")[-1])
+    return paths
+
+
+def swap_url_origin(url: str, receipt_base: str) -> str:
+    """只替换链接的域名。receipt_base 为空、或带了路径时，路径仍沿用原链接。"""
+    target = str(url or "").strip()
+    base = str(receipt_base or "").strip()
+    if not target or not base:
+        return target
+    if "://" not in base:
+        base = "https://" + base
+    new = urlsplit(base)
+    old = urlsplit(target)
+    if not new.netloc:
+        return target
+    scheme = new.scheme or old.scheme or "https"
+    return urlunsplit((scheme, new.netloc, old.path, old.query, old.fragment))
+
+
+def placement_instruction(paths: list[str]) -> str:
+    """要求沙盒把产物存到给出的工作空间路径。与图床开关无关。"""
+    cleaned = [str(path or "").strip() for path in paths if str(path or "").strip()]
+    if not cleaned:
+        return ""
+    lines = [
+        "【产物放置要求】将本轮产物保存到沙盒工作空间，路径必须严格使用：",
+        *cleaned,
+        "禁止改名，禁止放到其它目录。",
+    ]
+    if any(path.lower().endswith(".md") for path in cleaned):
+        lines.append("md 文件写入本轮回复内容，不要把上一轮已有报告复制后交差。")
+    return "\n\n" + "\n".join(lines)
 
 
 def sanitize_id_for_fs(raw: str, *, fallback: str = "unknown") -> str:
@@ -614,17 +666,6 @@ def _split_continue_rest(rest: str) -> tuple[str, str]:
     return task_ref, prompt_raw
 
 
-def _body_sha256(text: str) -> str:
-    return hashlib.sha256(_as_str(text).encode("utf-8")).hexdigest()
-
-
-def _is_md_only_outputs(output_files: str) -> bool:
-    names = _output_file_names(output_files)
-    if not names:
-        return False
-    return all(Path(name).suffix.lower() == ".md" for name in names)
-
-
 def _split_stored_urls(raw: str) -> list[str]:
     text = _as_str(raw).replace(",", "\n")
     urls: list[str] = []
@@ -633,6 +674,10 @@ def _split_stored_urls(raw: str) -> list[str]:
         if item.startswith(("http://", "https://")):
             urls.append(item)
     return urls
+
+
+def _split_stored_lines(raw: str) -> list[str]:
+    return [piece.strip() for piece in _as_str(raw).splitlines() if piece.strip()]
 
 
 def _is_image_blank(image_path: str) -> bool:
@@ -778,8 +823,8 @@ AGHELP_TEXT = (
     "/agretrieve 或 /agr <任务编号>\n"
     "  取回任务回执。确定会发图片回执时正文不截断；其余按配置字数截断。\n"
     "\n"
-    "/agcontinue 或 /agc [类型...] <任务文本>\n"
-    "  在同一沙盒会话中续接任务。不写类型时默认 md，并返回对应预期网址。\n"
+    "/agcontinue 或 /agc <任务编号> [类型...] <任务文本>\n"
+    "  在同一沙盒会话中续接任务。不写类型时默认 md，沙盒写入带时间戳的 result.md。\n"
     "  附件可用本条消息附带图片/文件，或回复一条带图/文件的消息后再发送本指令。\n"
     "  若上一轮尚未取回会先自动取回。未完成任务无法续接。\n"
     "\n"
@@ -814,6 +859,7 @@ class HandlerReceipt:
         source_count: int = 0,
         output: str = "",
         expected_urls: list[str] | None = None,
+        expected_paths: list[str] | None = None,
         steps: str = "",
         continue_blocked: bool = False,
         auto_retrieved: bool = False,
@@ -832,6 +878,7 @@ class HandlerReceipt:
         self.source_count = source_count
         self.output = output
         self.expected_urls = list(expected_urls or [])
+        self.expected_paths = list(expected_paths or [])
         self.steps = steps
         self.continue_blocked = continue_blocked
         self.auto_retrieved = auto_retrieved
@@ -845,7 +892,9 @@ class HandlerReceipt:
 
 SUBMIT_TOOL_DESC = (
 "在 Linux 沙盒环境中异步执行耗时任务、长脚本，或进行深度网络调研与复杂项目分析时调用此工具。\n"
-"支持传入指令并附带本地文件，返回任务编号 及产物预期公网地址。后续取回/续接只使用短号，不要向用户发送内部长 ID。\n"
+"支持传入指令并附带本地文件，返回任务编号。沙盒会把产物存到工作空间。"
+"回执是否附带预期路径和图床链接由插件配置决定。"
+"后续取回/续接只使用短号，不要向用户发送内部长 ID。\n"
 "主要触发场景：\n"
 "1. 深度调查与溯源：追查图片与文件来源、深度抓取与分析目标网站、检视开源项目源码等（此类深度任务优先于普通网页搜索调用）；\n"
 "2. 长时间后台任务：耗时计算、批量处理、编译运行或生成复杂文件。"
@@ -906,9 +955,9 @@ def _submit_parameters() -> dict:
                 "type": "string",
                 "description": (
                     "由调用方指定的任务产出原始文件名，逗号分隔；例如 "
-                    "result.jpg,report.pdf,archive.tar.gz。"
-                    "插件提交时自动加 YYMMDDHHMMSS_ 前缀（如 260901131456_new.docx），"
-                    "用于上传路径和预期公网地址，避免多次任务覆盖同一文件名。插件不替调用方决定后缀。"
+                    "result.jpg,report.pdf,archive.tar.gz。留空则默认 result.md。"
+                    "插件提交时自动加 YYMMDDHHMMSS_ 前缀，并要求沙盒保存到 "
+                    "/workspace/<时间戳文件名>。图床开启且配置齐全时同时要求上传。"
                 ),
             },
             "file_paths": {
@@ -961,9 +1010,9 @@ def _continue_parameters() -> dict:
             "output_files": {
                 "type": "string",
                 "description": (
-                    "本轮产出需上传到图床的文件名，逗号分隔；例如 "
-                    "result.jpg,report.pdf。插件自动加时间戳前缀。"
-                    "留空则默认 result.md，并返回对应预期网址。"
+                    "本轮产出文件名，逗号分隔；例如 result.jpg,report.pdf。"
+                    "留空则默认 result.md。插件自动加时间戳前缀，并要求沙盒保存到 "
+                    "/workspace/<时间戳文件名>。图床开启且配置齐全时同时要求上传。"
                 ),
             },
             "file_paths": {
@@ -1002,7 +1051,10 @@ def _get_parameters() -> dict:
             },
             "name": {
                 "type": "string",
-                "description": "要拉取的文件名或 workspace 相对路径。中文名按原样传入。",
+                "description": (
+                    "要拉取的文件名或工作空间路径，例如 /workspace/260927153045_result.md。"
+                    "中文名按原样传入。"
+                ),
             },
         },
         "required": ["task_id", "name"],
@@ -1885,38 +1937,36 @@ class AntigravitySandboxPlugin(Star):
         if last_status:
             dest["last_status"] = last_status
 
-    def _copy_md_meta(self, src: dict[str, str], dest: dict[str, str]) -> None:
-        for key in ("md_hash", "md_url", "md_name"):
-            val = _as_str(src.get(key))
-            if val:
-                dest[key] = val
-
     def _mark_round_outputs(
         self,
         short: str,
         *,
-        plugin_md: bool,
-        chat_reply: str,
         expected_urls: list[str] | None = None,
+        expected_paths: list[str] | None = None,
     ) -> None:
         short = _as_str(short)
         if not short or short not in self._short_index:
             return
         item = dict(self._short_index[short])
-        if plugin_md:
-            item["plugin_md"] = "1"
-        else:
-            item.pop("plugin_md", None)
-        reply = _as_str(chat_reply)
-        if reply:
-            item["chat_reply"] = reply
-        else:
-            item.pop("chat_reply", None)
+        for stale in (
+            "plugin_md",
+            "chat_reply",
+            "md_hash",
+            "md_url",
+            "md_name",
+            "md_plan_name",
+        ):
+            item.pop(stale, None)
         urls = [u for u in (expected_urls or []) if _as_str(u)]
         if urls:
             item["expected_urls"] = "\n".join(urls)
         else:
             item.pop("expected_urls", None)
+        paths = [p for p in (expected_paths or []) if _as_str(p)]
+        if paths:
+            item["expected_paths"] = "\n".join(paths)
+        else:
+            item.pop("expected_paths", None)
         self._short_index[short] = item
         self._save_short_index()
 
@@ -1927,16 +1977,6 @@ class AntigravitySandboxPlugin(Star):
         item = dict(self._short_index[short])
         cleaned = _as_str(status).lower() or "unknown"
         item["last_status"] = cleaned
-        self._short_index[short] = item
-        self._save_short_index()
-
-    def _remember_md_plan(self, short: str, name: str) -> None:
-        short = _as_str(short)
-        name = _as_str(name)
-        if not short or not name or short not in self._short_index:
-            return
-        item = dict(self._short_index[short])
-        item["md_plan_name"] = name
         self._short_index[short] = item
         self._save_short_index()
 
@@ -2037,10 +2077,6 @@ class AntigravitySandboxPlugin(Star):
         await self._refresh_in_progress_cache(client)
         return self._idle_keys_from_cache(keys)
 
-    def _round_chat_link_only(self, short: str) -> bool:
-        item = self._short_index.get(_as_str(short)) or {}
-        return _as_str(item.get("chat_reply")).lower() == "link"
-
     def _mark_short_retrieved(self, short: str, status: str) -> None:
         short = _as_str(short)
         if not short or short not in self._short_index:
@@ -2101,7 +2137,6 @@ class AntigravitySandboxPlugin(Star):
                 sandbox_id,
                 key=key or _as_str(old.get("key")),
             )
-            self._copy_md_meta(old, item)
             self._short_index[short] = item
             self._save_short_index()
             return short
@@ -2229,10 +2264,93 @@ class AntigravitySandboxPlugin(Star):
                 best_short = short
         return best_short
 
-    def _url_block(self, receipt: HandlerReceipt) -> str:
-        if not receipt.expected_urls:
-            return ""
-        return "\n预期公网地址:\n" + "\n".join(receipt.expected_urls)
+    def _path_receipt_enabled(self) -> bool:
+        return _as_bool(
+            self._setting("receipt", "sandbox_path_receipt", "sandbox_path_receipt", True),
+            True,
+        )
+
+    def _url_receipt_enabled(self) -> bool:
+        return _as_bool(
+            self._setting("image_host", "receipt_url", "receipt_url", True),
+            True,
+        )
+
+    def _receipt_base_url(self) -> str:
+        return _as_str(
+            self._setting("image_host", "receipt_base_url", "receipt_base_url", "")
+        )
+
+    def _visible_paths(self, paths: list[str] | None) -> list[str]:
+        if not self._path_receipt_enabled():
+            return []
+        return [_as_str(path) for path in (paths or []) if _as_str(path)]
+
+    def _visible_urls(self, urls: list[str] | None) -> list[str]:
+        if not self._url_receipt_enabled():
+            return []
+        base = self._receipt_base_url()
+        visible: list[str] = []
+        for url in urls or []:
+            text = _as_str(url)
+            if text:
+                visible.append(swap_url_origin(text, base))
+        return visible
+
+    def _product_lines(
+        self,
+        receipt: HandlerReceipt,
+        *,
+        for_llm: bool,
+        retrieve: bool,
+    ) -> list[str]:
+        paths = self._visible_paths(receipt.expected_paths)
+        urls = self._visible_urls(receipt.expected_urls)
+        lines: list[str] = []
+        short = self._public_task_short(receipt) if paths else ""
+        if paths:
+            lines.append("产物路径:" if retrieve else "预期文件路径:")
+            lines.extend(paths)
+            if short and short != "(未知)":
+                if for_llm:
+                    listed = "、".join(paths)
+                    lines.append(
+                        "需要文件时调用 get_sandbox_task，"
+                        f"task_id={short}，name 填路径：{listed}。"
+                    )
+                else:
+                    for path in paths:
+                        lines.append(f"/agget {short} {path}")
+        if urls:
+            lines.append("产物链接:" if retrieve else "预期公网地址:")
+            lines.extend(urls)
+        return lines
+
+    def _product_plain(
+        self,
+        receipt: HandlerReceipt,
+        *,
+        for_llm: bool,
+        retrieve: bool,
+    ) -> str:
+        return "\n".join(
+            self._product_lines(receipt, for_llm=for_llm, retrieve=retrieve)
+        )
+
+    def _stored_product_urls(self, item: dict[str, str]) -> list[str]:
+        md_url = _as_str(item.get("md_url"))
+        if md_url.startswith(("http://", "https://")):
+            return [md_url]
+        return _split_stored_urls(_as_str(item.get("expected_urls")))
+
+    def _stored_product_paths(self, item: dict[str, str]) -> list[str]:
+        stored = _split_stored_lines(_as_str(item.get("expected_paths")))
+        if stored:
+            return stored
+        name = _as_str(item.get("md_name"))
+        if name:
+            return workspace_product_paths([name])
+        return []
 
     def _public_task_short(self, receipt: HandlerReceipt) -> str:
         short = self._short_for_task(receipt.task_id)
@@ -2243,7 +2361,8 @@ class AntigravitySandboxPlugin(Star):
         return ""
 
     def _command_ack(self, receipt: HandlerReceipt) -> str:
-        url_block = self._url_block(receipt)
+        product = self._product_plain(receipt, for_llm=False, retrieve=False)
+        product_suffix = f"\n{product}" if product else ""
         if receipt.continue_blocked:
             short = self._public_task_short(receipt) or self._short_for_task(
                 receipt.task_id
@@ -2257,7 +2376,7 @@ class AntigravitySandboxPlugin(Star):
         if not receipt.ok:
             text = receipt.text or "提交失败。"
             if "回执超时" in text:
-                return "提交超时，未取得任务 id。详情见后台日志。" + url_block
+                return "提交超时，未取得任务 id。详情见后台日志。" + product_suffix
             if _is_retrieve_query_failure_text(text):
                 return text
             first = text.split("\n", 1)[0]
@@ -2267,7 +2386,7 @@ class AntigravitySandboxPlugin(Star):
         if not receipt.task_id:
             text = receipt.text or "提交失败。"
             if "回执超时" in text:
-                return "提交超时，未取得任务 id。详情见后台日志。" + url_block
+                return "提交超时，未取得任务 id。详情见后台日志。" + product_suffix
             return text.split("\n", 1)[0]
         short = self._public_task_short(receipt)
         lines = [
@@ -2277,8 +2396,8 @@ class AntigravitySandboxPlugin(Star):
         ]
         if receipt.auto_retrieved:
             lines.append("已自动取回上一轮（completed）后提交续接。")
-        if url_block:
-            lines.append(url_block.lstrip("\n"))
+        if product:
+            lines.append(product)
         if receipt.put_notes:
             lines.append("续接写入:")
             lines.extend(receipt.put_notes)
@@ -2292,10 +2411,18 @@ class AntigravitySandboxPlugin(Star):
         return "\n".join(lines)
 
     def _llm_ack(self, receipt: HandlerReceipt) -> str:
-        url_block = self._url_block(receipt)
+        product = self._product_plain(receipt, for_llm=True, retrieve=False)
+        product_suffix = f"\n{product}" if product else ""
         prefix = ""
         if receipt.pre_image_sent:
-            prefix = "【上一轮已自动取回】回执图片已直接发送给用户，无需重复其全文。\n\n"
+            prefix = "【上一轮已自动取回】回执图片已直接发送给用户，无需重复其全文。\n"
+            if receipt.pre_receipt is not None:
+                prev = self._product_plain(
+                    receipt.pre_receipt, for_llm=True, retrieve=True
+                )
+                if prev:
+                    prefix += prev + "\n"
+            prefix += "\n"
         elif receipt.pre_retrieve_reply:
             prefix = "【上一轮已自动取回】\n" + receipt.pre_retrieve_reply + "\n\n"
         if receipt.continue_blocked:
@@ -2319,13 +2446,13 @@ class AntigravitySandboxPlugin(Star):
         if not receipt.ok or not receipt.task_id:
             text = receipt.text or "提交失败。"
             if "回执超时" in text:
-                return prefix + "提交超时，未取得任务 id。详情见后台日志。" + url_block
+                return prefix + "提交超时，未取得任务 id。详情见后台日志。" + product_suffix
             if _is_retrieve_query_failure_text(text):
-                return prefix + text + url_block
+                return prefix + text + product_suffix
             first = text.split("\n", 1)[0]
             if receipt.status:
-                return prefix + f"{first}\nstatus: {receipt.status}" + url_block
-            return prefix + first + url_block
+                return prefix + f"{first}\nstatus: {receipt.status}" + product_suffix
+            return prefix + first + product_suffix
         short = self._public_task_short(receipt)
         lines = [
             "【Antigravity 沙盒任务已受理】",
@@ -2335,8 +2462,8 @@ class AntigravitySandboxPlugin(Star):
         ]
         if receipt.auto_retrieved:
             lines.append("已自动取回上一轮（completed）后提交续接。")
-        if url_block:
-            lines.append(url_block.lstrip("\n"))
+        if product:
+            lines.append(product)
         if receipt.put_notes:
             lines.append("续接写入:")
             lines.extend(receipt.put_notes)
@@ -2351,16 +2478,6 @@ class AntigravitySandboxPlugin(Star):
             ]
         )
         return prefix + "\n".join(lines)
-
-    def _receipt_link_urls(self, receipt: HandlerReceipt) -> list[str]:
-        urls = [_as_str(u) for u in receipt.expected_urls if _as_str(u)]
-        if urls:
-            return urls
-        short = self._short_for_task(receipt.task_id)
-        item = self._short_index.get(_as_str(short)) or {}
-        return _split_stored_urls(
-            _as_str(item.get("md_url")) or _as_str(item.get("expected_urls"))
-        )
 
     def _truncate_chars(self) -> int:
         raw = self._setting(
@@ -2388,10 +2505,9 @@ class AntigravitySandboxPlugin(Star):
         output = (receipt.output or "").strip() or "(尚无 output_text)"
         output = self._clip_user_text(output, keep_full=keep_full)
         lines = [f"任务编号: {short}", f"status: {status}", "", output]
-        urls = self._receipt_link_urls(receipt)
-        if urls:
-            lines.append("")
-            lines.extend(urls)
+        product = self._product_plain(receipt, for_llm=False, retrieve=True)
+        if product:
+            lines.extend(["", product])
         return "\n".join(lines)
 
     def _llm_retrieve_reply(self, receipt: HandlerReceipt) -> str:
@@ -2411,8 +2527,9 @@ class AntigravitySandboxPlugin(Star):
             "—— 回执文本（output_text）——",
             output,
         ]
-        if receipt.expected_urls:
-            lines.extend(["", "产物链接:"] + list(receipt.expected_urls))
+        product = self._product_plain(receipt, for_llm=True, retrieve=True)
+        if product:
+            lines.extend(["", product])
         if receipt.steps:
             lines.extend(["", "—— steps 摘要 ——", receipt.steps])
         return "\n".join(lines)
@@ -2427,6 +2544,9 @@ class AntigravitySandboxPlugin(Star):
             "回执已由插件渲染成图片并直接发送给用户。",
             "除非用户明确要求文字细节，不要在回复中重复回执全文。",
         ]
+        product = self._product_plain(receipt, for_llm=True, retrieve=True)
+        if product:
+            lines.extend(["", product])
         return "\n".join(lines)
 
     def _log_command_receipt(self, tag: str, text: str) -> None:
@@ -2593,6 +2713,7 @@ class AntigravitySandboxPlugin(Star):
         return [self._public_file_url(public_base, prefix, name) for name in names]
 
     def _upload_instruction(self, output_files: str, stamp: str) -> str:
+        """图床上传要求。这里的公网地址始终用公网访问基础地址，不用回执基础地址。"""
         webhook, public_base, token, prefix = self._resolved_upload_cfg()
         names = self._stamped_upload_names(output_files, stamp)
         if not webhook or not public_base or not token or not names:
@@ -2664,11 +2785,6 @@ class AntigravitySandboxPlugin(Star):
             payload = {}
         return self._public_url_from_upload_payload(
             payload, public_base=public_base, fallback=fallback
-        )
-
-    async def _upload_markdown_bytes(self, *, body: str, filename: str) -> str:
-        return await self._upload_file_bytes(
-            data=body.encode("utf-8"), filename=filename
         )
 
     async def _do_render_t2i(
@@ -2778,6 +2894,7 @@ class AntigravitySandboxPlugin(Star):
         image_path: str,
         extra_urls: list[str] | str | None = None,
         *args: Any,
+        extra_text: str = "",
         **kwargs: Any,
     ) -> bool:
         """工具调用途中或指令处理中把回执图片直接发给用户，不再拼接参考链接。"""
@@ -2794,7 +2911,7 @@ class AntigravitySandboxPlugin(Star):
             actual_urls = kwargs["urls"]
 
         try:
-            link_text = self._receipt_link_text(actual_urls)
+            link_text = _as_str(extra_text) or self._receipt_link_text(actual_urls)
             result = event.make_result().file_image(image_path)
             if link_text:
                 result.message("\n" + link_text)
@@ -2817,41 +2934,6 @@ class AntigravitySandboxPlugin(Star):
             target = args[0]
         clean = [_as_str(u) for u in target if _as_str(u)]
         return "\n".join(clean)
-
-    async def _maybe_plugin_upload_md(
-        self, short: str, output: str, status: str
-    ) -> list[str]:
-        short = _as_str(short)
-        item = self._short_index.get(short) or {}
-        stored_expected = _split_stored_urls(_as_str(item.get("expected_urls")))
-        if _as_str(item.get("plugin_md")).lower() not in {"1", "true", "yes"}:
-            return stored_expected
-        if _as_str(status).lower() != "completed":
-            md_url = _as_str(item.get("md_url"))
-            return [md_url] if md_url else stored_expected
-        body = (output or "").strip()
-        if not body:
-            md_url = _as_str(item.get("md_url"))
-            return [md_url] if md_url else stored_expected
-        digest = _body_sha256(body)
-        old_hash = _as_str(item.get("md_hash"))
-        old_url = _as_str(item.get("md_url"))
-        if digest == old_hash and old_url:
-            return [old_url]
-        planned = _as_str(item.get("md_plan_name"))
-        stamp = _submit_stamp()
-        name = planned or _stamp_upload_name("result.md", stamp)
-        url = await self._upload_markdown_bytes(body=body, filename=name)
-        if not url:
-            return [old_url] if old_url else stored_expected
-        item = dict(self._short_index.get(short) or item)
-        item["md_hash"] = digest
-        item["md_url"] = url
-        item["md_name"] = name
-        if short in self._short_index:
-            self._short_index[short] = item
-            self._save_short_index()
-        return [url]
 
     async def handle_submit(
         self,
@@ -2879,10 +2961,16 @@ class AntigravitySandboxPlugin(Star):
         file_contents: str = "",
         output_files: str = "",
     ) -> HandlerReceipt:
+        output_files = _default_output_files(output_files)
         stamp = _submit_stamp()
         expected_urls = self._expected_public_urls(output_files, stamp)
         stamped_names = self._stamped_upload_names(output_files, stamp)
-        prompt = _as_str(prompt) + self._upload_instruction(output_files, stamp)
+        expected_paths = workspace_product_paths(stamped_names)
+        prompt = (
+            _as_str(prompt)
+            + placement_instruction(expected_paths)
+            + self._upload_instruction(output_files, stamp)
+        )
         upload_token = self._resolved_upload_cfg()[2].strip()
         if upload_token:
             try:
@@ -2926,7 +3014,7 @@ class AntigravitySandboxPlugin(Star):
                     "提交失败: 未配置 Gemini API Key。请在插件设置「接入与模型」中填写。",
                     ok=False,
                     source_count=source_count,
-                    expected_urls=expected_urls,
+                    expected_urls=expected_urls, expected_paths=expected_paths,
                 )
             idle_keys = await self._idle_keys_for_new_task(client)
             if not idle_keys:
@@ -2934,7 +3022,7 @@ class AntigravitySandboxPlugin(Star):
                     MSG_NO_CAPACITY,
                     ok=False,
                     source_count=source_count,
-                    expected_urls=expected_urls,
+                    expected_urls=expected_urls, expected_paths=expected_paths,
                 )
             # 先记下这把 Key。额度相同的下一次提交才能轮到下一把，不用等本次 in_progress 写入缓存。
             self._remember_submit_key(idle_keys[0])
@@ -2972,6 +3060,8 @@ class AntigravitySandboxPlugin(Star):
             ]
             if stamped_names:
                 lines.append("预期上传文件名: " + ", ".join(stamped_names))
+            if expected_paths:
+                lines.extend(["", "预期文件路径:"] + expected_paths)
             if expected_urls:
                 lines.extend(
                     [
@@ -2990,14 +3080,14 @@ class AntigravitySandboxPlugin(Star):
                 "\n".join(lines),
                 ok=False,
                 source_count=source_count,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
             )
         except GeminiClientError as e:
             return HandlerReceipt(
                 f"提交失败: {e}",
                 ok=False,
                 source_count=source_count,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
             )
         except Exception as e:
             logger.error(f"submit_sandbox_task 未预期错误: {e}")
@@ -3005,7 +3095,7 @@ class AntigravitySandboxPlugin(Star):
                 f"提交失败（内部错误）: {e}",
                 ok=False,
                 source_count=source_count,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
             )
 
         task_id = _as_str(data.get("id"))
@@ -3013,9 +3103,8 @@ class AntigravitySandboxPlugin(Star):
         short = self._record_key(used_key or "", task_id=task_id, sandbox_id=sandbox)
         self._mark_round_outputs(
             short,
-            plugin_md=False,
-            chat_reply="link" if _is_md_only_outputs(output_files) else "",
             expected_urls=expected_urls,
+            expected_paths=expected_paths,
         )
         self._schedule_auto_retrieve(short, task_id=task_id, sandbox_id=sandbox)
         status = _as_str(data.get("status")) or "unknown"
@@ -3046,6 +3135,8 @@ class AntigravitySandboxPlugin(Star):
         elif output:
             lines.append("当前 output_text:")
             lines.append(self._clip_user_text(output, keep_full=False))
+        if expected_paths:
+            lines.extend(["", "预期文件路径:"] + expected_paths)
         if expected_urls:
             lines.extend(["", "预期公网地址（后台任务未完成前可能暂时无法访问）:"])
             lines.extend(expected_urls)
@@ -3067,7 +3158,7 @@ class AntigravitySandboxPlugin(Star):
             status=status,
             source_count=source_count,
             output=output,
-            expected_urls=expected_urls,
+            expected_urls=expected_urls, expected_paths=expected_paths,
         )
 
     async def handle_continue(
@@ -3081,14 +3172,12 @@ class AntigravitySandboxPlugin(Star):
         event: Any = None,
         **_kwargs: Any,
     ) -> str:
-        plugin_md = not bool(_output_file_names(output_files))
         receipt = await self._do_continue(
             prompt=prompt,
             task_id=task_id,
             sandbox_id=sandbox_id,
             output_files=output_files,
             file_paths=file_paths,
-            plugin_md=plugin_md,
             render_image=event is not None,
         )
         self._log_command_receipt("【continue_sandbox_task 完整回执】", receipt.text)
@@ -3102,7 +3191,8 @@ class AntigravitySandboxPlugin(Star):
         pre = receipt.pre_receipt
         if pre is None or not pre.image_path:
             return
-        if await self._send_receipt_image(event, pre.image_path):
+        tail = self._product_plain(pre, for_llm=False, retrieve=True)
+        if await self._send_receipt_image(event, pre.image_path, extra_text=tail):
             receipt.pre_image_sent = True
 
     async def _put_continue_uploads(
@@ -3171,7 +3261,6 @@ class AntigravitySandboxPlugin(Star):
         sandbox_id: str = "",
         file_paths: str = "",
         output_files: str = "",
-        plugin_md: bool = False,
         render_image: bool = False,
     ) -> HandlerReceipt:
         prompt_str = _as_str(prompt).strip()
@@ -3267,18 +3356,16 @@ class AntigravitySandboxPlugin(Star):
                 pre_receipt=pre,
             )
 
-        if plugin_md or not _output_file_names(output_files):
-            plugin_md = True
-            output_files = output_files or "result.md"
-            stamp = _submit_stamp()
-            expected_urls = self._expected_public_urls(output_files, stamp)
-            stamped_names = self._stamped_upload_names(output_files, stamp)
-            full_prompt = prompt_str
-        else:
-            stamp = _submit_stamp()
-            expected_urls = self._expected_public_urls(output_files, stamp)
-            stamped_names = self._stamped_upload_names(output_files, stamp)
-            full_prompt = prompt_str + self._upload_instruction(output_files, stamp)
+        output_files = _default_output_files(output_files)
+        stamp = _submit_stamp()
+        expected_urls = self._expected_public_urls(output_files, stamp)
+        stamped_names = self._stamped_upload_names(output_files, stamp)
+        expected_paths = workspace_product_paths(stamped_names)
+        full_prompt = (
+            prompt_str
+            + placement_instruction(expected_paths)
+            + self._upload_instruction(output_files, stamp)
+        )
         put_notes: list[str] = []
         try:
             client = self._client()
@@ -3310,6 +3397,8 @@ class AntigravitySandboxPlugin(Star):
             ]
             if stamped_names:
                 lines.append("预期上传文件名: " + ", ".join(stamped_names))
+            if expected_paths:
+                lines.extend(["", "预期文件路径:"] + expected_paths)
             if expected_urls:
                 lines.extend(
                     [
@@ -3321,7 +3410,7 @@ class AntigravitySandboxPlugin(Star):
             return HandlerReceipt(
                 "\n".join(lines),
                 ok=False,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
                 pre_retrieve_reply=pre_retrieve_reply,
                 pre_receipt=pre,
                 put_notes=put_notes,
@@ -3330,7 +3419,7 @@ class AntigravitySandboxPlugin(Star):
             return HandlerReceipt(
                 f"续接交互失败: {e}",
                 ok=False,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
                 pre_retrieve_reply=pre_retrieve_reply,
                 pre_receipt=pre,
                 put_notes=put_notes,
@@ -3340,7 +3429,7 @@ class AntigravitySandboxPlugin(Star):
             return HandlerReceipt(
                 f"续接交互失败（内部错误）: {e}",
                 ok=False,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
                 pre_retrieve_reply=pre_retrieve_reply,
                 pre_receipt=pre,
                 put_notes=put_notes,
@@ -3355,17 +3444,11 @@ class AntigravitySandboxPlugin(Star):
             previous_task_id=task_id,
             overwrite_short=overwrite_short,
         )
-        chat_reply = ""
-        if plugin_md or _is_md_only_outputs(output_files):
-            chat_reply = "link"
         self._mark_round_outputs(
             short,
-            plugin_md=plugin_md,
-            chat_reply=chat_reply,
             expected_urls=expected_urls,
+            expected_paths=expected_paths,
         )
-        if plugin_md and stamped_names:
-            self._remember_md_plan(short, stamped_names[0])
         self._schedule_auto_retrieve(
             short, task_id=new_task_id, sandbox_id=returned_sandbox
         )
@@ -3398,6 +3481,8 @@ class AntigravitySandboxPlugin(Star):
         elif output:
             lines.append("当前 output_text:")
             lines.append(self._clip_user_text(output, keep_full=False))
+        if expected_paths:
+            lines.extend(["", "预期文件路径:"] + expected_paths)
         if expected_urls:
             lines.extend(["", "预期公网地址（后台任务未完成前可能暂时无法访问）:"])
             lines.extend(expected_urls)
@@ -3419,7 +3504,7 @@ class AntigravitySandboxPlugin(Star):
             status=status,
             source_count=sum(1 for note in put_notes if "失败" not in note and "未能" not in note and "超过" not in note),
             output=output,
-            expected_urls=expected_urls,
+            expected_urls=expected_urls, expected_paths=expected_paths,
             auto_retrieved=auto_retrieved,
             pre_retrieve_reply=pre_retrieve_reply,
             pre_receipt=pre,
@@ -3441,7 +3526,9 @@ class AntigravitySandboxPlugin(Star):
         image_sent = False
         if receipt.ok and receipt.image_path and event is not None:
             image_sent = await self._send_receipt_image(
-                event, receipt.image_path
+                event,
+                receipt.image_path,
+                extra_text=self._product_plain(receipt, for_llm=False, retrieve=True),
             )
         if image_sent:
             return self._llm_retrieve_brief(receipt)
@@ -3546,12 +3633,9 @@ class AntigravitySandboxPlugin(Star):
             self._mark_short_retrieved(short, status)
         output = extract_output_text(data)
         steps = summarize_steps(data)
-        expected_urls: list[str] = []
-        if short:
-            try:
-                expected_urls = await self._maybe_plugin_upload_md(short, output, status)
-            except Exception as e:
-                logger.warning(f"取回后插件上传 md 失败: {e}")
+        item = self._short_index.get(short) or {} if short else {}
+        expected_urls = self._stored_product_urls(item)
+        expected_paths = self._stored_product_paths(item)
         lines = [
             "【Antigravity 沙盒任务回执】",
             f"task_id: {task_id}",
@@ -3564,6 +3648,8 @@ class AntigravitySandboxPlugin(Star):
             "—— steps 摘要 ——",
             steps,
         ]
+        if expected_paths:
+            lines.extend(["", "产物路径:"] + expected_paths)
         if expected_urls:
             lines.extend(["", "产物链接:"] + expected_urls)
         usage = data.get("usage")
@@ -3576,7 +3662,7 @@ class AntigravitySandboxPlugin(Star):
             status=status,
             output=output,
             steps=steps,
-            expected_urls=expected_urls,
+            expected_urls=expected_urls, expected_paths=expected_paths,
         )
         if render_image and receipt_image_applies(
             self._image_receipt_enabled(),
@@ -3649,7 +3735,7 @@ class AntigravitySandboxPlugin(Star):
         if receipt.image_path and await self._send_receipt_image(
             event,
             receipt.image_path,
-            extra_urls=self._receipt_link_urls(receipt),
+            extra_text=self._product_plain(receipt, for_llm=False, retrieve=True),
         ):
             return
         yield event.plain_result(self._command_retrieve_reply(receipt))
@@ -3659,12 +3745,11 @@ class AntigravitySandboxPlugin(Star):
         """在已有沙盒会话中续接任务: /agcontinue <任务编号> [类型...] <任务文本>"""
         task_ref, prompt_raw = _split_continue_rest(str(rest))
         prompt_text, output_files = _parse_command_prompt(
-            prompt_raw, default_ext=None
+            prompt_raw, default_ext="md"
         )
-        plugin_md = not bool(_output_file_names(output_files))
         prompt_preview = prompt_text if len(prompt_text) <= 500 else prompt_text[:500] + "…"
         logger.info(
-            f"agcontinue 解析 task_ref={task_ref} plugin_md={plugin_md} "
+            f"agcontinue 解析 task_ref={task_ref} "
             f"output_files={output_files or '-'} prompt={prompt_preview}"
         )
         if not task_ref or not prompt_text:
@@ -3684,14 +3769,15 @@ class AntigravitySandboxPlugin(Star):
             sandbox_id=sandbox_id,
             output_files=output_files,
             file_paths=",".join(file_list),
-            plugin_md=plugin_md,
             render_image=True,
         )
         self._log_command_receipt("【agcontinue 完整回执】", receipt.text)
         pre = receipt.pre_receipt
         if pre is not None and pre.image_path:
             receipt.pre_image_sent = await self._send_receipt_image(
-                event, pre.image_path, extra_urls=self._receipt_link_urls(pre)
+                event,
+                pre.image_path,
+                extra_text=self._product_plain(pre, for_llm=False, retrieve=True),
             )
         if not receipt.pre_image_sent and receipt.pre_retrieve_reply:
             yield event.plain_result(receipt.pre_retrieve_reply)

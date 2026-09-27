@@ -561,9 +561,18 @@ class SourceTests(unittest.TestCase):
         self.assertIn('endswith(".token")', text)
         # 续接说明按新修订：默认 md 那句单独成行，附件提示另起一句
         self.assertIn(
-            "  在同一沙盒会话中续接任务。不写类型时默认 md，并返回对应预期网址。\\n",
+            "  在同一沙盒会话中续接任务。不写类型时默认 md，沙盒写入带时间戳的 result.md。\\n",
             text,
         )
+        self.assertIn("【产物放置要求】", text)
+        self.assertNotIn("def _maybe_plugin_upload_md", text)
+        self.assertNotIn("plugin_md=", text)
+        self.assertNotIn("default_ext=None", text)
+        schema = (ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+        self.assertIn("沙盒路径回执", schema)
+        self.assertIn("回执基础地址", schema)
+        self.assertIn("回执图床 URL", schema)
+        self.assertIn("未备案域名", schema)
         self.assertNotIn('f"taskid: {short}"', text)
 
 
@@ -627,6 +636,62 @@ class AgGetParseTests(unittest.TestCase):
 
     def test_empty_is_rejected(self):
         self.assertEqual(self._parse("   "), ("", ""))
+
+
+class ReceiptFormatTests(unittest.TestCase):
+    @staticmethod
+    def _helpers() -> dict:
+        text = MAIN.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        wanted = {"workspace_product_paths", "swap_url_origin", "placement_instruction"}
+        chunks: list[str] = []
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in wanted:
+                segment = ast.get_source_segment(text, node)
+                if segment:
+                    chunks.append(segment)
+        namespace: dict = {}
+        exec(
+            "from urllib.parse import urlsplit, urlunsplit\n\n" + "\n\n".join(chunks),
+            namespace,
+        )
+        return namespace
+
+    def test_workspace_path_uses_stamped_filename(self):
+        helpers = self._helpers()
+        self.assertEqual(
+            helpers["workspace_product_paths"](["260927153045_result.md"]),
+            ["/workspace/260927153045_result.md"],
+        )
+
+    def test_receipt_base_replaces_origin_only(self):
+        helpers = self._helpers()
+        swap = helpers["swap_url_origin"]
+        url = "https://real.example/agysb/260927153045_result.md?x=1"
+        self.assertEqual(swap(url, ""), url)
+        self.assertEqual(
+            swap(url, "https://spare.example"),
+            "https://spare.example/agysb/260927153045_result.md?x=1",
+        )
+        self.assertEqual(
+            swap(url, "https://spare.example/ignored"),
+            "https://spare.example/agysb/260927153045_result.md?x=1",
+        )
+        self.assertEqual(
+            swap(url, "spare.example"),
+            "https://spare.example/agysb/260927153045_result.md?x=1",
+        )
+
+    def test_placement_tells_sandbox_to_keep_md_for_this_round(self):
+        helpers = self._helpers()
+        place = helpers["placement_instruction"]
+        md = place(["/workspace/260927153045_result.md"])
+        self.assertIn("【产物放置要求】", md)
+        self.assertIn("/workspace/260927153045_result.md", md)
+        self.assertIn("不要把上一轮已有报告复制后交差", md)
+        png = place(["/workspace/260927153045_result.png"])
+        self.assertNotIn("不要把上一轮已有报告复制后交差", png)
+        self.assertEqual(place([]), "")
 
 
 if __name__ == "__main__":
