@@ -190,5 +190,18 @@
         "default": true
       }
     }
+  },
+  "probe": {
+    "description": "测试功能",
+    "hint": "默认关闭。只影响完成后的完成标记轮询提示，不改变沙盒是否写入 result.md。",
+    "type": "object",
+    "items": {
+      "file_status_poll": {
+        "description": "取回文件查询状态",
+        "type": "bool",
+        "hint": "开启后，提交和续接会在给沙盒的提示词末尾追加完成标记要求（例如 260928153045.completed 空文件），并每 10 秒查看这一轮的标记文件，最多 1 小时。取到文件后在原会话提示用 /agr 取回。与「1 小时后自动取回」并行。手动取回问到状态后停止。默认关闭。",
+        "default": false
+      }
+    }
   }
 }

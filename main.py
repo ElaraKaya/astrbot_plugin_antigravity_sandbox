@@ -35,7 +35,7 @@ from urllib.parse import urlsplit, urlunsplit
 import astrbot.api.message_components as Comp
 import httpx
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
@@ -155,6 +155,8 @@ DEFAULT_IDLE_TTL_HOURS = 24
 DEFAULT_KEEP_RECENT = 2
 AUTO_RETRIEVE_SECONDS = 60 * 60
 AUTO_RETRIEVE_TICK_SECONDS = 30.0
+FILE_POLL_SECONDS = 60 * 60
+FILE_POLL_INTERVAL_SECONDS = 10.0
 PULL_TEMP_TTL_SECONDS = 30 * 60
 
 RETRIEVE_QUERY_FAIL_PREFIX = "取回失败（查询超时或网络错误）"
@@ -513,10 +515,77 @@ def _output_file_names(output_files: str) -> list[str]:
     return [x.strip() for x in _as_str(output_files).split(",") if x.strip()]
 
 
+def ensure_result_md(output_files: str) -> str:
+    """每一轮都带一份 result.md。调用方已经点名 result.md 时不追加第二份。"""
+    names = _output_file_names(output_files)
+    if not names:
+        return "result.md"
+    for name in names:
+        leaf = name.replace("\\", "/").split("/")[-1].lower()
+        if leaf == "result.md":
+            return output_files
+    return ",".join([*names, "result.md"])
+
+
 def _default_output_files(output_files: str) -> str:
-    if _output_file_names(output_files):
-        return output_files
-    return "result.md"
+    return ensure_result_md(output_files)
+
+
+COMPLETED_MARKER_SUFFIX = ".completed"
+
+
+def completed_marker_name(stamp: str) -> str:
+    """这一轮完成标记文件名：{提交时间戳}.completed，与 result.md 同一时间戳。"""
+    text = _as_str(stamp) or _submit_stamp()
+    return f"{text}{COMPLETED_MARKER_SUFFIX}"
+
+
+def is_completed_marker_path(name: str) -> bool:
+    """判断路径是不是插件下发的完成标记，用来过滤旧版 result.md 轮询记录。"""
+    text = _as_str(name).replace("\\", "/").rstrip("/").lower()
+    return text.endswith(COMPLETED_MARKER_SUFFIX)
+
+
+def stamped_completed_path(stamp: str) -> str:
+    """这一轮完成标记在沙盒工作空间里的路径。"""
+    return "/workspace/" + completed_marker_name(stamp)
+
+
+def completed_marker_instruction(stamp: str) -> str:
+    """取回文件查询状态开启时追加到沙盒提示词末尾的完成标记要求。"""
+    return (
+        "\n\n完成所有任务后请在工作空间创建文件 "
+        f"{completed_marker_name(stamp)}的空文件,此项不需要汇报。"
+    )
+
+
+def file_poll_notice(short: str) -> str:
+    return f"任务 {short} 可能已经完成，请使用 /agr {short} 取回"
+
+
+def _notify_from_event(event: Any, origin: str) -> dict[str, str] | None:
+    if event is None:
+        return None
+    umo = _as_str(getattr(event, "unified_msg_origin", ""))
+    if not umo:
+        return None
+    sender_id = ""
+    getter = getattr(event, "get_sender_id", None)
+    if callable(getter):
+        sender_id = _as_str(getter())
+    sender_name = ""
+    name_getter = getattr(event, "get_sender_name", None)
+    if callable(name_getter):
+        try:
+            sender_name = _as_str(name_getter())
+        except Exception:
+            sender_name = ""
+    return {
+        "umo": umo,
+        "sender_id": sender_id,
+        "sender_name": sender_name,
+        "origin": origin,
+    }
 
 
 def _safe_upload_name(name: str) -> str:
@@ -604,6 +673,49 @@ def _parse_short_int(raw: str) -> int | None:
 
 def _format_short(n: int) -> str:
     return f"{n:0{SHORT_ID_WIDTH}d}"
+
+
+def _index_item_is_round(item: dict) -> bool:
+    """提交或续接写入的短号带预期路径或链接。回执格式化旁路插进来的行没有。"""
+    return bool(
+        _as_str(item.get("expected_paths"))
+        or _as_str(item.get("expected_urls"))
+        or _as_str(item.get("md_url"))
+        or _as_str(item.get("md_name"))
+    )
+
+
+def pick_latest_indexed_short(index: dict, sandbox_id: str) -> str:
+    """同一沙盒上的最新一轮。有正式轮次时忽略没有产物记录的旁路短号。"""
+    sandbox_id = _as_str(sandbox_id)
+    if not sandbox_id or not isinstance(index, dict):
+        return ""
+    rows: list[tuple[str, dict]] = []
+    for short, item in index.items():
+        if isinstance(item, dict) and _as_str(item.get("sandbox_id")) == sandbox_id:
+            rows.append((str(short), item))
+    if not rows:
+        return ""
+    rounds = [(short, item) for short, item in rows if _index_item_is_round(item)]
+    pool = rounds or rows
+    best_short = ""
+    best_rank: tuple[int, datetime, int] | None = None
+    fallback = datetime.min.replace(tzinfo=_now().tzinfo)
+    for short, item in pool:
+        ts = _parse_iso(_as_str(item.get("recorded_at")))
+        matched = CONTINUE_SHORT_RE.fullmatch(short)
+        if matched:
+            n = int(matched.group(1)) * (10**CONTINUE_SHORT_TIME_WIDTH) + int(
+                matched.group(2)
+            )
+        else:
+            parsed = _parse_short_int(short)
+            n = (parsed * (10**CONTINUE_SHORT_TIME_WIDTH)) if parsed is not None else -1
+        rank = (1 if ts is not None else 0, ts or fallback, n)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_short = short
+    return best_short
 
 
 def _user_source_count(sources: list[dict[str, Any]] | None) -> int:
@@ -817,14 +929,16 @@ AGHELP_TEXT = (
     "Antigravity 沙盒指令：\n"
     "\n"
     "/agsubmit 或 /ags [类型...] <任务文本>\n"
-    "  提交新任务。默认产出 result.md。例如：/ags png 查询今日新闻\n"
+    "  提交新任务。默认产出 result.md。指定 png、html 等类型时仍会额外要求一份 result.md。\n"
+    "  例如：/ags png 查询今日新闻\n"
     "  可在本条消息附带图片/文件，或回复一条带图/文件的消息后再发送本指令。\n"
     "\n"
     "/agretrieve 或 /agr <任务编号>\n"
     "  取回任务回执。确定会发图片回执时正文不截断；其余按配置字数截断。\n"
     "\n"
     "/agcontinue 或 /agc <任务编号> [类型...] <任务文本>\n"
-    "  在同一沙盒会话中续接任务。不写类型时默认 md，沙盒写入带时间戳的 result.md。\n"
+    "  在同一沙盒会话中续接任务。不写类型时默认 md。\n"
+    "  指定其它类型时仍会额外要求一份带时间戳的 result.md。\n"
     "  附件可用本条消息附带图片/文件，或回复一条带图/文件的消息后再发送本指令。\n"
     "  若上一轮尚未取回会先自动取回。未完成任务无法续接。\n"
     "\n"
@@ -927,9 +1041,10 @@ LIST_TOOL_DESC = (
 )
 
 GET_TOOL_DESC = (
-    "从 Antigravity 沙盒 workspace 拉取一个文件发给用户。只使用任务编号 和文件名。"
+    "从 Antigravity 沙盒 workspace 拉取一个文件。只使用任务编号和文件名。"
+    "电脑能力为 local 时，文件写入当前会话工作区并返回相对路径，不要发到聊天，也不要把内容复述进回复。"
+    "电脑能力为 none 或 sandbox 时，插件把文件直接发给用户。"
     "沙盒网络存疑，不一定能成功拉取文件。超过 20MB 或 90 秒会中止，请改用图床或 WebUI。"
-    "不要把文件内容复述进回复。"
 )
 
 
@@ -956,8 +1071,11 @@ def _submit_parameters() -> dict:
                 "description": (
                     "由调用方指定的任务产出原始文件名，逗号分隔；例如 "
                     "result.jpg,report.pdf,archive.tar.gz。留空则默认 result.md。"
+                    "无论是否指定其它类型，都会额外要求一份 result.md；已经包含 result.md 时不追加。"
                     "插件提交时自动加 YYMMDDHHMMSS_ 前缀，并要求沙盒保存到 "
                     "/workspace/<时间戳文件名>。图床开启且配置齐全时同时要求上传。"
+                    "测试功能里的「取回文件查询状态」开启时，还会额外要求沙盒在完成时创建 "
+                    "<时间戳>.completed 空文件。"
                 ),
             },
             "file_paths": {
@@ -1011,8 +1129,11 @@ def _continue_parameters() -> dict:
                 "type": "string",
                 "description": (
                     "本轮产出文件名，逗号分隔；例如 result.jpg,report.pdf。"
-                    "留空则默认 result.md。插件自动加时间戳前缀，并要求沙盒保存到 "
+                    "留空则默认 result.md。无论是否指定其它类型，都会额外要求一份 result.md；"
+                    "已经包含 result.md 时不追加。插件自动加时间戳前缀，并要求沙盒保存到 "
                     "/workspace/<时间戳文件名>。图床开启且配置齐全时同时要求上传。"
+                    "测试功能里的「取回文件查询状态」开启时，还会额外要求沙盒在完成时创建 "
+                    "<时间戳>.completed 空文件。"
                 ),
             },
             "file_paths": {
@@ -1072,10 +1193,12 @@ class AntigravitySandboxPlugin(Star):
         self._short_index: dict[str, dict[str, str]] = self._load_short_index()
         self._env_meta: dict[str, dict[str, str]] = self._load_env_meta()
         self._pending_retrieve: dict[str, dict[str, str]] = self._load_pending_retrieve()
+        self._file_polls: dict[str, dict[str, str]] = self._load_file_polls()
         self._scrub_persisted_secrets()
         self._cleanup_lock = asyncio.Lock()
         self._startup_task: asyncio.Task[None] | None = None
         self._auto_retrieve_task: asyncio.Task[None] | None = None
+        self._file_poll_task: asyncio.Task[None] | None = None
         self._pull_cleanup_task: asyncio.Task[None] | None = None
         self._ui_pull_sem = asyncio.Semaphore(UI_PULL_CONCURRENCY)
         self._ui_jobs: dict[str, dict[str, Any]] = {}
@@ -1101,6 +1224,7 @@ class AntigravitySandboxPlugin(Star):
 
     async def initialize(self):
         self._auto_retrieve_task = asyncio.create_task(self._auto_retrieve_loop())
+        self._file_poll_task = asyncio.create_task(self._file_poll_loop())
         self._pull_cleanup_task = asyncio.create_task(self._pull_temp_cleanup_loop())
         if not self._env_auto_cleanup():
             return
@@ -1160,6 +1284,9 @@ class AntigravitySandboxPlugin(Star):
 
     def _pending_retrieve_file(self) -> Path:
         return self._data_dir / "auto_retrieve.json"
+
+    def _file_poll_file(self) -> Path:
+        return self._data_dir / "file_poll.json"
 
     def _group(self, name: str) -> dict[str, Any]:
         raw = (self.config or {}).get(name)
@@ -1292,6 +1419,7 @@ class AntigravitySandboxPlugin(Star):
         sandbox_id: str = "",
         previous_task_id: str = "",
         overwrite_short: str = "",
+        allocate: bool = True,
     ) -> str:
         stored = self._stored_key_ref(key)
         if stored:
@@ -1312,6 +1440,7 @@ class AntigravitySandboxPlugin(Star):
                 previous_task_id=previous_task_id,
                 key=stored,
                 overwrite_short=overwrite_short,
+                allocate=allocate,
             )
         return short
 
@@ -1486,6 +1615,250 @@ class AntigravitySandboxPlugin(Star):
         else:
             first_line = (receipt.text or "").split("\n", 1)[0]
             logger.warning(f"自动取回 {short} 失败: {first_line}")
+
+    def _file_poll_enabled(self) -> bool:
+        return _as_bool(
+            self._setting("probe", "file_status_poll", "file_status_poll", False),
+            False,
+        )
+
+    def _load_file_polls(self) -> dict[str, dict[str, str]]:
+        path = self._file_poll_file()
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            pending: dict[str, dict[str, str]] = {}
+            for key, value in data.items():
+                short = _as_str(key)
+                if not short or not isinstance(value, dict):
+                    continue
+                task_id = _as_str(value.get("task_id"))
+                sandbox_id = _as_str(value.get("sandbox_id"))
+                result_path = _as_str(value.get("result_path"))
+                deadline = _as_str(value.get("deadline"))
+                if not task_id or not sandbox_id or not deadline:
+                    continue
+                # 1.6.7 起的轮询目标是 .completed 空文件；旧版 result.md 记录直接丢弃
+                if result_path and not is_completed_marker_path(result_path):
+                    continue
+                pending[short] = {
+                    "task_id": task_id,
+                    "sandbox_id": sandbox_id,
+                    "result_path": result_path,
+                    "deadline": deadline,
+                    "next_poll_at": _as_str(value.get("next_poll_at")),
+                    "umo": _as_str(value.get("umo")),
+                    "sender_id": _as_str(value.get("sender_id")),
+                    "sender_name": _as_str(value.get("sender_name")),
+                    "origin": _as_str(value.get("origin")),
+                }
+            return pending
+        except Exception as e:
+            logger.warning(f"读取 file_poll.json 失败: {e}")
+            return {}
+
+    def _save_file_polls(self) -> None:
+        try:
+            _write_json(self._file_poll_file(), self._file_polls)
+        except Exception as e:
+            logger.warning(f"写入 file_poll.json 失败: {e}")
+
+    def _schedule_file_poll(
+        self,
+        short: str,
+        *,
+        task_id: str,
+        sandbox_id: str,
+        result_path: str,
+        notify: dict[str, str] | None,
+    ) -> None:
+        short = _as_str(short)
+        task_id = _as_str(task_id)
+        sandbox_id = _as_str(sandbox_id)
+        result_path = _as_str(result_path)
+        if not self._file_poll_enabled():
+            return
+        if not short or not task_id or not sandbox_id or not result_path:
+            return
+        note = notify or {}
+        now = _now()
+        self._file_polls[short] = {
+            "task_id": task_id,
+            "sandbox_id": sandbox_id,
+            "result_path": result_path,
+            "deadline": (now + timedelta(seconds=FILE_POLL_SECONDS)).isoformat(),
+            "next_poll_at": (now + timedelta(seconds=FILE_POLL_INTERVAL_SECONDS)).isoformat(),
+            "umo": _as_str(note.get("umo")),
+            "sender_id": _as_str(note.get("sender_id")),
+            "sender_name": _as_str(note.get("sender_name")),
+            "origin": _as_str(note.get("origin")),
+        }
+        self._save_file_polls()
+
+    def _cancel_file_poll(self, short: str) -> None:
+        short = _as_str(short)
+        if not short or short not in self._file_polls:
+            return
+        self._file_polls.pop(short, None)
+        self._save_file_polls()
+
+    async def _file_poll_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    delay = await self._file_poll_tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"文件状态轮询循环异常: {e}")
+                    delay = FILE_POLL_INTERVAL_SECONDS
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+
+    async def _file_poll_tick(self) -> float:
+        now = _now()
+        if not self._file_poll_enabled():
+            expired = [
+                short
+                for short, info in self._file_polls.items()
+                if (deadline := _parse_iso(_as_str(info.get("deadline")))) is not None
+                and deadline <= now
+            ]
+            if expired:
+                for short in expired:
+                    self._file_polls.pop(short, None)
+                    logger.info(f"文件状态轮询放弃 {short}：1 小时内未取到 .completed 完成标记")
+                self._save_file_polls()
+            return FILE_POLL_INTERVAL_SECONDS
+        due: list[str] = []
+        next_due: datetime | None = None
+        for short, info in list(self._file_polls.items()):
+            deadline = _parse_iso(_as_str(info.get("deadline")))
+            nxt = _parse_iso(_as_str(info.get("next_poll_at")))
+            if deadline is not None and deadline <= now:
+                due.append(short)
+                continue
+            if nxt is None or nxt <= now:
+                due.append(short)
+                continue
+            if next_due is None or nxt < next_due:
+                next_due = nxt
+        for short in due:
+            await self._file_poll_one(short)
+        if next_due is None:
+            return FILE_POLL_INTERVAL_SECONDS
+        wait = (next_due - _now()).total_seconds()
+        return max(1.0, min(FILE_POLL_INTERVAL_SECONDS, wait))
+
+    async def _file_poll_one(self, short: str) -> None:
+        short = _as_str(short)
+        info = self._file_polls.get(short)
+        if not info:
+            return
+        deadline = _parse_iso(_as_str(info.get("deadline")))
+        if deadline is not None and deadline <= _now():
+            self._file_polls.pop(short, None)
+            self._save_file_polls()
+            logger.info(f"文件状态轮询放弃 {short}：1 小时内未取到 .completed 完成标记")
+            return
+        found = False
+        try:
+            found = await self._sandbox_has_file(short, _as_str(info.get("result_path")))
+        except Exception as e:
+            logger.info(f"文件状态轮询 {short} 尚未取到: {e}")
+        if not found:
+            info["next_poll_at"] = (
+                _now() + timedelta(seconds=FILE_POLL_INTERVAL_SECONDS)
+            ).isoformat()
+            self._save_file_polls()
+            return
+        self._file_polls.pop(short, None)
+        self._save_file_polls()
+        logger.info(f"文件状态轮询取到 {short} {_as_str(info.get('result_path'))}")
+        await self._notify_file_ready(short, info)
+
+    async def _sandbox_has_file(self, task_ref: str, name: str) -> bool:
+        short, _task_id, sandbox_id, key = self._resolve_file_target(task_ref)
+        del short
+        files = await self._client().list_environment_files(
+            sandbox_id,
+            "workspace",
+            recursive=True,
+            api_key=key,
+        )
+        match = self._match_listed_file(files, name)
+        return bool(match) and _as_str(match.get("type")) != "directory"
+
+    async def _notify_file_ready(self, short: str, info: dict[str, str]) -> None:
+        umo = _as_str(info.get("umo"))
+        if not umo:
+            logger.info(f"文件状态轮询 {short} 没有会话，跳过通知")
+            return
+        text = file_poll_notice(short)
+        chain = MessageChain()
+        sender_id = _as_str(info.get("sender_id"))
+        if _as_str(info.get("origin")) == "command" and sender_id:
+            chain.at(_as_str(info.get("sender_name")) or sender_id, sender_id)
+        chain.message(text)
+        try:
+            await self.context.send_message(umo, chain)
+        except Exception as e:
+            logger.warning(f"文件状态轮询通知 {short} 失败: {e}")
+
+    def _computer_use_runtime(self, event: Any) -> str:
+        umo = _as_str(getattr(event, "unified_msg_origin", "")) if event is not None else ""
+        settings: Any = {}
+        try:
+            getter = self.context.get_config
+            cfg = getter(umo=umo) if umo else getter()
+            if cfg is not None:
+                settings = cfg.get("provider_settings", {}) or {}
+        except Exception as e:
+            logger.warning(f"读取电脑能力配置失败: {e}")
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        return str(settings.get("computer_use_runtime") or "none").strip().lower()
+
+    async def _session_workspace_root(self, umo: str) -> Path:
+        from astrbot.core.workspace import resolve_workspace_root_for_umo
+
+        db = getattr(self.context, "_db", None)
+        return await resolve_workspace_root_for_umo(umo, db)
+
+    async def _save_pulled_file_to_workspace(
+        self, event: Any, src: Path, display: str
+    ) -> str:
+        umo = _as_str(getattr(event, "unified_msg_origin", ""))
+        if not umo:
+            return ""
+        root = (await self._session_workspace_root(umo)).resolve(strict=False)
+        root.mkdir(parents=True, exist_ok=True)
+        leaf = Path(str(display or "")).name.replace("\\", "/").split("/")[-1]
+        if not leaf or leaf in {".", ".."}:
+            leaf = src.name or "download.bin"
+        dest = (root / leaf).resolve(strict=False)
+        if not dest.is_relative_to(root):
+            return ""
+        if dest.exists():
+            stem = dest.stem
+            suffix = dest.suffix
+            n = 2
+            while True:
+                candidate = (root / f"{stem}_{n}{suffix}").resolve(strict=False)
+                if not candidate.is_relative_to(root):
+                    return ""
+                if not candidate.exists():
+                    dest = candidate
+                    break
+                n += 1
+        shutil.copyfile(src, dest)
+        return dest.relative_to(root).as_posix()
 
     def _touch_sandbox(self, sandbox_id: str, *, status: str = "") -> None:
         sandbox_id = _as_str(sandbox_id)
@@ -2101,6 +2474,7 @@ class AntigravitySandboxPlugin(Star):
         previous_task_id: str = "",
         key: str = "",
         overwrite_short: str = "",
+        allocate: bool = True,
     ) -> str:
         task_id = _as_str(task_id)
         sandbox_id = _as_str(sandbox_id)
@@ -2130,7 +2504,7 @@ class AntigravitySandboxPlugin(Star):
         short = _as_str(overwrite_short) or (
             self._short_for_task(previous_task_id) if previous_task_id else ""
         )
-        if short:
+        if short and (allocate or short in self._short_index):
             old = self._short_index.get(short) or {}
             item = self._short_item(
                 task_id,
@@ -2140,6 +2514,8 @@ class AntigravitySandboxPlugin(Star):
             self._short_index[short] = item
             self._save_short_index()
             return short
+        if not allocate:
+            return ""
         if len(self._short_index) >= SHORT_INDEX_LIMIT:
             self._trim_short_index()
         short = self._alloc_submit_short()
@@ -2241,28 +2617,7 @@ class AntigravitySandboxPlugin(Star):
         return self._latest_short_for_sandbox(only)
 
     def _latest_short_for_sandbox(self, sandbox_id: str) -> str:
-        sandbox_id = _as_str(sandbox_id)
-        if not sandbox_id:
-            return ""
-        best_rank: tuple[int, datetime, int] | None = None
-        fallback = datetime.min.replace(tzinfo=_now().tzinfo)
-        for short, item in self._short_index.items():
-            if _as_str(item.get("sandbox_id")) != sandbox_id:
-                continue
-            ts = _parse_iso(_as_str(item.get("recorded_at")))
-            matched = CONTINUE_SHORT_RE.fullmatch(short)
-            if matched:
-                n = int(matched.group(1)) * (10**CONTINUE_SHORT_TIME_WIDTH) + int(
-                    matched.group(2)
-                )
-            else:
-                parsed = _parse_short_int(short)
-                n = (parsed * (10**CONTINUE_SHORT_TIME_WIDTH)) if parsed is not None else -1
-            rank = (1 if ts is not None else 0, ts or fallback, n)
-            if best_rank is None or rank > best_rank:
-                best_rank = rank
-                best_short = short
-        return best_short
+        return pick_latest_indexed_short(self._short_index, sandbox_id)
 
     def _path_receipt_enabled(self) -> bool:
         return _as_bool(
@@ -2307,20 +2662,17 @@ class AntigravitySandboxPlugin(Star):
         paths = self._visible_paths(receipt.expected_paths)
         urls = self._visible_urls(receipt.expected_urls)
         lines: list[str] = []
-        short = self._public_task_short(receipt) if paths else ""
         if paths:
             lines.append("产物路径:" if retrieve else "预期文件路径:")
             lines.extend(paths)
-            if short and short != "(未知)":
-                if for_llm:
+            if retrieve and for_llm:
+                short = self._public_task_short(receipt)
+                if short and short != "(未知)":
                     listed = "、".join(paths)
                     lines.append(
                         "需要文件时调用 get_sandbox_task，"
                         f"task_id={short}，name 填路径：{listed}。"
                     )
-                else:
-                    for path in paths:
-                        lines.append(f"/agget {short} {path}")
         if urls:
             lines.append("产物链接:" if retrieve else "预期公网地址:")
             lines.extend(urls)
@@ -2353,12 +2705,9 @@ class AntigravitySandboxPlugin(Star):
         return []
 
     def _public_task_short(self, receipt: HandlerReceipt) -> str:
-        short = self._short_for_task(receipt.task_id)
-        if short:
-            return short
-        if receipt.task_id and receipt.sandbox_id:
-            return self._record_short(receipt.task_id, receipt.sandbox_id)
-        return ""
+        # 只查已有短号。续接覆盖后上一轮 id 已经不在索引里，这里再分配会插进一条更新的旁路短号，
+        # 下一轮会把它当成最新交互，已取回的标记也对不上。
+        return self._short_for_task(receipt.task_id)
 
     def _command_ack(self, receipt: HandlerReceipt) -> str:
         product = self._product_plain(receipt, for_llm=False, retrieve=False)
@@ -2403,9 +2752,10 @@ class AntigravitySandboxPlugin(Star):
             lines.extend(receipt.put_notes)
         lines.extend(
             [
-                f"后续 /agr {short} 取回，",
+                "后续:",
+                f"/agr {short} 取回任务，",
                 f"/agc {short} [类型...] <任务文本> 续接任务，",
-                CONTINUE_GATE_HINT,
+                f"/agget {short} <文件路径> 获取文件(可能需先取回任务)",
             ]
         )
         return "\n".join(lines)
@@ -2470,10 +2820,10 @@ class AntigravitySandboxPlugin(Star):
         lines.extend(
             [
                 "",
-                f"后续调用 retrieve_sandbox_task，传入 task_id={short} 取回；",
-                f"调用 continue_sandbox_task，传入 task_id={short} 与 prompt 续接；",
-                f"调用 list_sandbox_task / get_sandbox_task 时同样使用 task_id={short}。",
-                CONTINUE_GATE_HINT,
+                "后续:",
+                f"调用 retrieve_sandbox_task，传入 task_id={short} 取回任务；",
+                f"调用 continue_sandbox_task，传入 task_id={short} 与 prompt 续接任务；",
+                f"调用 get_sandbox_task，传入 task_id={short}，name 填文件路径，获取文件（可能需先取回任务）。",
                 "只使用短号任务编号，不要向用户发送内部长 ID。",
             ]
         )
@@ -2942,6 +3292,7 @@ class AntigravitySandboxPlugin(Star):
         file_paths: str = "",
         file_contents: str = "",
         output_files: str = "",
+        event: Any = None,
         **_kwargs: Any,
     ) -> str:
         receipt = await self._do_submit(
@@ -2949,6 +3300,7 @@ class AntigravitySandboxPlugin(Star):
             file_paths=file_paths,
             file_contents=file_contents,
             output_files=output_files,
+            notify=_notify_from_event(event, "tool"),
         )
         self._log_command_receipt("【submit_sandbox_task 完整回执】", receipt.text)
         return self._llm_ack(receipt)
@@ -2960,9 +3312,10 @@ class AntigravitySandboxPlugin(Star):
         file_paths: str = "",
         file_contents: str = "",
         output_files: str = "",
+        notify: dict[str, str] | None = None,
     ) -> HandlerReceipt:
-        output_files = _default_output_files(output_files)
         stamp = _submit_stamp()
+        output_files = _default_output_files(output_files)
         expected_urls = self._expected_public_urls(output_files, stamp)
         stamped_names = self._stamped_upload_names(output_files, stamp)
         expected_paths = workspace_product_paths(stamped_names)
@@ -2970,6 +3323,11 @@ class AntigravitySandboxPlugin(Star):
             _as_str(prompt)
             + placement_instruction(expected_paths)
             + self._upload_instruction(output_files, stamp)
+            + (
+                completed_marker_instruction(stamp)
+                if self._file_poll_enabled()
+                else ""
+            )
         )
         upload_token = self._resolved_upload_cfg()[2].strip()
         if upload_token:
@@ -3107,6 +3465,14 @@ class AntigravitySandboxPlugin(Star):
             expected_paths=expected_paths,
         )
         self._schedule_auto_retrieve(short, task_id=task_id, sandbox_id=sandbox)
+        marker_path = stamped_completed_path(stamp) if self._file_poll_enabled() else ""
+        self._schedule_file_poll(
+            short,
+            task_id=task_id,
+            sandbox_id=sandbox,
+            result_path=marker_path,
+            notify=notify,
+        )
         status = _as_str(data.get("status")) or "unknown"
         if status in {"", "unknown"} and bool(payload.get("background")):
             status = "in_progress"
@@ -3135,6 +3501,8 @@ class AntigravitySandboxPlugin(Star):
         elif output:
             lines.append("当前 output_text:")
             lines.append(self._clip_user_text(output, keep_full=False))
+        if marker_path:
+            lines.append(f"完成标记: {marker_path}（取回文件查询状态开启时轮询它）")
         if expected_paths:
             lines.extend(["", "预期文件路径:"] + expected_paths)
         if expected_urls:
@@ -3179,6 +3547,7 @@ class AntigravitySandboxPlugin(Star):
             output_files=output_files,
             file_paths=file_paths,
             render_image=event is not None,
+            notify=_notify_from_event(event, "tool"),
         )
         self._log_command_receipt("【continue_sandbox_task 完整回执】", receipt.text)
         if event is not None:
@@ -3262,6 +3631,7 @@ class AntigravitySandboxPlugin(Star):
         file_paths: str = "",
         output_files: str = "",
         render_image: bool = False,
+        notify: dict[str, str] | None = None,
     ) -> HandlerReceipt:
         prompt_str = _as_str(prompt).strip()
         task_id = _as_str(task_id).strip()
@@ -3289,7 +3659,7 @@ class AntigravitySandboxPlugin(Star):
         if ".." in task_id or ".." in sandbox_id or "\x00" in task_id + sandbox_id:
             return HandlerReceipt("续接交互失败: id 含非法路径字符。", ok=False)
 
-        gate_short = overwrite_short or self._short_for_task(task_id)
+        gate_short = self._short_for_task(task_id) or overwrite_short
         auto_retrieved = False
         pre_retrieve_reply = ""
         pre: HandlerReceipt | None = None
@@ -3342,6 +3712,7 @@ class AntigravitySandboxPlugin(Star):
                     pre_receipt=pre,
                 )
             auto_retrieved = True
+        self._cancel_file_poll(gate_short)
 
         assigned_key = assigned_key or self._find_key_for(
             task_id=task_id, sandbox_id=sandbox_id
@@ -3366,6 +3737,11 @@ class AntigravitySandboxPlugin(Star):
             + placement_instruction(expected_paths)
             + self._upload_instruction(output_files, stamp)
         )
+        tail_instruction = (
+            completed_marker_instruction(stamp)
+            if self._file_poll_enabled()
+            else ""
+        )
         put_notes: list[str] = []
         try:
             client = self._client()
@@ -3375,6 +3751,8 @@ class AntigravitySandboxPlugin(Star):
                 )
                 if put_notes:
                     full_prompt += "\n\n【用户附件】已尝试写入沙盒:\n" + "\n".join(put_notes)
+            # 完成标记要求放在最后，附件说明之后
+            full_prompt += tail_instruction
             # 延续会话时禁止 interaction sources。附件只走上面的 PUT。
             payload = client.build_create_payload(
                 prompt=full_prompt,
@@ -3443,7 +3821,12 @@ class AntigravitySandboxPlugin(Star):
             sandbox_id=returned_sandbox,
             previous_task_id=task_id,
             overwrite_short=overwrite_short,
+            allocate=False,
         )
+        if not short:
+            logger.warning(
+                f"续接未分配短号：覆盖目标为空 previous={task_id} new={new_task_id}"
+            )
         self._mark_round_outputs(
             short,
             expected_urls=expected_urls,
@@ -3451,6 +3834,14 @@ class AntigravitySandboxPlugin(Star):
         )
         self._schedule_auto_retrieve(
             short, task_id=new_task_id, sandbox_id=returned_sandbox
+        )
+        marker_path = stamped_completed_path(stamp) if self._file_poll_enabled() else ""
+        self._schedule_file_poll(
+            short,
+            task_id=new_task_id,
+            sandbox_id=returned_sandbox,
+            result_path=marker_path,
+            notify=notify,
         )
         status = _as_str(data.get("status")) or "unknown"
         if status in {"", "unknown"} and bool(payload.get("background")):
@@ -3481,6 +3872,8 @@ class AntigravitySandboxPlugin(Star):
         elif output:
             lines.append("当前 output_text:")
             lines.append(self._clip_user_text(output, keep_full=False))
+        if marker_path:
+            lines.append(f"完成标记: {marker_path}（取回文件查询状态开启时轮询它）")
         if expected_paths:
             lines.extend(["", "预期文件路径:"] + expected_paths)
         if expected_urls:
@@ -3520,7 +3913,10 @@ class AntigravitySandboxPlugin(Star):
         **_kwargs: Any,
     ) -> str:
         receipt = await self._do_retrieve(
-            task_id=task_id, sandbox_id=sandbox_id, render_image=event is not None
+            task_id=task_id,
+            sandbox_id=sandbox_id,
+            render_image=event is not None,
+            cancel_file_poll=True,
         )
         self._log_command_receipt("【retrieve_sandbox_task 完整回执】", receipt.text)
         image_sent = False
@@ -3540,6 +3936,7 @@ class AntigravitySandboxPlugin(Star):
         task_id: str = "",
         sandbox_id: str = "",
         cancel_auto: bool = True,
+        cancel_file_poll: bool = False,
         render_image: bool = False,
     ) -> HandlerReceipt:
         task_id = _as_str(task_id)
@@ -3631,6 +4028,8 @@ class AntigravitySandboxPlugin(Star):
         if cancel_auto and short:
             self._cancel_auto_retrieve(short)
             self._mark_short_retrieved(short, status)
+        if cancel_file_poll and short:
+            self._cancel_file_poll(short)
         output = extract_output_text(data)
         steps = summarize_steps(data)
         item = self._short_index.get(short) or {} if short else {}
@@ -3710,6 +4109,7 @@ class AntigravitySandboxPlugin(Star):
             prompt=prompt_text,
             output_files=output_files,
             file_paths=",".join(file_list),
+            notify=_notify_from_event(event, "command"),
         )
         self._log_command_receipt("【agsubmit 完整回执】", receipt.text)
         yield event.plain_result(self._command_ack(receipt))
@@ -3729,7 +4129,10 @@ class AntigravitySandboxPlugin(Star):
             return
         task_id, sandbox_id, _assigned_key = resolved
         receipt = await self._do_retrieve(
-            task_id=task_id, sandbox_id=sandbox_id, render_image=True
+            task_id=task_id,
+            sandbox_id=sandbox_id,
+            render_image=True,
+            cancel_file_poll=True,
         )
         self._log_command_receipt("【agretrieve 完整回执】", receipt.text)
         if receipt.image_path and await self._send_receipt_image(
@@ -3770,6 +4173,7 @@ class AntigravitySandboxPlugin(Star):
             output_files=output_files,
             file_paths=",".join(file_list),
             render_image=True,
+            notify=_notify_from_event(event, "command"),
         )
         self._log_command_receipt("【agcontinue 完整回执】", receipt.text)
         pre = receipt.pre_receipt
@@ -4146,6 +4550,20 @@ class AntigravitySandboxPlugin(Star):
         text, path, display = await self._pull_chat_file(task_id, name)
         if path is None or event is None:
             return text
+        if self._computer_use_runtime(event) == "local":
+            try:
+                rel = await self._save_pulled_file_to_workspace(
+                    event, path, display or path.name
+                )
+            except Exception as e:
+                logger.warning(f"写入会话工作区失败，改为发到聊天: {e}")
+                rel = ""
+            if rel:
+                return (
+                    f"已保存到当前会话工作区：{rel}\n"
+                    "这是相对于会话工作区的路径。请用文件工具读取，"
+                    "不要把文件内容复述进回复，也不要再发到聊天。"
+                )
         try:
             if hasattr(event, "track_temporary_local_file"):
                 event.track_temporary_local_file(str(path))
@@ -4894,7 +5312,12 @@ class AntigravitySandboxPlugin(Star):
             task = job.get("task")
             if task is not None and not task.done():
                 task.cancel()
-        for task in (self._startup_task, self._auto_retrieve_task, self._pull_cleanup_task):
+        for task in (
+            self._startup_task,
+            self._auto_retrieve_task,
+            self._file_poll_task,
+            self._pull_cleanup_task,
+        ):
             if task is not None and not task.done():
                 task.cancel()
                 try:
@@ -4922,7 +5345,7 @@ class SubmitSandboxTaskTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         plugin: AntigravitySandboxPlugin = self.plugin
-        return await plugin.handle_submit(**kwargs)
+        return await plugin.handle_submit(event=_tool_event(context), **kwargs)
 
 
 @dataclass

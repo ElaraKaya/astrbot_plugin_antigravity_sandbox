@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import sys
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -559,12 +560,14 @@ class SourceTests(unittest.TestCase):
         self.assertIn("未完成任务无法续接", text)
         self.assertIn("def _chat_pull_blocked", text)
         self.assertIn('endswith(".token")', text)
-        # 续接说明按新修订：默认 md 那句单独成行，附件提示另起一句
         self.assertIn(
-            "  在同一沙盒会话中续接任务。不写类型时默认 md，沙盒写入带时间戳的 result.md。\\n",
+            "  指定其它类型时仍会额外要求一份带时间戳的 result.md。\\n",
             text,
         )
         self.assertIn("【产物放置要求】", text)
+        self.assertIn('"/agget {short} <文件路径> 获取文件(可能需先取回任务)"', text)
+        self.assertIn('"后续:"', text)
+        self.assertNotIn("后续 /agr {short} 取回，", text)
         self.assertNotIn("def _maybe_plugin_upload_md", text)
         self.assertNotIn("plugin_md=", text)
         self.assertNotIn("default_ext=None", text)
@@ -572,6 +575,8 @@ class SourceTests(unittest.TestCase):
         self.assertIn("沙盒路径回执", schema)
         self.assertIn("回执基础地址", schema)
         self.assertIn("回执图床 URL", schema)
+        self.assertIn("测试功能", schema)
+        self.assertIn("取回文件查询状态", schema)
         self.assertIn("未备案域名", schema)
         self.assertNotIn('f"taskid: {short}"', text)
 
@@ -643,7 +648,19 @@ class ReceiptFormatTests(unittest.TestCase):
     def _helpers() -> dict:
         text = MAIN.read_text(encoding="utf-8")
         tree = ast.parse(text)
-        wanted = {"workspace_product_paths", "swap_url_origin", "placement_instruction"}
+        wanted = {
+            "workspace_product_paths",
+            "swap_url_origin",
+            "placement_instruction",
+            "ensure_result_md",
+            "completed_marker_name",
+            "stamped_completed_path",
+            "is_completed_marker_path",
+            "completed_marker_instruction",
+            "file_poll_notice",
+            "_output_file_names",
+            "_as_str",
+        }
         chunks: list[str] = []
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name in wanted:
@@ -652,9 +669,13 @@ class ReceiptFormatTests(unittest.TestCase):
                     chunks.append(segment)
         namespace: dict = {}
         exec(
-            "from urllib.parse import urlsplit, urlunsplit\n\n" + "\n\n".join(chunks),
+            "from typing import Any\nfrom urllib.parse import urlsplit, urlunsplit\n"
+            "from datetime import datetime\n\n"
+            + "\n\n".join(chunks),
             namespace,
         )
+        namespace["COMPLETED_MARKER_SUFFIX"] = ".completed"
+        namespace["_submit_stamp"] = lambda: "260928153045"
         return namespace
 
     def test_workspace_path_uses_stamped_filename(self):
@@ -692,6 +713,200 @@ class ReceiptFormatTests(unittest.TestCase):
         png = place(["/workspace/260927153045_result.png"])
         self.assertNotIn("不要把上一轮已有报告复制后交差", png)
         self.assertEqual(place([]), "")
+
+    def test_png_still_adds_one_result_md(self):
+        helpers = self._helpers()
+        ensure = helpers["ensure_result_md"]
+        self.assertEqual(ensure(""), "result.md")
+        self.assertEqual(ensure("result.png"), "result.png,result.md")
+        self.assertEqual(ensure("result.png,result.html"), "result.png,result.html,result.md")
+        self.assertEqual(ensure("result.md"), "result.md")
+        self.assertEqual(ensure("notes.md,result.md"), "notes.md,result.md")
+
+    def test_poll_watches_only_this_round_completed_marker(self):
+        helpers = self._helpers()
+        self.assertEqual(
+            helpers["completed_marker_name"]("260928153045"),
+            "260928153045.completed",
+        )
+        self.assertEqual(
+            helpers["stamped_completed_path"]("260928153045"),
+            "/workspace/260928153045.completed",
+        )
+        # 与 result.md 用同一时间戳，工具输出路径差一个后缀
+        self.assertEqual(
+            helpers["stamped_completed_path"]("260928153045"),
+            "/workspace/260928153045_result.md".replace("_result.md", ".completed"),
+        )
+        self.assertEqual(helpers["file_poll_notice"]("0001"), "任务 0001 可能已经完成，请使用 /agr 0001 取回")
+
+    def test_completed_marker_path_filter(self):
+        helpers = self._helpers()
+        is_marker = helpers["is_completed_marker_path"]
+        self.assertTrue(is_marker("/workspace/260928153045.completed"))
+        self.assertTrue(is_marker("workspace/260928153045.COMPLETED"))
+        self.assertFalse(is_marker("/workspace/260928153045_result.md"))
+        self.assertFalse(is_marker(""))
+
+    def test_completed_marker_instruction_text(self):
+        helpers = self._helpers()
+        text = helpers["completed_marker_instruction"]("260928153045")
+        self.assertIn("完成所有任务后请在工作空间创建文件 260928153045.completed的空文件,此项不需要汇报。", text)
+        self.assertTrue(text.startswith("\n\n"))
+
+
+class LatestRoundTests(unittest.TestCase):
+    @staticmethod
+    def _pick():
+        text = MAIN.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        wanted = {
+            "_as_str",
+            "_now",
+            "_parse_iso",
+            "_parse_short_int",
+            "_index_item_is_round",
+            "pick_latest_indexed_short",
+        }
+        chunks: list[str] = []
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in wanted:
+                segment = ast.get_source_segment(text, node)
+                if segment:
+                    chunks.append(segment)
+        namespace: dict = {}
+        exec(
+            "import re\n"
+            "from datetime import datetime\n"
+            "SHORT_ID_WIDTH = 4\n"
+            "CONTINUE_SHORT_TIME_WIDTH = 6\n"
+            "CONTINUE_SHORT_RE = re.compile(r'^(\\d+)_(\\d{6})$')\n\n"
+            + "\n\n".join(chunks),
+            namespace,
+        )
+        return namespace["pick_latest_indexed_short"]
+
+    def test_side_rows_do_not_outrank_a_real_round(self):
+        pick = self._pick()
+        sandbox = "env-1"
+        index = {
+            "0006": {
+                "sandbox_id": sandbox,
+                "task_id": "task-new",
+                "recorded_at": "2026-09-28T18:47:08+08:00",
+                "expected_paths": "/workspace/260928184708_result.md",
+                "retrieved": "1",
+                "last_status": "completed",
+            },
+            "0014": {
+                "sandbox_id": sandbox,
+                "task_id": "task-old",
+                "recorded_at": "2026-09-28T18:47:10+08:00",
+                "retrieved": "1",
+                "last_status": "completed",
+            },
+        }
+        self.assertEqual(pick(index, sandbox), "0006")
+
+    def test_without_round_rows_newest_stamp_still_wins(self):
+        pick = self._pick()
+        sandbox = "env-1"
+        index = {
+            "0001": {
+                "sandbox_id": sandbox,
+                "recorded_at": "2026-09-28T18:00:00+08:00",
+            },
+            "0002": {
+                "sandbox_id": sandbox,
+                "recorded_at": "2026-09-28T19:00:00+08:00",
+            },
+        }
+        self.assertEqual(pick(index, sandbox), "0002")
+        self.assertEqual(pick(index, "missing"), "")
+
+    def test_continue_gate_uses_the_followed_task_and_reply_does_not_allocate(self):
+        text = MAIN.read_text(encoding="utf-8")
+        self.assertIn(
+            "gate_short = self._short_for_task(task_id) or overwrite_short",
+            text,
+        )
+        self.assertNotIn(
+            "return self._record_short(receipt.task_id, receipt.sandbox_id)",
+            text,
+        )
+        self.assertIn("allocate=False", text)
+
+    def test_continue_record_never_mints_a_short(self):
+        text = MAIN.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        segment = ""
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if isinstance(child, ast.FunctionDef) and child.name == "_record_short":
+                        segment = ast.get_source_segment(text, child) or ""
+        self.assertTrue(segment)
+        namespace: dict = {"_as_str": lambda value: "" if value is None else str(value).strip()}
+        exec(textwrap.dedent(segment), namespace)
+        record = namespace["_record_short"]
+
+        class Box:
+            def __init__(self):
+                self._short_index = {
+                    "0006": {"task_id": "old", "sandbox_id": "env", "key": "k"},
+                }
+                self.allocated = False
+
+            def _find_key_for(self, **_kwargs):
+                return ""
+
+            def _short_for_task(self, task_id):
+                for short, item in self._short_index.items():
+                    if item.get("task_id") == task_id:
+                        return short
+                return ""
+
+            def _short_item(self, task_id, sandbox_id, *, key="", recorded_at=""):
+                item = {"task_id": task_id, "sandbox_id": sandbox_id}
+                if key:
+                    item["key"] = key
+                if recorded_at:
+                    item["recorded_at"] = recorded_at
+                return item
+
+            def _copy_retrieve_meta(self, _src, _dest):
+                return None
+
+            def _save_short_index(self):
+                return None
+
+            def _trim_short_index(self):
+                raise AssertionError("continue trimmed the short index")
+
+            def _alloc_submit_short(self):
+                self.allocated = True
+                raise AssertionError("continue allocated a short")
+
+        box = Box()
+        got = record(
+            box,
+            "new-task",
+            "env",
+            previous_task_id="old",
+            overwrite_short="0006",
+            allocate=False,
+        )
+        self.assertEqual(got, "0006")
+        self.assertEqual(box._short_index["0006"]["task_id"], "new-task")
+        self.assertEqual(list(box._short_index), ["0006"])
+        self.assertFalse(box.allocated)
+
+        empty = Box()
+        empty._short_index = {}
+        missing = record(empty, "new-task", "env", allocate=False)
+        self.assertEqual(missing, "")
+        self.assertEqual(empty._short_index, {})
+        self.assertFalse(empty.allocated)
 
 
 if __name__ == "__main__":
