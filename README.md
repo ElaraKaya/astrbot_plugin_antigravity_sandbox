@@ -6,7 +6,7 @@ AstrBot 插件：用 Google **Antigravity** 托管智能体在云端沙盒里跑
 
 - 插件名：`astrbot_plugin_antigravity_sandbox`
 - 作者：珂夜
-- 版本：1.6.8beta1
+- 版本：1.6.3beta1
 - 需要 AstrBot `>=4.5.7,<5`
 
 ## 介绍
@@ -186,7 +186,7 @@ Project environment storage quota exceeded
 
 ## 更新日志
 
-**1.6.8beta1**：版本收口。1.6.4 到 1.6.7 并入本 beta。
+**1.6.3beta1**：版本收口。1.6.4 到 1.6.7 并入本 beta。
 
 **1.6.7**：「取回文件查询状态」改为轮询完成标记空文件。开启后提交和续接会在沙盒提示词末尾追加「完成所有任务后请在工作空间创建文件 `<时间戳>.completed`的空文件,此项不需要汇报。」，并每 10 秒查看这个 `.completed` 文件，最多 1 小时。轮询记录改用 `.completed` 路径，旧版 `result.md` 记录升级后被丢弃。
 
