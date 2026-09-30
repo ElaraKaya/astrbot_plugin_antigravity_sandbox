@@ -1312,15 +1312,16 @@ class AntigravitySandboxPlugin(Star):
         section = self._group(group)
         if key in section and section[key] is not None:
             return section[key]
-        # 完成标记三项原先放在「测试功能」。新配置没写时仍读旧分组。
-        if group == "receipt" and key in {
-            "file_status_poll",
-            "completed_notify",
-            "file_poll_interval",
-        }:
+        # 完成标记原先放在「测试功能」。新配置没写时仍读旧分组。
+        if group == "receipt" and key in {"file_status_poll", "file_poll_interval"}:
             probe = self._group("probe")
             if key in probe and probe[key] is not None:
                 return probe[key]
+        # 工具提交提醒现在放在「测试功能」。配置还写在取回回执时也认。
+        if group == "probe" and key == "completed_notify":
+            receipt = self._group("receipt")
+            if key in receipt and receipt[key] is not None:
+                return receipt[key]
         cfg = self.config or {}
         if legacy and legacy in cfg and cfg[legacy] is not None:
             return cfg[legacy]
@@ -1637,8 +1638,8 @@ class AntigravitySandboxPlugin(Star):
 
     def _file_poll_enabled(self) -> bool:
         return _as_bool(
-            self._setting("receipt", "file_status_poll", "file_status_poll", False),
-            False,
+            self._setting("receipt", "file_status_poll", "file_status_poll", True),
+            True,
         )
 
     def _file_poll_interval(self) -> float:
@@ -1832,7 +1833,7 @@ class AntigravitySandboxPlugin(Star):
         """
         if _as_str(origin) != "command":
             return _as_bool(
-                self._setting("receipt", "completed_notify", "completed_notify", False),
+                self._setting("probe", "completed_notify", "completed_notify", False),
                 False,
             )
         return True

@@ -42,8 +42,8 @@
       "max_in_progress_per_key": {
         "description": "单 Key 进行中任务上限",
         "type": "int",
-        "hint": "每个 Gemini Key 同时处于 in_progress 的任务数，默认 1。只统计本地缓存。新建任务优先交给更空闲的 Key；剩余额度相同则提交到上一把 Key 的下一把。全部占满时先对相关短号 GET 刷新一次，仍无空闲则提示目前无空余沙盒分配。续接不换 Key，达到上限直接拒绝。",
-        "default": 1
+        "hint": "每个 Gemini Key 同时处于 in_progress 的任务数，默认 4。只统计本地缓存。新建任务优先交给更空闲的 Key；剩余额度相同则提交到上一把 Key 的下一把。全部占满时先对相关短号 GET 刷新一次，仍无空闲则提示目前无空余沙盒分配。续接不换 Key，达到上限直接拒绝。",
+        "default": 4
       }
     }
   },
@@ -104,15 +104,22 @@
       "file_status_poll": {
         "description": "完成标记提醒",
         "type": "bool",
-        "hint": "开启后，提交时让沙盒做完再写一个空的完成标记文件。插件按下方间隔去看这个文件，最多看 1 小时。看到了就在原会话提示用 /agr 取回。/agr 问到任务还在跑（in_progress）时继续看；问到已结束才停。默认关闭。",
-        "default": false
+        "hint": "开启后，提交时让沙盒做完再写一个空的完成标记文件。插件按下方间隔去看这个文件，最多看 1 小时。看到了就在原会话提示用 /agr 取回。/agr 问到任务还在跑（in_progress）时继续看；问到已结束才停。默认开启。",
+        "default": true
       },
       "file_poll_interval": {
         "description": "完成标记查询间隔（秒）",
         "type": "int",
         "hint": "隔多久去沙盒看一次完成标记。默认 30 秒。最小 5 秒。",
         "default": 30
-      },
+      }
+    }
+  },
+  "probe": {
+    "description": "测试功能",
+    "hint": "还在试的开关。默认不影响 /ags、/agc 的完成提醒。",
+    "type": "object",
+    "items": {
       "completed_notify": {
         "description": "工具提交也提醒",
         "type": "bool",

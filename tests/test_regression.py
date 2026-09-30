@@ -578,7 +578,8 @@ class SourceTests(unittest.TestCase):
         self.assertIn("完成标记提醒", schema)
         self.assertIn("完成标记查询间隔", schema)
         self.assertNotIn("取回文件查询状态", schema)
-        self.assertNotIn('"probe"', schema)
+        self.assertIn('"probe"', schema)
+        self.assertIn("测试功能", schema)
         self.assertIn("未备案域名", schema)
         self.assertNotIn('f"taskid: {short}"', text)
 
@@ -959,7 +960,7 @@ class CompletedNotifyOriginTests(unittest.TestCase):
     def _stub(self, **probe):
         class Stub:
             def _setting(self, group, key, legacy=None, default=None):
-                assert group == "receipt"
+                assert group == "probe"
                 return probe.get(key, default)
 
         return Stub()
