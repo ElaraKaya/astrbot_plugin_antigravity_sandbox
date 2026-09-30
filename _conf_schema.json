@@ -100,6 +100,24 @@
         "type": "bool",
         "hint": "提交或续接满 1 小时仍未手动取回时，后台查询一次并写日志，不推送到会话。手动取回会取消这次等待。",
         "default": true
+      },
+      "file_status_poll": {
+        "description": "完成标记提醒",
+        "type": "bool",
+        "hint": "开启后，提交时让沙盒做完再写一个空的完成标记文件。插件按下方间隔去看这个文件，最多看 1 小时。看到了就在原会话提示用 /agr 取回。/agr 问到任务还在跑（in_progress）时继续看；问到已结束才停。默认关闭。",
+        "default": false
+      },
+      "file_poll_interval": {
+        "description": "完成标记查询间隔（秒）",
+        "type": "int",
+        "hint": "隔多久去沙盒看一次完成标记。默认 30 秒。最小 5 秒。",
+        "default": 30
+      },
+      "completed_notify": {
+        "description": "工具提交也提醒",
+        "type": "bool",
+        "hint": "/ags、/agc 提交的，看到完成标记后照常在原会话提示。模型用工具提交的默认只写日志、不发消息，避免打断当前对话。打开后，工具提交也照常提示。默认关闭。",
+        "default": false
       }
     }
   },
@@ -188,19 +206,6 @@
         "type": "bool",
         "hint": "遇到 Project environment storage quota exceeded 时，先在当前 Key 的项目里删除闲置环境，再用同一把 Key 重试提交。",
         "default": true
-      }
-    }
-  },
-  "probe": {
-    "description": "测试功能",
-    "hint": "默认关闭。只影响完成后的完成标记轮询提示，不改变沙盒是否写入 result.md。",
-    "type": "object",
-    "items": {
-      "file_status_poll": {
-        "description": "取回文件查询状态",
-        "type": "bool",
-        "hint": "开启后，提交和续接会在给沙盒的提示词末尾追加完成标记要求（例如 260928153045.completed 空文件），并每 10 秒查看这一轮的标记文件，最多 1 小时。取到文件后在原会话提示用 /agr 取回。与「1 小时后自动取回」并行。手动取回问到状态后停止。默认关闭。",
-        "default": false
       }
     }
   }

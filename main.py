@@ -57,6 +57,7 @@ try:
         MSG_NO_CAPACITY,
         MSG_PULL_TIMEOUT,
         RUNNING_STATUS,
+        TERMINAL_STATUS,
         UI_PULL_CONCURRENCY,
         UI_PULL_PROGRESS_INTERVAL,
         GeminiClientError,
@@ -96,6 +97,7 @@ except ImportError:  # loaded as a loose main.py, not a package
         MSG_NO_CAPACITY,
         MSG_PULL_TIMEOUT,
         RUNNING_STATUS,
+        TERMINAL_STATUS,
         UI_PULL_CONCURRENCY,
         UI_PULL_PROGRESS_INTERVAL,
         GeminiClientError,
@@ -156,7 +158,7 @@ DEFAULT_KEEP_RECENT = 2
 AUTO_RETRIEVE_SECONDS = 60 * 60
 AUTO_RETRIEVE_TICK_SECONDS = 30.0
 FILE_POLL_SECONDS = 60 * 60
-FILE_POLL_INTERVAL_SECONDS = 10.0
+FILE_POLL_INTERVAL_SECONDS = 30.0
 PULL_TEMP_TTL_SECONDS = 30 * 60
 
 RETRIEVE_QUERY_FAIL_PREFIX = "取回失败（查询超时或网络错误）"
@@ -267,6 +269,14 @@ def _as_str(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def file_poll_should_stop(status: str) -> bool:
+    """/agr 问到终态才停 .completed 轮询。in_progress、queued 继续查。"""
+    text = _as_str(status).lower()
+    if not text or text in RUNNING_STATUS | {"unknown"}:
+        return False
+    return text in TERMINAL_STATUS
 
 
 def receipt_image_applies(
@@ -552,7 +562,7 @@ def stamped_completed_path(stamp: str) -> str:
 
 
 def completed_marker_instruction(stamp: str) -> str:
-    """取回文件查询状态开启时追加到沙盒提示词末尾的完成标记要求。"""
+    """完成标记提醒开启时追加到沙盒提示词末尾的完成标记要求。"""
     return (
         "\n\n完成所有任务后请在工作空间创建文件 "
         f"{completed_marker_name(stamp)}的空文件,此项不需要汇报。"
@@ -1074,7 +1084,7 @@ def _submit_parameters() -> dict:
                     "无论是否指定其它类型，都会额外要求一份 result.md；已经包含 result.md 时不追加。"
                     "插件提交时自动加 YYMMDDHHMMSS_ 前缀，并要求沙盒保存到 "
                     "/workspace/<时间戳文件名>。图床开启且配置齐全时同时要求上传。"
-                    "测试功能里的「取回文件查询状态」开启时，还会额外要求沙盒在完成时创建 "
+                    "「取回回执 / 完成标记提醒」开启时，还会额外要求沙盒在完成时创建 "
                     "<时间戳>.completed 空文件。"
                 ),
             },
@@ -1132,7 +1142,7 @@ def _continue_parameters() -> dict:
                     "留空则默认 result.md。无论是否指定其它类型，都会额外要求一份 result.md；"
                     "已经包含 result.md 时不追加。插件自动加时间戳前缀，并要求沙盒保存到 "
                     "/workspace/<时间戳文件名>。图床开启且配置齐全时同时要求上传。"
-                    "测试功能里的「取回文件查询状态」开启时，还会额外要求沙盒在完成时创建 "
+                    "「取回回执 / 完成标记提醒」开启时，还会额外要求沙盒在完成时创建 "
                     "<时间戳>.completed 空文件。"
                 ),
             },
@@ -1302,6 +1312,15 @@ class AntigravitySandboxPlugin(Star):
         section = self._group(group)
         if key in section and section[key] is not None:
             return section[key]
+        # 完成标记三项原先放在「测试功能」。新配置没写时仍读旧分组。
+        if group == "receipt" and key in {
+            "file_status_poll",
+            "completed_notify",
+            "file_poll_interval",
+        }:
+            probe = self._group("probe")
+            if key in probe and probe[key] is not None:
+                return probe[key]
         cfg = self.config or {}
         if legacy and legacy in cfg and cfg[legacy] is not None:
             return cfg[legacy]
@@ -1618,9 +1637,19 @@ class AntigravitySandboxPlugin(Star):
 
     def _file_poll_enabled(self) -> bool:
         return _as_bool(
-            self._setting("probe", "file_status_poll", "file_status_poll", False),
+            self._setting("receipt", "file_status_poll", "file_status_poll", False),
             False,
         )
+
+    def _file_poll_interval(self) -> float:
+        raw = self._setting("receipt", "file_poll_interval", "file_poll_interval", 30)
+        try:
+            seconds = float(raw)
+        except (TypeError, ValueError):
+            seconds = FILE_POLL_INTERVAL_SECONDS
+        if seconds < 5:
+            seconds = 5
+        return seconds
 
     def _load_file_polls(self) -> dict[str, dict[str, str]]:
         path = self._file_poll_file()
@@ -1691,7 +1720,7 @@ class AntigravitySandboxPlugin(Star):
             "sandbox_id": sandbox_id,
             "result_path": result_path,
             "deadline": (now + timedelta(seconds=FILE_POLL_SECONDS)).isoformat(),
-            "next_poll_at": (now + timedelta(seconds=FILE_POLL_INTERVAL_SECONDS)).isoformat(),
+            "next_poll_at": (now + timedelta(seconds=self._file_poll_interval())).isoformat(),
             "umo": _as_str(note.get("umo")),
             "sender_id": _as_str(note.get("sender_id")),
             "sender_name": _as_str(note.get("sender_name")),
@@ -1715,7 +1744,7 @@ class AntigravitySandboxPlugin(Star):
                     raise
                 except Exception as e:
                     logger.warning(f"文件状态轮询循环异常: {e}")
-                    delay = FILE_POLL_INTERVAL_SECONDS
+                    delay = self._file_poll_interval()
                 await asyncio.sleep(delay)
         except asyncio.CancelledError:
             raise
@@ -1734,7 +1763,7 @@ class AntigravitySandboxPlugin(Star):
                     self._file_polls.pop(short, None)
                     logger.info(f"文件状态轮询放弃 {short}：1 小时内未取到 .completed 完成标记")
                 self._save_file_polls()
-            return FILE_POLL_INTERVAL_SECONDS
+            return self._file_poll_interval()
         due: list[str] = []
         next_due: datetime | None = None
         for short, info in list(self._file_polls.items()):
@@ -1751,9 +1780,10 @@ class AntigravitySandboxPlugin(Star):
         for short in due:
             await self._file_poll_one(short)
         if next_due is None:
-            return FILE_POLL_INTERVAL_SECONDS
+            return self._file_poll_interval()
         wait = (next_due - _now()).total_seconds()
-        return max(1.0, min(FILE_POLL_INTERVAL_SECONDS, wait))
+        interval = self._file_poll_interval()
+        return max(1.0, min(interval, wait))
 
     async def _file_poll_one(self, short: str) -> None:
         short = _as_str(short)
@@ -1773,7 +1803,7 @@ class AntigravitySandboxPlugin(Star):
             logger.info(f"文件状态轮询 {short} 尚未取到: {e}")
         if not found:
             info["next_poll_at"] = (
-                _now() + timedelta(seconds=FILE_POLL_INTERVAL_SECONDS)
+                _now() + timedelta(seconds=self._file_poll_interval())
             ).isoformat()
             self._save_file_polls()
             return
@@ -1794,15 +1824,35 @@ class AntigravitySandboxPlugin(Star):
         match = self._match_listed_file(files, name)
         return bool(match) and _as_str(match.get("type")) != "directory"
 
+    def _completed_notify_enabled_for(self, origin: str) -> bool:
+        """指令提交照常提示；工具提交默认只写日志，开关打开才提示。
+
+        定时任务和模型自主提交都是外层模型调工具进来的，让它们抓到完成标记后
+        往会话里发「请用 /agr 取回」会打断正在进行的对话。
+        """
+        if _as_str(origin) != "command":
+            return _as_bool(
+                self._setting("receipt", "completed_notify", "completed_notify", False),
+                False,
+            )
+        return True
+
     async def _notify_file_ready(self, short: str, info: dict[str, str]) -> None:
         umo = _as_str(info.get("umo"))
+        origin = _as_str(info.get("origin"))
         if not umo:
             logger.info(f"文件状态轮询 {short} 没有会话，跳过通知")
+            return
+        if not self._completed_notify_enabled_for(origin):
+            logger.info(
+                f"文件状态轮询取到 {short}，提交来源 origin={origin or 'unknown'} "
+                "按设置只写日志，未在会话中提示"
+            )
             return
         text = file_poll_notice(short)
         chain = MessageChain()
         sender_id = _as_str(info.get("sender_id"))
-        if _as_str(info.get("origin")) == "command" and sender_id:
+        if origin == "command" and sender_id:
             chain.at(_as_str(info.get("sender_name")) or sender_id, sender_id)
         chain.message(text)
         try:
@@ -3502,7 +3552,7 @@ class AntigravitySandboxPlugin(Star):
             lines.append("当前 output_text:")
             lines.append(self._clip_user_text(output, keep_full=False))
         if marker_path:
-            lines.append(f"完成标记: {marker_path}（取回文件查询状态开启时轮询它）")
+            lines.append(f"完成标记: {marker_path}（完成标记提醒开启时按间隔查看）")
         if expected_paths:
             lines.extend(["", "预期文件路径:"] + expected_paths)
         if expected_urls:
@@ -3873,7 +3923,7 @@ class AntigravitySandboxPlugin(Star):
             lines.append("当前 output_text:")
             lines.append(self._clip_user_text(output, keep_full=False))
         if marker_path:
-            lines.append(f"完成标记: {marker_path}（取回文件查询状态开启时轮询它）")
+            lines.append(f"完成标记: {marker_path}（完成标记提醒开启时按间隔查看）")
         if expected_paths:
             lines.extend(["", "预期文件路径:"] + expected_paths)
         if expected_urls:
@@ -4028,7 +4078,9 @@ class AntigravitySandboxPlugin(Star):
         if cancel_auto and short:
             self._cancel_auto_retrieve(short)
             self._mark_short_retrieved(short, status)
-        if cancel_file_poll and short:
+        # 问到 in_progress / queued 说明任务还在跑，.completed 轮询不能停。
+        # 只有终态（完成、失败、取消等）才停，避免 /agr 查一次就把提醒掐掉。
+        if cancel_file_poll and short and file_poll_should_stop(status):
             self._cancel_file_poll(short)
         output = extract_output_text(data)
         steps = summarize_steps(data)

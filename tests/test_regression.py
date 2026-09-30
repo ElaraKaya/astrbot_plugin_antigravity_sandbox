@@ -575,8 +575,10 @@ class SourceTests(unittest.TestCase):
         self.assertIn("沙盒路径回执", schema)
         self.assertIn("回执基础地址", schema)
         self.assertIn("回执图床 URL", schema)
-        self.assertIn("测试功能", schema)
-        self.assertIn("取回文件查询状态", schema)
+        self.assertIn("完成标记提醒", schema)
+        self.assertIn("完成标记查询间隔", schema)
+        self.assertNotIn("取回文件查询状态", schema)
+        self.assertNotIn('"probe"', schema)
         self.assertIn("未备案域名", schema)
         self.assertNotIn('f"taskid: {short}"', text)
 
@@ -658,6 +660,7 @@ class ReceiptFormatTests(unittest.TestCase):
             "is_completed_marker_path",
             "completed_marker_instruction",
             "file_poll_notice",
+            "file_poll_should_stop",
             "_output_file_names",
             "_as_str",
         }
@@ -671,6 +674,10 @@ class ReceiptFormatTests(unittest.TestCase):
         exec(
             "from typing import Any\nfrom urllib.parse import urlsplit, urlunsplit\n"
             "from datetime import datetime\n\n"
+            "RUNNING_STATUS = frozenset({'in_progress', 'queued'})\n"
+            "TERMINAL_STATUS = frozenset({"
+            "'completed', 'failed', 'cancelled', 'incomplete', "
+            "'budget_exceeded', 'requires_action'})\n\n"
             + "\n\n".join(chunks),
             namespace,
         )
@@ -753,6 +760,19 @@ class ReceiptFormatTests(unittest.TestCase):
         text = helpers["completed_marker_instruction"]("260928153045")
         self.assertIn("完成所有任务后请在工作空间创建文件 260928153045.completed的空文件,此项不需要汇报。", text)
         self.assertTrue(text.startswith("\n\n"))
+
+    def test_in_progress_does_not_stop_completed_poll(self):
+        helpers = self._helpers()
+        stop = helpers["file_poll_should_stop"]
+        self.assertFalse(stop("in_progress"))
+        self.assertFalse(stop("IN_PROGRESS"))
+        self.assertFalse(stop("queued"))
+        self.assertFalse(stop("unknown"))
+        self.assertFalse(stop(""))
+        self.assertTrue(stop("completed"))
+        self.assertTrue(stop("failed"))
+        self.assertTrue(stop("cancelled"))
+        self.assertTrue(stop("incomplete"))
 
 
 class LatestRoundTests(unittest.TestCase):
@@ -907,6 +927,87 @@ class LatestRoundTests(unittest.TestCase):
         self.assertEqual(missing, "")
         self.assertEqual(empty._short_index, {})
         self.assertFalse(empty.allocated)
+
+
+class CompletedNotifyOriginTests(unittest.TestCase):
+    """完成标记提示按提交来源区分：指令照常，工具默认静默。"""
+
+    @staticmethod
+    def _gate():
+        """抽出 _completed_notify_enabled_for，用桩 config 跑真实判定。"""
+        text = MAIN.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        wanted = {"_completed_notify_enabled_for"}
+        segments = []
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if isinstance(child, ast.FunctionDef) and child.name in wanted:
+                        segment = ast.get_source_segment(text, child)
+                        if segment:
+                            segments.append(textwrap.dedent(segment))
+        assert segments, "_completed_notify_enabled_for not found in main.py"
+        namespace: dict = {
+            "_as_str": lambda v: "" if v is None else str(v).strip(),
+            "_as_bool": lambda v, d: (
+                str(v).strip().lower() in {"1", "true", "yes", "on"} if v is not None else d
+            ),
+        }
+        exec("\n\n".join(segments), namespace)
+        return namespace["_completed_notify_enabled_for"]
+
+    def _stub(self, **probe):
+        class Stub:
+            def _setting(self, group, key, legacy=None, default=None):
+                assert group == "receipt"
+                return probe.get(key, default)
+
+        return Stub()
+
+    def test_command_origin_always_notifies(self):
+        gate = self._gate()
+        self.assertTrue(gate(self._stub(), "command"))
+        # 即使开关关着也发，指令是用户自己打的
+        self.assertTrue(gate(self._stub(completed_notify=False), "command"))
+
+    def test_tool_origin_stays_silent_by_default(self):
+        gate = self._gate()
+        # 外层模型自主提交：默认不往会话里弹提示
+        self.assertFalse(gate(self._stub(), "tool"))
+        # 开关显式关同样不发
+        self.assertFalse(gate(self._stub(completed_notify=False), "tool"))
+        # 读到空或缺省都回落静默
+        self.assertFalse(gate(self._stub(completed_notify=None), "tool"))
+
+    def test_tool_origin_notifies_only_when_switch_on(self):
+        gate = self._gate()
+        self.assertTrue(gate(self._stub(completed_notify=True), "tool"))
+        self.assertTrue(gate(self._stub(completed_notify="true"), "tool"))
+
+    def test_unknown_origin_treated_as_tool(self):
+        # 来源字段缺失或未知值时按更保守的工具提交处理
+        gate = self._gate()
+        self.assertFalse(gate(self._stub(), ""))
+        self.assertFalse(gate(self._stub(), "cron"))
+        self.assertTrue(gate(self._stub(completed_notify=True), ""))
+
+    def test_notify_routes_by_origin(self):
+        """_notify_file_ready 只对允许的来源调用 send_message。"""
+        text = MAIN.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        segment = ""
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if (
+                        isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and child.name == "_notify_file_ready"
+                    ):
+                        segment = ast.get_source_segment(text, child) or ""
+        assert segment
+        # 指令来源仍然 @提交人
+        self.assertIn('if origin == "command" and sender_id:', segment)
+        self.assertIn("self._completed_notify_enabled_for(origin)", segment)
 
 
 if __name__ == "__main__":
