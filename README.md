@@ -6,7 +6,7 @@ AstrBot 插件：用 Google **Antigravity** 托管智能体在云端沙盒里跑
 
 - 插件名：`astrbot_plugin_antigravity_sandbox`
 - 作者：珂夜
-- 版本：1.6.3beta3
+- 版本：1.6.3beta4
 - 需要 AstrBot `>=4.5.7,<5`
 
 ## 介绍
@@ -87,7 +87,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | --- | --- | --- |
 | 接入与模型 | `gemini_api_keys` | **必填。** AI Studio 的 Gemini Key，可多个 |
 | 接入与模型 | `default_model` | 底层模型。默认 `auto`，一般不用改 |
-| 接入与模型 | `sandbox_agent` | 默认 `antigravity-preview-05-2026`。Google 发布新沙盒版本后只改这里，不要填 `gemini-*` 模型名 |
+| 接入与模型 | `sandbox_agent` | 默认 `antigravity-preview-09-2026`。Google 发布新沙盒版本后只改这里，不要填 `gemini-*` 模型名 |
 | 接入与模型 | `submit_background` | 默认开启：提交后立刻回 ID，稍后取回 |
 | 接入与模型 | `max_in_progress_per_key` | 每个 Key 同时处于 `in_progress` 的任务上限，默认 4。新建任务优先给更空闲的 Key；额度相同则轮到上一把的下一把。续接不换 Key |
 | 网络代理 | `proxy` | 插件访问 Gemini 的代理。留空直连。图床 Webhook 不走这里 |
@@ -100,12 +100,12 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | 取回回执 | `file_status_poll` | 完成标记提醒。默认开启。沙盒做完会写一个空的完成标记，插件按间隔去看，最多 1 小时。看到了就提示用 `/agr` 取回。`/agr` 问到还在跑会继续看，问到已结束才停 |
 | 取回回执 | `file_poll_interval` | 完成标记查询间隔，默认 30 秒，最小 5 秒 |
 | 测试功能 | `completed_notify` | 工具提交也提醒。默认关闭。`/ags`、`/agc` 照常提示；模型用工具提交的默认只写日志。打开后工具提交也提示 |
-| 图床上传 | `enabled` | 启用上传图床。关闭后不挂载 Token，也不要求沙盒上传。产物仍要求存到工作空间 |
+| 图床上传 | `enabled` | 启用上传图床。关闭后不再要求沙盒上传。产物仍要求存到工作空间 |
 | 图床上传 | `webhook_url` | 图床上传地址（可选） |
 | 图床上传 | `public_base_url` | 图床公网基础地址（可选）。发给沙盒的地址用这个 |
 | 图床上传 | `receipt_base_url` | 回执基础地址。默认空。只替换回执链接的域名，空则用公网访问基础地址。QQ 群里频繁发送未备案域名，域名容易被标记 |
 | 图床上传 | `receipt_url` | 回执图床 URL。默认开启。关闭后回执不写图床链接。是否上传仍由总开关决定 |
-| 图床上传 | `token` | 图床 Token（可选，会挂到沙盒 `/workspace/upload.token`） |
+| 图床上传 | `token` | 图床 Token（可选）。存为项目内独占的 Gemini bearer 凭据，由出站代理注入到 Webhook 主机 |
 | 图床上传 | `prefix` | 默认上传目录，默认 `agysb` |
 | 沙盒环境回收 | `auto_cleanup` | 默认开启：自动回收闲置沙盒，避免存储配额打满 |
 | 沙盒环境回收 | `idle_ttl_hours` | 默认 24：闲置多久可回收 |
@@ -191,6 +191,8 @@ Project environment storage quota exceeded
 `/agenvcleanup 0002`：按短号立即删除对应沙盒，不受 TTL / 最近保留限制。
 
 ## 更新日志
+
+**1.6.3beta4**：图床 Token 改为项目内 bearer 凭据，由出站代理注入到 Webhook 主机，不再挂到沙盒文件。续接附件只 PUT 进沙盒，不再由插件再传一次图床。本版不删除历史沙盒里的 Token 文件，旧 Token 要在图床侧轮换后才算失效。详见 [CHANGELOG.md](CHANGELOG.md)。
 
 **1.6.3beta3**：完成标记提醒挪到「取回回执」，默认开启。工具提交也提醒放回「测试功能」，默认关闭。单 Key 进行中上限默认 4。新增查询间隔，默认 30 秒。`/agr` 问到 `in_progress` 不再停止完成标记轮询，问到已结束才停。
 

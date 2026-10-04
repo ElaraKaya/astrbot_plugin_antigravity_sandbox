@@ -1,5 +1,13 @@
 # 更新日志
 
+## 1.6.3beta4 - 2026-10-04
+
+- 图床 Token 改为 Gemini `bearer_token` 凭据（固定 ID `astrbot-image-host`，一个 Google 项目一套图床）。出站代理只向 Webhook 主机注入 `Authorization`，沙盒里不再挂 `/workspace/upload.token`。
+- 上传地址只接受 HTTPS 的具体主机。通配主机、userinfo 和非法端口会在建凭据之前失败，回执不带原始地址。
+- 续接必须使用任务绑定的那把 Key。凭据准备、附件 PUT 和 interaction 用同一把，401/403/429 也不换 Key。绑定缺失时直接失败。
+- 续接附件只通过 Environments Files PUT 写入沙盒，插件不再把同一份字节再传到图床。
+- 本版不自动删除历史沙盒里的 Token 文件，也不撤销旧环境上已经写过的出站规则。旧 Token 要在图床侧轮换后才算失效。
+
 ## 1.6.3beta3 - 2026-09-30
 
 - 「完成标记提醒」从「测试功能」挪到「取回回执」，默认开启。旧配置仍生效。

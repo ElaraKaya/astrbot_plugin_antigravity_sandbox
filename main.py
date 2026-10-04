@@ -33,7 +33,6 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import astrbot.api.message_components as Comp
-import httpx
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
@@ -51,6 +50,7 @@ try:
         DEFAULT_AGENT,
         DEFAULT_IN_PROGRESS_PER_KEY,
         DEFAULT_RECEIPT_TRUNCATE_CHARS,
+        IMAGE_HOST_CREDENTIAL_ID,
         MSG_FILE_MISSING,
         MSG_FILE_TOO_LARGE,
         MSG_LIST_EMPTY,
@@ -68,7 +68,7 @@ try:
         GeminiSandboxClient,
         GeminiSubmitTimeoutError,
         ProgressThrottle,
-        build_httpx_client_kwargs,
+        build_upload_instruction,
         clip_text,
         count_key_in_progress,
         ensure_md_filename,
@@ -78,10 +78,12 @@ try:
         extract_output_text,
         files_error_kind,
         fixed_files_message,
+        image_host_network,
         normalize_environment_file_path,
         select_balanced_keys,
         slim_environment_file_entry,
         summarize_steps,
+        webhook_upload_host,
         workspace_download_path,
     )
 except ImportError:  # loaded as a loose main.py, not a package
@@ -91,6 +93,7 @@ except ImportError:  # loaded as a loose main.py, not a package
         DEFAULT_AGENT,
         DEFAULT_IN_PROGRESS_PER_KEY,
         DEFAULT_RECEIPT_TRUNCATE_CHARS,
+        IMAGE_HOST_CREDENTIAL_ID,
         MSG_FILE_MISSING,
         MSG_FILE_TOO_LARGE,
         MSG_LIST_EMPTY,
@@ -108,7 +111,7 @@ except ImportError:  # loaded as a loose main.py, not a package
         GeminiSandboxClient,
         GeminiSubmitTimeoutError,
         ProgressThrottle,
-        build_httpx_client_kwargs,
+        build_upload_instruction,
         clip_text,
         count_key_in_progress,
         ensure_md_filename,
@@ -118,10 +121,12 @@ except ImportError:  # loaded as a loose main.py, not a package
         extract_output_text,
         files_error_kind,
         fixed_files_message,
+        image_host_network,
         normalize_environment_file_path,
         select_balanced_keys,
         slim_environment_file_entry,
         summarize_steps,
+        webhook_upload_host,
         workspace_download_path,
     )
 
@@ -3106,87 +3111,40 @@ class AntigravitySandboxPlugin(Star):
         root = public_base.rstrip("/") + "/" + prefix.strip("/")
         return f"{root}/{name}"
 
-    def _expected_public_urls(self, output_files: str, stamp: str) -> list[str]:
-        _webhook, public_base, _token, prefix = self._resolved_upload_cfg()
-        names = self._stamped_upload_names(output_files, stamp)
-        if not public_base or not names:
-            return []
-        return [self._public_file_url(public_base, prefix, name) for name in names]
-
-    def _upload_instruction(self, output_files: str, stamp: str) -> str:
-        """图床上传要求。这里的公网地址始终用公网访问基础地址，不用回执基础地址。"""
+    def _take_upload_snapshot(self, output_files: str, stamp: str) -> dict[str, Any]:
+        """One read of the image-host settings for this submit or continue."""
         webhook, public_base, token, prefix = self._resolved_upload_cfg()
         names = self._stamped_upload_names(output_files, stamp)
-        if not webhook or not public_base or not token or not names:
-            return ""
-        mapping = ", ".join(
-            f"{orig} -> {stamped}" for orig, stamped in zip(_output_file_names(output_files), names)
-        )
-        return (
-            "\n\n【文件上传要求】任务完成后，将以下文件上传到图床："
-            + ", ".join(names)
-            + f"。原始文件名与上传文件名对应：{mapping}。"
-            f"上传接口：{webhook}；上传目录：{prefix}/；"
-            + f"公网基础地址：{public_base.rstrip(chr(47))}。"
-            "必须使用上述带时间戳前缀的文件名上传，禁止使用未加前缀的原始文件名，避免覆盖历史文件。"
-            "从 /workspace/upload.token 读取 Bearer Token，禁止输出 Token。"
-            "文件后缀以调用方指定为准；如需上传大包，建议调用方指定 .tar.gz。上传后用 GET 验证公网文件 URL 返回 200，"
-            "并在最终回执中列出每个文件的公网 URL。"
-        )
-
-    def _public_url_from_upload_payload(
-        self, payload: dict[str, Any], *, public_base: str, fallback: str
-    ) -> str:
-        url = _as_str(payload.get("full_url") or payload.get("url"))
-        if url.startswith("/uploads/"):
-            url = public_base.rstrip("/") + url[len("/uploads") :]
-        elif url.startswith("/"):
-            url = public_base.rstrip("/") + url
-        return url or fallback
-
-    async def _upload_file_bytes(self, *, data: bytes, filename: str) -> str:
-        webhook, public_base, token, prefix = self._resolved_upload_cfg()
-        name = _safe_upload_name(filename)
-        if not webhook or not public_base or not token or not name:
-            return ""
-        dest_path = f"{prefix.strip('/')}/{name}"
-        fallback = self._public_file_url(public_base, prefix, name)
-        headers = {"Authorization": f"Bearer {token}"}
-        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        files = {
-            "file": (name, data, content_type),
+        expected_urls: list[str] = []
+        if public_base and names:
+            expected_urls = [self._public_file_url(public_base, prefix, name) for name in names]
+        snap: dict[str, Any] = {
+            "active": False,
+            "error": "",
+            "instruction": "",
+            "network": None,
+            "token": "",
+            "names": names,
+            "expected_urls": expected_urls,
         }
+        if not (webhook and public_base and token and names):
+            return snap
         try:
-            # 图床 Webhook 不走插件代理；沙盒内部访问图床也无法被该代理覆盖。
-            async with httpx.AsyncClient(
-                **build_httpx_client_kwargs(
-                    timeout=httpx.Timeout(30.0, connect=15.0),
-                    proxy=self._proxy_url(),
-                    use_proxy=False,
-                )
-            ) as client:
-                resp = await client.post(
-                    webhook,
-                    headers=headers,
-                    data={"path": dest_path},
-                    files=files,
-                )
-        except httpx.HTTPError as e:
-            logger.warning(f"插件上传 {name} 失败: {e}")
-            return ""
-        if resp.status_code >= 400:
-            preview = (resp.text or "")[:300].replace("\n", " ")
-            logger.warning(f"插件上传 {name} HTTP {resp.status_code}: {preview}")
-            return ""
-        try:
-            payload = resp.json()
-        except ValueError:
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-        return self._public_url_from_upload_payload(
-            payload, public_base=public_base, fallback=fallback
+            host = webhook_upload_host(webhook)
+        except GeminiClientError as exc:
+            snap["error"] = str(exc)
+            return snap
+        snap["active"] = True
+        snap["token"] = token
+        snap["network"] = image_host_network(host, IMAGE_HOST_CREDENTIAL_ID)
+        snap["instruction"] = build_upload_instruction(
+            names=names,
+            original_names=_output_file_names(output_files),
+            webhook=webhook,
+            public_base=public_base,
+            prefix=prefix,
         )
+        return snap
 
     async def _do_render_t2i(
         self,
@@ -3367,40 +3325,27 @@ class AntigravitySandboxPlugin(Star):
     ) -> HandlerReceipt:
         stamp = _submit_stamp()
         output_files = _default_output_files(output_files)
-        expected_urls = self._expected_public_urls(output_files, stamp)
-        stamped_names = self._stamped_upload_names(output_files, stamp)
+        upload_snap = self._take_upload_snapshot(output_files, stamp)
+        expected_urls = list(upload_snap["expected_urls"])
+        stamped_names = list(upload_snap["names"])
         expected_paths = workspace_product_paths(stamped_names)
+        if upload_snap["error"]:
+            return HandlerReceipt(
+                f"提交失败: {upload_snap['error']}",
+                ok=False,
+                expected_urls=expected_urls,
+                expected_paths=expected_paths,
+            )
         prompt = (
             _as_str(prompt)
             + placement_instruction(expected_paths)
-            + self._upload_instruction(output_files, stamp)
+            + _as_str(upload_snap["instruction"])
             + (
                 completed_marker_instruction(stamp)
                 if self._file_poll_enabled()
                 else ""
             )
         )
-        upload_token = self._resolved_upload_cfg()[2].strip()
-        if upload_token:
-            try:
-                existing = json.loads(_as_str(file_contents)) if file_contents else []
-                if not isinstance(existing, list):
-                    existing = []
-                has_token = any(
-                    isinstance(item, dict) and item.get("target") == TOKEN_TARGET
-                    for item in existing
-                )
-                if not has_token:
-                    existing.append({
-                        "target": TOKEN_TARGET,
-                        "content": upload_token,
-                    })
-                file_contents = json.dumps(existing, ensure_ascii=False)
-            except json.JSONDecodeError:
-                return HandlerReceipt(
-                    "提交失败: file_contents 不是有效 JSON，无法挂载上传 Token。",
-                    ok=False,
-                )
         sources: list[dict[str, Any]] = []
         source_count = 0
         try:
@@ -3433,15 +3378,22 @@ class AntigravitySandboxPlugin(Star):
                     source_count=source_count,
                     expected_urls=expected_urls, expected_paths=expected_paths,
                 )
-            # 先记下这把 Key。额度相同的下一次提交才能轮到下一把，不用等本次 in_progress 写入缓存。
-            self._remember_submit_key(idle_keys[0])
+            ready_keys = list(idle_keys)
+            if upload_snap["active"]:
+                ready_keys = await client.ensure_credentials_for_keys(
+                    idle_keys,
+                    IMAGE_HOST_CREDENTIAL_ID,
+                    _as_str(upload_snap["token"]),
+                )
+            # 凭据过滤之后再记 Key。额度相同的下一次提交才能轮到下一把。
+            self._remember_submit_key(ready_keys[0])
             try:
-                key_no = client.api_keys.index(idle_keys[0]) + 1
+                key_no = client.api_keys.index(ready_keys[0]) + 1
             except ValueError:
                 key_no = 0
             logger.info(
                 f"新建任务按负载分配到 Key #{key_no}"
-                f"（进行中 {self._in_progress_count(idle_keys[0])}/{self._in_progress_limit()}）"
+                f"（进行中 {self._in_progress_count(ready_keys[0])}/{self._in_progress_limit()}）"
             )
             payload = client.build_create_payload(
                 prompt=_as_str(prompt),
@@ -3451,11 +3403,12 @@ class AntigravitySandboxPlugin(Star):
                 previous_task_id=None,
                 sources=sources,
                 background=True,
+                network=upload_snap["network"] if upload_snap["active"] else None,
             )
             quota_hook = self._on_storage_quota if self._env_cleanup_on_quota() else None
             data, used_key = await client.create_interaction(
                 payload,
-                candidate_keys=idle_keys,
+                candidate_keys=ready_keys,
                 on_storage_quota=quota_hook,
             )
             if used_key:
@@ -3644,6 +3597,9 @@ class AntigravitySandboxPlugin(Star):
                 notes.append(f"{display}: 超过 20MB，未写入，已继续续接")
                 continue
             target_name, added = ensure_md_filename(display)
+            if not (api_key or "").strip():
+                notes.append(f"{target_name}: 未能写入沙盒，已继续续接")
+                continue
             rel = f"workspace/{target_name}"
             mime = mimetypes.guess_type(target_name)[0] or (
                 "text/markdown" if target_name.lower().endswith(".md") else "application/octet-stream"
@@ -3654,23 +3610,14 @@ class AntigravitySandboxPlugin(Star):
                     rel,
                     data,
                     content_type=mime,
-                    api_key=api_key or None,
+                    api_key=api_key,
                 )
             except Exception as e:
                 logger.warning(f"续接 PUT 写入失败 {target_name}: {e}")
                 notes.append(f"{target_name}: 写入失败，已继续续接")
                 continue
             suffix_note = "（无后缀，已按 md 写入）" if added else ""
-            public = ""
-            try:
-                stamped = _stamp_upload_name(target_name, _submit_stamp())
-                public = await self._upload_file_bytes(data=data, filename=stamped)
-            except Exception as e:
-                logger.warning(f"续接附件图床地址生成失败 {target_name}: {e}")
-            if public:
-                notes.append(f"{public}{suffix_note}")
-            else:
-                notes.append(f"/workspace/{target_name}{suffix_note}")
+            notes.append(f"/workspace/{target_name}{suffix_note}")
         return notes
 
     async def _do_continue(
@@ -3768,6 +3715,15 @@ class AntigravitySandboxPlugin(Star):
         assigned_key = assigned_key or self._find_key_for(
             task_id=task_id, sandbox_id=sandbox_id
         ) or ""
+        if not assigned_key:
+            return HandlerReceipt(
+                "续接交互失败: 任务绑定的 API Key 不可用，请恢复对应配置。",
+                ok=False,
+                task_id=task_id,
+                sandbox_id=sandbox_id,
+                pre_retrieve_reply=pre_retrieve_reply,
+                pre_receipt=pre,
+            )
         if assigned_key and self._in_progress_count(assigned_key) >= self._in_progress_limit():
             return HandlerReceipt(
                 MSG_NO_CAPACITY,
@@ -3780,13 +3736,25 @@ class AntigravitySandboxPlugin(Star):
 
         output_files = _default_output_files(output_files)
         stamp = _submit_stamp()
-        expected_urls = self._expected_public_urls(output_files, stamp)
-        stamped_names = self._stamped_upload_names(output_files, stamp)
+        upload_snap = self._take_upload_snapshot(output_files, stamp)
+        expected_urls = list(upload_snap["expected_urls"])
+        stamped_names = list(upload_snap["names"])
         expected_paths = workspace_product_paths(stamped_names)
+        if upload_snap["error"]:
+            return HandlerReceipt(
+                f"续接交互失败: {upload_snap['error']}",
+                ok=False,
+                task_id=task_id,
+                sandbox_id=sandbox_id,
+                expected_urls=expected_urls,
+                expected_paths=expected_paths,
+                pre_retrieve_reply=pre_retrieve_reply,
+                pre_receipt=pre,
+            )
         full_prompt = (
             prompt_str
             + placement_instruction(expected_paths)
-            + self._upload_instruction(output_files, stamp)
+            + _as_str(upload_snap["instruction"])
         )
         tail_instruction = (
             completed_marker_instruction(stamp)
@@ -3796,6 +3764,23 @@ class AntigravitySandboxPlugin(Star):
         put_notes: list[str] = []
         try:
             client = self._client()
+            if not assigned_key or assigned_key not in client.api_keys:
+                return HandlerReceipt(
+                    "续接交互失败: 任务绑定的 API Key 不可用，请恢复对应配置。",
+                    ok=False,
+                    task_id=task_id,
+                    sandbox_id=sandbox_id,
+                    expected_urls=expected_urls,
+                    expected_paths=expected_paths,
+                    pre_retrieve_reply=pre_retrieve_reply,
+                    pre_receipt=pre,
+                )
+            if upload_snap["active"]:
+                await client.ensure_bearer_credential(
+                    assigned_key,
+                    IMAGE_HOST_CREDENTIAL_ID,
+                    _as_str(upload_snap["token"]),
+                )
             if _as_str(file_paths):
                 put_notes = await self._put_continue_uploads(
                     client, sandbox_id, assigned_key, file_paths
@@ -3813,6 +3798,7 @@ class AntigravitySandboxPlugin(Star):
                 previous_task_id=task_id,
                 sources=None,
                 background=True,
+                network=upload_snap["network"] if upload_snap["active"] else None,
             )
             quota_hook = self._on_storage_quota if self._env_cleanup_on_quota() else None
             data, used_key = await client.create_interaction(

@@ -24,8 +24,8 @@
       "sandbox_agent": {
         "description": "沙盒 agent 型号",
         "type": "string",
-        "hint": "Interactions 请求的 agent 字段，默认 antigravity-preview-05-2026。Google 发布新沙盒版本后只改这里。不要填 gemini-* 模型名，底层模型填上面的「底层模型」。",
-        "default": "antigravity-preview-05-2026"
+        "hint": "Interactions 请求的 agent 字段，默认 antigravity-preview-09-2026。Google 发布新沙盒版本后只改这里。不要填 gemini-* 模型名，底层模型填上面的「底层模型」。",
+        "default": "antigravity-preview-09-2026"
       },
       "submit_background": {
         "description": "提交后立即返回",
@@ -136,7 +136,7 @@
       "enabled": {
         "description": "启用上传图床",
         "type": "bool",
-        "hint": "关闭后不挂载上传 Token，也不要求沙盒上传图床。重新打开即恢复。沙盒仍会被要求把产物存到工作空间。",
+        "hint": "关闭后不再要求沙盒上传。不删除已有凭据，也不撤销旧环境上已经写过的出站规则。重新打开即恢复。沙盒仍会被要求把产物存到工作空间。",
         "default": true
       },
       "webhook_url": {
@@ -154,7 +154,7 @@
       "token": {
         "description": "Bearer Token",
         "type": "string",
-        "hint": "仅在提交任务时挂载为 /workspace/upload.token。不写日志、不回显。",
+        "hint": "存为当前 Google 项目内的 bearer 凭据，由出站代理注入到 Webhook 主机。不写入沙盒，不写日志。一个项目只配一套图床。",
         "default": "",
         "secret": true
       },

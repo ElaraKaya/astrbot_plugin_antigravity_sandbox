@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import sys
 import textwrap
 import unittest
@@ -18,6 +19,7 @@ from gemini_client import (  # noqa: E402
     CHAT_PULL_MAX_BYTES,
     CHAT_PULL_TIMEOUT_SECONDS,
     DEFAULT_RECEIPT_TRUNCATE_CHARS,
+    IMAGE_HOST_CREDENTIAL_ID,
     MSG_ENV_404,
     MSG_FILE_MISSING,
     MSG_FILE_TOO_LARGE,
@@ -34,17 +36,21 @@ from gemini_client import (  # noqa: E402
     GeminiPullCancelled,
     GeminiRetrieveQueryError,
     GeminiSandboxClient,
+    GeminiSubmitTimeoutError,
     ProgressThrottle,
     build_httpx_client_kwargs,
+    build_upload_instruction,
     clip_text,
     count_key_in_progress,
     ensure_md_filename,
     environment_media_url,
     files_error_kind,
     fixed_files_message,
+    image_host_network,
     select_balanced_keys,
     select_idle_keys,
     slim_environment_file_entry,
+    webhook_upload_host,
     workspace_download_path,
 )
 
@@ -193,20 +199,23 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(throttle.allow(1.2, force=True))
         self.assertTrue(throttle.allow(1.8))
 
-    def test_proxy_applies_to_gemini_and_not_to_webhook_helper(self):
+    def test_proxy_switch_applies_only_when_enabled(self):
         proxied = GeminiSandboxClient(api_keys=["k"], proxy="http://127.0.0.1:7890")
         options = proxied._client_kwargs(5, "k")
         self.assertEqual(options["proxy"], "http://127.0.0.1:7890")
         self.assertFalse(options["trust_env"])
+        self.assertTrue(options["follow_redirects"])
         direct = GeminiSandboxClient(api_keys=["k"], proxy="  ")
         self.assertNotIn("proxy", direct._client_kwargs(5, "k"))
-        webhook = build_httpx_client_kwargs(
+        direct_only = build_httpx_client_kwargs(
             timeout=5,
             proxy="http://127.0.0.1:7890",
             use_proxy=False,
+            follow_redirects=False,
         )
-        self.assertNotIn("proxy", webhook)
-        self.assertFalse(webhook["trust_env"])
+        self.assertNotIn("proxy", direct_only)
+        self.assertFalse(direct_only["trust_env"])
+        self.assertFalse(direct_only["follow_redirects"])
 
     def test_continue_rejects_interaction_sources(self):
         client = GeminiSandboxClient(api_keys=["k"])
@@ -229,6 +238,45 @@ class PolicyTests(unittest.TestCase):
         )
         self.assertEqual(payload["environment"], "env")
         self.assertNotIn("sources", payload["environment"] if isinstance(payload["environment"], dict) else {})
+        network = image_host_network("img.example.com")
+        fresh = client.build_create_payload(
+            prompt="新建",
+            new_sandbox=True,
+            sandbox_id=None,
+            new_session=True,
+            previous_task_id=None,
+            sources=[{"type": "inline", "target": "/workspace/a.md", "content": "hi"}],
+            network=network,
+        )
+        self.assertEqual(fresh["environment"]["type"], "remote")
+        self.assertIn("sources", fresh["environment"])
+        self.assertEqual(fresh["environment"]["network"], network)
+        bare = client.build_create_payload(
+            prompt="新建",
+            new_sandbox=True,
+            sandbox_id=None,
+            new_session=True,
+            previous_task_id=None,
+            sources=None,
+            network=network,
+        )
+        self.assertNotIn("sources", bare["environment"])
+        continued = client.build_create_payload(
+            prompt="继续",
+            new_sandbox=False,
+            sandbox_id="env",
+            new_session=False,
+            previous_task_id="prev",
+            sources=None,
+            network=network,
+        )
+        self.assertEqual(continued["previous_interaction_id"], "prev")
+        self.assertEqual(continued["environment"]["environment_id"], "env")
+        self.assertNotIn("sources", continued["environment"])
+        rules = continued["environment"]["network"]["allowlist"]
+        self.assertEqual(rules[0]["domain"], "img.example.com")
+        self.assertEqual(rules[0]["credential"], IMAGE_HOST_CREDENTIAL_ID)
+        self.assertEqual(rules[1], {"domain": "*"})
 
     def test_limits(self):
         self.assertEqual(CHAT_PULL_MAX_BYTES, 20 * 1024 * 1024)
@@ -528,19 +576,33 @@ class SourceTests(unittest.TestCase):
         tree = ast.parse(MAIN.read_text(encoding="utf-8"))
         chat_src = ""
         ui_src = ""
-        upload_src = ""
+        submit_src = ""
+        continue_src = ""
         for node in ast.walk(tree):
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_pull_chat_file_inner":
                 chat_src = ast.get_source_segment(MAIN.read_text(encoding="utf-8"), node) or ""
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ui_pull_worker":
                 ui_src = ast.get_source_segment(MAIN.read_text(encoding="utf-8"), node) or ""
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_upload_file_bytes":
-                upload_src = ast.get_source_segment(MAIN.read_text(encoding="utf-8"), node) or ""
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_do_submit":
+                submit_src = ast.get_source_segment(MAIN.read_text(encoding="utf-8"), node) or ""
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_do_continue":
+                continue_src = ast.get_source_segment(MAIN.read_text(encoding="utf-8"), node) or ""
         self.assertNotIn("_ui_pull_sem", chat_src)
         self.assertIn("_chat_pull_blocked", chat_src)
         self.assertIn("_ui_pull_sem", ui_src)
-        self.assertIn("use_proxy=False", upload_src)
+        self.assertLess(
+            submit_src.find("ensure_credentials_for_keys"),
+            submit_src.find("_remember_submit_key"),
+        )
+        self.assertLess(
+            continue_src.find("ensure_bearer_credential"),
+            continue_src.find("_put_continue_uploads"),
+        )
+        self.assertIn("api_key=assigned_key", continue_src)
         text = MAIN.read_text(encoding="utf-8")
+        self.assertNotIn("def _upload_file_bytes", text)
+        self.assertNotIn("def _public_url_from_upload_payload", text)
+        self.assertIn("任务绑定的 API Key 不可用，请恢复对应配置。", text)
         self.assertIn("Comp.File", text)
         self.assertIn("sources=None", text)
         self.assertIn("沙盒网络存疑", text)
@@ -582,6 +644,301 @@ class SourceTests(unittest.TestCase):
         self.assertIn("测试功能", schema)
         self.assertIn("未备案域名", schema)
         self.assertNotIn('f"taskid: {short}"', text)
+
+
+class CredentialTests(unittest.TestCase):
+    SENTINEL_TOKEN = "sentinel-token-value"
+    SENTINEL_KEY = "sentinel-api-key-value"
+
+    def setUp(self):
+        import gemini_client as gc
+
+        self._gc = gc
+        self._old_logger = gc.logger
+        self.lines: list[str] = []
+
+        class Capture:
+            def __init__(self, sink: list[str]):
+                self.sink = sink
+
+            def info(self, *args, **kwargs):
+                self.sink.append(" ".join(str(arg) for arg in args))
+
+            warning = info
+            error = info
+
+        gc.logger = Capture(self.lines)
+
+    def tearDown(self):
+        self._gc.logger = self._old_logger
+
+    def _assert_secret_hidden(self, *chunks: str) -> None:
+        blob = "\n".join(chunks) + "\n" + "\n".join(self.lines)
+        self.assertNotIn(self.SENTINEL_TOKEN, blob)
+        self.assertNotIn(self.SENTINEL_KEY, blob)
+
+    def test_webhook_host_accepts_https_and_rejects_unsafe_forms(self):
+        self.assertEqual(
+            webhook_upload_host("https://img.example.com/Webhook/upload"),
+            "img.example.com",
+        )
+        self.assertEqual(
+            webhook_upload_host("https://img.example.com:8443/hook"),
+            "img.example.com",
+        )
+        bad_urls = [
+            "http://img.example.com/hook",
+            "https:///hook",
+            "https://*/hook",
+            "https://*.example.com/hook",
+            "https://user:pass@img.example.com/hook",
+            "https://img.example.com:abc/hook",
+            "https://img.example.com:99999/hook",
+            "not a url",
+            "",
+        ]
+        for raw in bad_urls:
+            with self.subTest(raw=raw):
+                with self.assertRaises(GeminiClientError) as ctx:
+                    webhook_upload_host(raw)
+                if raw:
+                    self.assertNotIn(raw, str(ctx.exception))
+                self.assertEqual(str(ctx.exception), "图床上传地址无效。")
+
+    def test_upload_instruction_does_not_ask_for_the_token_file(self):
+        text = build_upload_instruction(
+            names=["260101_result.md"],
+            original_names=["result.md"],
+            webhook="https://img.example.com/Webhook/upload",
+            public_base="https://img.example.com",
+            prefix="agysb",
+        )
+        self.assertNotIn("从 /workspace/upload.token 读取", text)
+        self.assertIn("不要设置 Authorization", text)
+        self.assertIn("不要读取 /workspace/upload.token", text)
+
+    def test_sources_drop_reserved_token_paths(self):
+        client = GeminiSandboxClient(api_keys=["k"])
+        import json
+
+        contents = json.dumps(
+            [
+                {"target": "/workspace/./upload.token", "content": self.SENTINEL_TOKEN},
+                {"target": "upload.token", "content": self.SENTINEL_TOKEN},
+                {"target": "/workspace//upload.token", "content": self.SENTINEL_TOKEN},
+                {"target": "/workspace/ok.txt", "content": "hi"},
+            ]
+        )
+        sources = client.build_sources_from_files(
+            file_paths="E:/no-such-dir/upload.token",
+            file_contents=contents,
+        )
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["target"], "/workspace/ok.txt")
+        self.assertNotIn(self.SENTINEL_TOKEN, str(sources))
+
+    def test_credential_create_update_and_redaction(self):
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if request.method == "POST":
+                return httpx.Response(
+                    409,
+                    json={
+                        "error": {
+                            "code": "aborted",
+                            "message": f"leak {self.SENTINEL_TOKEN} {self.SENTINEL_KEY}",
+                        }
+                    },
+                )
+            if request.method == "PATCH":
+                return httpx.Response(200, json={"id": IMAGE_HOST_CREDENTIAL_ID})
+            return httpx.Response(500, text=self.SENTINEL_TOKEN)
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["other-key"])
+        _run(
+            client.ensure_bearer_credential(
+                self.SENTINEL_KEY,
+                IMAGE_HOST_CREDENTIAL_ID,
+                self.SENTINEL_TOKEN,
+            )
+        )
+        self.assertEqual([item.method for item in seen], ["POST", "PATCH"])
+        self.assertEqual(seen[0].url.path, "/v1beta/credentials")
+        self.assertEqual(seen[1].url.path, f"/v1beta/credentials/{IMAGE_HOST_CREDENTIAL_ID}")
+        for item in seen:
+            self.assertEqual(item.headers["x-goog-api-key"], self.SENTINEL_KEY)
+            payload = json.loads(item.content)
+            self.assertEqual(payload["type"], "bearer_token")
+            self.assertEqual(payload["token"], self.SENTINEL_TOKEN)
+            self.assertEqual(payload["header_name"], "Authorization")
+            self.assertEqual(payload["prefix"], "Bearer")
+        self.assertEqual(json.loads(seen[0].content)["id"], IMAGE_HOST_CREDENTIAL_ID)
+        self.assertNotIn("id", json.loads(seen[1].content))
+        self._assert_secret_hidden()
+
+    def test_credential_create_accepts_200_and_201(self):
+        for status in (200, 201):
+            with self.subTest(status=status):
+                def handler(request: httpx.Request, status=status) -> httpx.Response:
+                    return httpx.Response(status, json={"id": IMAGE_HOST_CREDENTIAL_ID})
+
+                client = ProbeClient(httpx.MockTransport(handler), api_keys=["k"])
+                _run(client.ensure_bearer_credential("k", IMAGE_HOST_CREDENTIAL_ID, "tok"))
+
+    def test_non_aborted_409_does_not_patch(self):
+        methods: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            methods.append(request.method)
+            return httpx.Response(
+                409,
+                json={"error": {"code": "already_exists", "message": self.SENTINEL_TOKEN}},
+            )
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["other"])
+        with self.assertRaises(GeminiClientError) as ctx:
+            _run(
+                client.ensure_bearer_credential(
+                    self.SENTINEL_KEY,
+                    IMAGE_HOST_CREDENTIAL_ID,
+                    self.SENTINEL_TOKEN,
+                )
+            )
+        self.assertEqual(methods, ["POST"])
+        self.assertIn("HTTP 409", str(ctx.exception))
+        self._assert_secret_hidden(
+            str(ctx.exception),
+            f"提交失败: {ctx.exception}",
+            f"续接交互失败: {ctx.exception}",
+        )
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertTrue(ctx.exception.__suppress_context__)
+
+    def test_credential_failures_stay_sanitized(self):
+        cases = {
+            "patch": lambda request: (
+                httpx.Response(
+                    409,
+                    json={"error": {"code": "aborted", "message": self.SENTINEL_TOKEN}},
+                )
+                if request.method == "POST"
+                else httpx.Response(500, text=f"{self.SENTINEL_TOKEN} {self.SENTINEL_KEY}")
+            ),
+            "html": lambda request: httpx.Response(200, text=f"<html>{self.SENTINEL_TOKEN}</html>"),
+            "redirect": lambda request: httpx.Response(
+                302,
+                headers={"Location": "https://example.invalid/next"},
+                text=self.SENTINEL_TOKEN,
+            ),
+            "timeout": None,
+        }
+
+        def run_case(kind: str):
+            def handler(request: httpx.Request) -> httpx.Response:
+                if kind == "timeout":
+                    raise httpx.TimeoutException(self.SENTINEL_TOKEN)
+                result = cases[kind](request)
+                if not isinstance(result, httpx.Response):
+                    raise AssertionError(kind)
+                return result
+
+            client = ProbeClient(httpx.MockTransport(handler), api_keys=["other-key"])
+            with self.assertRaises(GeminiClientError) as ctx:
+                _run(
+                    client.ensure_bearer_credential(
+                        self.SENTINEL_KEY,
+                        IMAGE_HOST_CREDENTIAL_ID,
+                        self.SENTINEL_TOKEN,
+                    )
+                )
+            self.assertNotIsInstance(ctx.exception, GeminiSubmitTimeoutError)
+            self._assert_secret_hidden(
+                str(ctx.exception),
+                f"提交失败: {ctx.exception}",
+                f"续接交互失败: {ctx.exception}",
+            )
+            self.assertTrue(ctx.exception.__suppress_context__)
+
+        for kind in cases:
+            with self.subTest(kind=kind):
+                self.lines.clear()
+                run_case(kind)
+
+    def test_empty_key_does_not_call_or_fall_back(self):
+        called = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal called
+            called = True
+            return httpx.Response(201, json={"id": "x"})
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["real-key"])
+        with self.assertRaises(GeminiClientError) as ctx:
+            _run(client.ensure_bearer_credential("  ", IMAGE_HOST_CREDENTIAL_ID, "tok"))
+        self.assertFalse(called)
+        self.assertIn("API Key 为空", str(ctx.exception))
+
+    def test_key_filter_keeps_success_order_and_hides_secrets(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            key = request.headers["x-goog-api-key"]
+            if key == "key-a":
+                return httpx.Response(500, text=f"{self.SENTINEL_TOKEN} {self.SENTINEL_KEY}")
+            if key == "key-b":
+                return httpx.Response(201, json={"id": IMAGE_HOST_CREDENTIAL_ID})
+            return httpx.Response(500, text="unexpected")
+
+        client = ProbeClient(
+            httpx.MockTransport(handler),
+            api_keys=["key-a", "key-b", "key-c"],
+        )
+        ready = _run(
+            client.ensure_credentials_for_keys(
+                ["key-a", "key-b"],
+                IMAGE_HOST_CREDENTIAL_ID,
+                self.SENTINEL_TOKEN,
+            )
+        )
+        self.assertEqual(ready, ["key-b"])
+        self._assert_secret_hidden()
+
+        def fail_all(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text=self.SENTINEL_TOKEN)
+
+        failing = ProbeClient(httpx.MockTransport(fail_all), api_keys=["key-a", "key-b"])
+        with self.assertRaises(GeminiClientError) as ctx:
+            _run(
+                failing.ensure_credentials_for_keys(
+                    ["key-a", "key-b"],
+                    IMAGE_HOST_CREDENTIAL_ID,
+                    self.SENTINEL_TOKEN,
+                )
+            )
+        self._assert_secret_hidden(str(ctx.exception))
+
+    def test_interaction_failover_stays_inside_prepared_keys(self):
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            key = request.headers["x-goog-api-key"]
+            seen.append(key)
+            if key == "key-a":
+                return httpx.Response(429, json={"error": {"message": "rate"}})
+            return httpx.Response(200, json={"id": "task", "status": "in_progress"})
+
+        client = ProbeClient(
+            httpx.MockTransport(handler),
+            api_keys=["key-a", "key-b", "key-c"],
+        )
+        payload = {"input": "hi"}
+        _data, used = _run(client.create_interaction(payload, candidate_keys=["key-a", "key-b"]))
+        self.assertEqual(seen, ["key-a", "key-b"])
+        self.assertEqual(used, "key-b")
+        seen.clear()
+        with self.assertRaises(GeminiClientError):
+            _run(client.create_interaction(payload, api_key="key-a"))
+        self.assertEqual(seen, ["key-a"])
 
 
 class AgGetParseTests(unittest.TestCase):

@@ -9,6 +9,8 @@ Direct Gemini REST only (no local WebUI, no protocol gateway):
   GET  https://generativelanguage.googleapis.com/v1beta/environments/{id}/files/{path}?alt=media
   PUT  https://generativelanguage.googleapis.com/upload/v1beta/environments/{id}/files/{path}
   GET  https://generativelanguage.googleapis.com/v1beta/files/{resourceId}:download?alt=media
+  POST https://generativelanguage.googleapis.com/v1beta/credentials
+  PATCH https://generativelanguage.googleapis.com/v1beta/credentials/{id}
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -40,8 +42,11 @@ except ImportError:  # local syntax tests without AstrBot installed
 
 GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 GEMINI_ENVIRONMENTS_URL = "https://generativelanguage.googleapis.com/v1beta/environments"
+GEMINI_CREDENTIALS_URL = "https://generativelanguage.googleapis.com/v1beta/credentials"
+IMAGE_HOST_CREDENTIAL_ID = "astrbot-image-host"
+CREDENTIAL_TIMEOUT = 30.0
 GEMINI_FILES_BASE = "https://generativelanguage.googleapis.com/v1beta/files"
-DEFAULT_AGENT = "antigravity-preview-05-2026"
+DEFAULT_AGENT = "antigravity-preview-09-2026"
 GEMINI_MODEL_PREFIX = "gemini"
 ALLOWED_MODELS = (
     "gemini-3.8-flash",
@@ -352,15 +357,16 @@ def build_httpx_client_kwargs(
     proxy: str = "",
     use_proxy: bool = False,
     headers: dict[str, str] | None = None,
+    follow_redirects: bool = True,
 ) -> dict[str, Any]:
     """Plugin HTTP options. trust_env is off so an empty proxy really means direct.
 
-    Image-host webhook calls pass use_proxy=False. Gemini calls pass use_proxy=True.
+    Gemini calls pass use_proxy=True. Pass follow_redirects=False for credential writes.
     """
     timeout_obj = timeout if isinstance(timeout, httpx.Timeout) else httpx.Timeout(timeout, connect=30.0)
     kwargs: dict[str, Any] = {
         "timeout": timeout_obj,
-        "follow_redirects": True,
+        "follow_redirects": bool(follow_redirects),
         "trust_env": False,
     }
     if headers:
@@ -540,6 +546,86 @@ def sandbox_target_from_path(local_path: str) -> str:
     return f"/workspace/{name}"
 
 
+def is_reserved_upload_token_target(target: str) -> bool:
+    """True when a source target is the old plaintext token file, after path cleanup."""
+    text = (target or "").strip().replace("\\", "/")
+    while "//" in text:
+        text = text.replace("//", "/")
+    if not text.startswith("/") and not text.startswith("."):
+        text = f"/workspace/{Path(text).name}"
+    parts: list[str] = []
+    for part in text.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            return False
+        parts.append(part)
+    return "/".join(parts) == "workspace/upload.token"
+
+
+def webhook_upload_host(url: str) -> str:
+    """HTTPS host for the image-host webhook. Errors never include the raw URL."""
+    text = url or ""
+    if not text.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        raise GeminiClientError("图床上传地址无效。")
+    try:
+        parsed = urlparse(text.strip())
+        port = parsed.port
+    except ValueError:
+        raise GeminiClientError("图床上传地址无效。") from None
+    if (parsed.scheme or "").lower() != "https":
+        raise GeminiClientError("图床上传地址无效。")
+    if parsed.username or parsed.password:
+        raise GeminiClientError("图床上传地址无效。")
+    host = parsed.hostname or ""
+    if (
+        not host
+        or "*" in host
+        or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in host)
+    ):
+        raise GeminiClientError("图床上传地址无效。")
+    if port is not None and not 1 <= port <= 65535:
+        raise GeminiClientError("图床上传地址无效。")
+    return host
+
+
+def image_host_network(host: str, credential_id: str = IMAGE_HOST_CREDENTIAL_ID) -> dict[str, Any]:
+    """Allow all egress, and inject the bearer credential only on the upload host."""
+    return {
+        "allowlist": [
+            {"domain": host, "credential": credential_id},
+            {"domain": "*"},
+        ]
+    }
+
+
+def build_upload_instruction(
+    *,
+    names: list[str],
+    original_names: list[str],
+    webhook: str,
+    public_base: str,
+    prefix: str,
+) -> str:
+    """Prompt text for sandbox uploads. The token is not included."""
+    mapping = ", ".join(
+        f"{orig} -> {stamped}" for orig, stamped in zip(original_names, names)
+    )
+    return (
+        "\n\n【文件上传要求】任务完成后，将以下文件上传到图床："
+        + ", ".join(names)
+        + f"。原始文件名与上传文件名对应：{mapping}。"
+        f"上传接口：{webhook}；上传目录：{prefix}/；"
+        f"公网基础地址：{public_base.rstrip('/')}。"
+        "必须使用上述带时间戳前缀的文件名上传，禁止使用未加前缀的原始文件名，避免覆盖历史文件。"
+        "向该上传接口 POST 时不要设置 Authorization，平台会在请求离开沙盒时注入。"
+        "不要读取 /workspace/upload.token 或任何 Token 文件。"
+        "不要在命令输出、文件或回执里打印请求头。"
+        "文件后缀以调用方指定为准；如需上传大包，建议调用方指定 .tar.gz。"
+        "上传后用 GET 验证公网文件 URL 返回 200，并在最终回执中列出每个文件的公网 URL。"
+    )
+
+
 def resolve_model(raw: str | None) -> str:
     """Return a concrete model id, or empty string to omit agent_config.model."""
     model = (raw or "").strip()
@@ -617,6 +703,7 @@ class GeminiSandboxClient:
         api_key: str | None = None,
         *,
         content_type: str | None = "application/json",
+        follow_redirects: bool = True,
     ) -> dict[str, Any]:
         headers = {
             "x-goog-api-key": api_key or self.api_key,
@@ -629,6 +716,7 @@ class GeminiSandboxClient:
             proxy=self.proxy,
             use_proxy=True,
             headers=headers,
+            follow_redirects=follow_redirects,
         )
 
     def require_api_key(self) -> None:
@@ -652,25 +740,33 @@ class GeminiSandboxClient:
         new_sandbox: bool,
         sandbox_id: str | None,
         sources: list[dict[str, Any]] | None,
+        network: dict[str, Any] | None = None,
     ) -> str | dict[str, Any]:
         sources = sources or []
+        net = network if isinstance(network, dict) and network else None
         if new_sandbox:
+            if not sources and net is None:
+                return "remote"
+            env: dict[str, Any] = {"type": "remote"}
             if sources:
-                return {"type": "remote", "sources": sources}
-            return "remote"
+                env["sources"] = sources
+            if net is not None:
+                env["network"] = net
+            return env
         env_id = (sandbox_id or "").strip()
         if not env_id:
             raise GeminiClientError(
                 "new_sandbox=false 时必须提供 sandbox_id（environment_id）以复用沙盒。"
             )
+        if not sources and net is None:
+            return env_id
+        # Official EnvironmentConfig.environment_id updates an existing env.
+        env = {"type": "remote", "environment_id": env_id}
         if sources:
-            # Official EnvironmentConfig.environment_id updates an existing env.
-            return {
-                "type": "remote",
-                "environment_id": env_id,
-                "sources": sources,
-            }
-        return env_id
+            env["sources"] = sources
+        if net is not None:
+            env["network"] = net
+        return env
 
     def build_sources_from_files(
         self,
@@ -712,6 +808,8 @@ class GeminiSandboxClient:
             for piece in str(file_paths).split(","):
                 local = piece.strip()
                 if not local:
+                    continue
+                if is_reserved_upload_token_target(sandbox_target_from_path(local)):
                     continue
                 path = Path(local).expanduser()
                 if not path.is_file():
@@ -760,6 +858,8 @@ class GeminiSandboxClient:
                     enc = str(encoding).strip() if encoding else None
                     if not target.startswith("/") and not target.startswith("."):
                         target = f"/workspace/{Path(target).name}"
+                    if is_reserved_upload_token_target(target):
+                        continue
                     _add_inline(target, str(content), encoding=enc)
 
         return sources
@@ -774,6 +874,7 @@ class GeminiSandboxClient:
         previous_task_id: str | None,
         sources: list[dict[str, Any]],
         background: bool | None = None,
+        network: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         prompt = (prompt or "").strip()
         if not prompt:
@@ -782,6 +883,7 @@ class GeminiSandboxClient:
             new_sandbox=new_sandbox,
             sandbox_id=sandbox_id,
             sources=sources,
+            network=network,
         )
         payload: dict[str, Any] = {
             "agent": self.agent or DEFAULT_AGENT,
@@ -811,6 +913,121 @@ class GeminiSandboxClient:
                 )
             payload["previous_interaction_id"] = prev
         return payload
+
+    @staticmethod
+    def _credential_failure(
+        stage: str,
+        credential_id: str,
+        status: int | None,
+    ) -> GeminiClientError:
+        if status is None:
+            logger.warning(f"凭据{stage}失败 id={credential_id} 超时或网络错误")
+            return GeminiClientError(f"凭据{stage}失败: id={credential_id} 超时或网络错误")
+        logger.warning(f"凭据{stage}失败 id={credential_id} HTTP {status}")
+        return GeminiClientError(f"凭据{stage}失败: id={credential_id} HTTP {status}")
+
+    @staticmethod
+    def _credential_code_is_aborted(resp: httpx.Response) -> bool:
+        try:
+            payload = resp.json()
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        err = payload.get("error")
+        if not isinstance(err, dict):
+            return False
+        return err.get("code") == "aborted"
+
+    @staticmethod
+    def _require_credential_json(resp: httpx.Response, *, stage: str, credential_id: str) -> None:
+        try:
+            payload = resp.json()
+        except Exception:
+            raise GeminiSandboxClient._credential_failure(
+                stage, credential_id, resp.status_code
+            ) from None
+        if not isinstance(payload, dict):
+            raise GeminiSandboxClient._credential_failure(
+                stage, credential_id, resp.status_code
+            ) from None
+
+    async def ensure_bearer_credential(self, api_key: str, credential_id: str, token: str) -> None:
+        """Create or update a project bearer credential. Errors omit secrets and response bodies."""
+        key = (api_key or "").strip()
+        if not key:
+            raise GeminiClientError("凭据准备失败: API Key 为空。")
+        cred_id = (credential_id or "").strip()
+        if not cred_id:
+            raise GeminiClientError("凭据准备失败: 凭据 ID 为空。")
+        if not (token or "").strip():
+            raise GeminiClientError("凭据准备失败: Token 为空。")
+        create_body = {
+            "id": cred_id,
+            "type": "bearer_token",
+            "token": token,
+            "header_name": "Authorization",
+            "prefix": "Bearer",
+        }
+        patch_body = {
+            "type": "bearer_token",
+            "token": token,
+            "header_name": "Authorization",
+            "prefix": "Bearer",
+        }
+        patch_url = f"{GEMINI_CREDENTIALS_URL}/{quote(cred_id, safe='')}"
+        stage = "创建"
+        try:
+            async with httpx.AsyncClient(
+                **self._client_kwargs(CREDENTIAL_TIMEOUT, key, follow_redirects=False)
+            ) as client:
+                resp = await client.post(GEMINI_CREDENTIALS_URL, json=create_body)
+                if resp.status_code in (200, 201):
+                    self._require_credential_json(resp, stage="创建", credential_id=cred_id)
+                    logger.info(f"凭据已创建 id={cred_id} HTTP {resp.status_code}")
+                    return
+                if resp.status_code == 409 and self._credential_code_is_aborted(resp):
+                    logger.info(f"凭据已存在，改为更新 id={cred_id} HTTP 409")
+                    stage = "更新"
+                    resp = await client.patch(patch_url, json=patch_body)
+                    if resp.status_code in (200, 201):
+                        self._require_credential_json(resp, stage="更新", credential_id=cred_id)
+                        logger.info(f"凭据已更新 id={cred_id} HTTP {resp.status_code}")
+                        return
+                    raise self._credential_failure("更新", cred_id, resp.status_code) from None
+                raise self._credential_failure("创建", cred_id, resp.status_code) from None
+        except GeminiClientError:
+            raise
+        except httpx.TimeoutException:
+            raise self._credential_failure(stage, cred_id, None) from None
+        except httpx.HTTPError:
+            raise self._credential_failure(stage, cred_id, None) from None
+
+    async def ensure_credentials_for_keys(
+        self,
+        keys: list[str],
+        credential_id: str,
+        token: str,
+    ) -> list[str]:
+        """Keep keys whose credential write succeeded, in the original order."""
+        ready: list[str] = []
+        last_error: GeminiClientError | None = None
+        for key in keys:
+            if not str(key or "").strip():
+                last_error = GeminiClientError("凭据准备失败: API Key 为空。")
+                continue
+            try:
+                await self.ensure_bearer_credential(key, credential_id, token)
+            except GeminiClientError as exc:
+                last_error = exc
+                logger.warning(f"凭据准备未使用该 Key: {exc}")
+                continue
+            ready.append(key)
+        if ready:
+            return ready
+        if last_error is not None:
+            raise last_error
+        raise GeminiClientError("凭据准备失败: 没有可用的 API Key。")
 
     async def _post_interaction(self, payload: dict[str, Any], api_key: str) -> httpx.Response:
         async with httpx.AsyncClient(**self._client_kwargs(SUBMIT_TIMEOUT, api_key)) as client:
