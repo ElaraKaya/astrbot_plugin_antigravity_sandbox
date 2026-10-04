@@ -45,10 +45,12 @@ from pydantic.dataclasses import dataclass
 
 try:
     from .gemini_client import (
-        CHAT_PULL_MAX_BYTES,
+        AGGET_STALL_SECONDS,
         CHAT_PULL_TIMEOUT_SECONDS,
+        CONTINUE_PUT_MAX_BYTES,
         DEFAULT_AGENT,
         DEFAULT_IN_PROGRESS_PER_KEY,
+        DEFAULT_PULL_PROGRESS_MB,
         DEFAULT_RECEIPT_TRUNCATE_CHARS,
         IMAGE_HOST_CREDENTIAL_ID,
         MSG_FILE_MISSING,
@@ -68,18 +70,25 @@ try:
         GeminiSandboxClient,
         GeminiSubmitTimeoutError,
         ProgressThrottle,
+        PullProgress,
+        agget_stall_message,
         build_upload_instruction,
         clip_text,
         count_key_in_progress,
         ensure_md_filename,
         environment_id_of,
+        file_too_large_message,
+        files_error_kind,
+        fixed_files_message,
+        format_bytes,
+        format_pull_progress,
+        image_host_network,
         is_safe_local_file_path,
         environment_size_bytes,
         extract_output_text,
-        files_error_kind,
-        fixed_files_message,
-        image_host_network,
         normalize_environment_file_path,
+        pull_limit_bytes,
+        pull_progress_step_bytes,
         select_balanced_keys,
         slim_environment_file_entry,
         summarize_steps,
@@ -88,10 +97,12 @@ try:
     )
 except ImportError:  # loaded as a loose main.py, not a package
     from gemini_client import (
-        CHAT_PULL_MAX_BYTES,
+        AGGET_STALL_SECONDS,
         CHAT_PULL_TIMEOUT_SECONDS,
+        CONTINUE_PUT_MAX_BYTES,
         DEFAULT_AGENT,
         DEFAULT_IN_PROGRESS_PER_KEY,
+        DEFAULT_PULL_PROGRESS_MB,
         DEFAULT_RECEIPT_TRUNCATE_CHARS,
         IMAGE_HOST_CREDENTIAL_ID,
         MSG_FILE_MISSING,
@@ -111,18 +122,25 @@ except ImportError:  # loaded as a loose main.py, not a package
         GeminiSandboxClient,
         GeminiSubmitTimeoutError,
         ProgressThrottle,
+        PullProgress,
+        agget_stall_message,
         build_upload_instruction,
         clip_text,
         count_key_in_progress,
         ensure_md_filename,
         environment_id_of,
+        file_too_large_message,
+        files_error_kind,
+        fixed_files_message,
+        format_bytes,
+        format_pull_progress,
+        image_host_network,
         is_safe_local_file_path,
         environment_size_bytes,
         extract_output_text,
-        files_error_kind,
-        fixed_files_message,
-        image_host_network,
         normalize_environment_file_path,
+        pull_limit_bytes,
+        pull_progress_step_bytes,
         select_balanced_keys,
         slim_environment_file_entry,
         summarize_steps,
@@ -504,14 +522,7 @@ def _parse_iso(raw: str) -> datetime | None:
 
 
 def _fmt_bytes(n: int) -> str:
-    size = float(max(0, int(n or 0)))
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            if unit == "B":
-                return f"{int(size)} {unit}"
-            return f"{size:.2f} {unit}"
-        size /= 1024
-    return f"{size:.2f} GB"
+    return format_bytes(n)
 
 
 def _submit_stamp() -> str:
@@ -961,8 +972,9 @@ AGHELP_TEXT = (
     "  列出该短号沙盒 workspace 文件。\n"
     "\n"
     "/agget <任务编号> <完整路径>\n"
-    "  拉取文件发到聊天。先按大小卡住 20MB，超过请改用图床或 WebUI。\n"
-    "  90 秒超时会直接中止。沙盒网络存疑，不一定能拉取成功。\n"
+    "  马上返回，文件在后台拉取，好了再发到聊天。大小上限在配置里，默认不限制。\n"
+    "  进度反馈默认每 40MB 一次，文件小于该阈值时不发。可在配置里关闭或改阈值。\n"
+    "  不设总超时。下载进度停了 10 分钟会中止，并建议改用图床或 WebUI。\n"
     "\n"
     "/agenvlist 或 /agels\n"
     "  管理员：列出当前项目沙盒环境数量与占用。\n"
@@ -1059,7 +1071,8 @@ GET_TOOL_DESC = (
     "从 Antigravity 沙盒 workspace 拉取一个文件。只使用任务编号和文件名。"
     "电脑能力为 local 时，文件写入当前会话工作区并返回相对路径，不要发到聊天，也不要把内容复述进回复。"
     "电脑能力为 none 或 sandbox 时，插件把文件直接发给用户。"
-    "沙盒网络存疑，不一定能成功拉取文件。超过 20MB 或 90 秒会中止，请改用图床或 WebUI。"
+    "沙盒网络存疑，不一定能成功拉取文件。大小上限见插件配置「工具拉取大小上限」，默认不限制。"
+    "超过上限或 90 秒会中止，请改用图床或 WebUI。这条和 /agget 的大小上限、超时不是同一套。"
 )
 
 
@@ -1215,6 +1228,7 @@ class AntigravitySandboxPlugin(Star):
         self._auto_retrieve_task: asyncio.Task[None] | None = None
         self._file_poll_task: asyncio.Task[None] | None = None
         self._pull_cleanup_task: asyncio.Task[None] | None = None
+        self._agget_tasks: set[asyncio.Task[None]] = set()
         self._ui_pull_sem = asyncio.Semaphore(UI_PULL_CONCURRENCY)
         self._ui_jobs: dict[str, dict[str, Any]] = {}
         self._ui_jobs_lock = asyncio.Lock()
@@ -2421,6 +2435,21 @@ class AntigravitySandboxPlugin(Star):
         except (TypeError, ValueError):
             return DEFAULT_IN_PROGRESS_PER_KEY
 
+    def _pull_max_bytes(self) -> int | None:
+        """/agget size cap. None means unlimited (config 0 or empty)."""
+        return pull_limit_bytes(self._setting("pull", "max_mb", None, 0))
+
+    def _tool_pull_max_bytes(self) -> int | None:
+        """get_sandbox_task size cap. None means unlimited."""
+        return pull_limit_bytes(self._setting("pull", "tool_max_mb", None, 0))
+
+    def _pull_progress_step_bytes(self) -> int:
+        enabled = _as_bool(self._setting("pull", "progress", None, True), True)
+        return pull_progress_step_bytes(
+            self._setting("pull", "progress_mb", None, DEFAULT_PULL_PROGRESS_MB),
+            enabled=enabled,
+        )
+
     def _in_progress_count(self, key: str) -> int:
         fp = self._stored_key_ref(key)
         return count_key_in_progress(list(self._short_index.values()), fp)
@@ -3593,8 +3622,10 @@ class AntigravitySandboxPlugin(Star):
                 logger.warning(f"读取续接附件失败 {display}: {e}")
                 notes.append(f"{display}: 未能写入沙盒，已继续续接")
                 continue
-            if size > CHAT_PULL_MAX_BYTES:
-                notes.append(f"{display}: 超过 20MB，未写入，已继续续接")
+            if size > CONTINUE_PUT_MAX_BYTES:
+                notes.append(
+                    f"{display}: 超过 {CONTINUE_PUT_MAX_BYTES // (1024 * 1024)}MB，未写入，已继续续接"
+                )
                 continue
             target_name, added = ensure_md_filename(display)
             if not (api_key or "").strip():
@@ -4275,30 +4306,38 @@ class AntigravitySandboxPlugin(Star):
             if head.isdigit() and tail:
                 task_ref = head
                 name = tail
+            elif head.isdigit():
+                # 只有编号、没有路径，例如「/agget 0009」
+                task_ref, name = head, ""
         elif " " in raw:
             # 主写法：<任务编号> <完整路径>，路径本身可含空格，只在首个空格切
             head, _, tail = raw.partition(" ")
             if head.strip().isdigit() and tail.strip():
                 task_ref = head.strip()
                 name = tail.strip()
+        elif raw.isdigit():
+            # 只给了编号，例如「/agget 0009」「/agget 9」
+            task_ref = raw
+            name = ""
         if not name:
-            yield event.plain_result(
-                "用法: /agget <任务编号> <完整路径>，例如 /agget 0003 workspace/a.md"
-            )
+            # 有编号但缺路径：说明用法，不要只说找不到任务编号。
+            if task_ref:
+                yield event.plain_result(
+                    f"任务编号 {task_ref} 缺少要拉取的文件路径。"
+                    f"用法: /agget {task_ref} <完整路径>，"
+                    f"例如 /agget {task_ref} workspace/result.md。"
+                    "可先用 /agls 查看该任务的 workspace 文件。"
+                )
+            else:
+                yield event.plain_result(
+                    "用法: /agget <任务编号> <完整路径>，例如 /agget 0003 workspace/a.md"
+                )
             return
         short = task_ref or self._single_latest_short_for_sandbox()
-        text, path, display = await self._pull_chat_file(short, name)
-        if path is not None:
-            if hasattr(event, "track_temporary_local_file"):
-                event.track_temporary_local_file(str(path))
-            yield event.chain_result(
-                [
-                    Comp.Plain(text),
-                    Comp.File(name=display or path.name, file=str(path)),
-                ]
-            )
-            return
-        yield event.plain_result(text)
+        umo = _as_str(getattr(event, "unified_msg_origin", ""))
+        task = asyncio.create_task(self._agget_pull_job(umo, short, name))
+        self._track_agget_task(task)
+        yield event.plain_result(f"开始拉取 {name}，完成后发到这里。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("agenvlist", alias={"agels"})
@@ -4359,10 +4398,14 @@ class AntigravitySandboxPlugin(Star):
 
 
     def _files_failure_text(self, exc: Exception, *, listing: bool) -> str:
-        if isinstance(exc, (asyncio.TimeoutError, GeminiFileTimeoutError)):
+        if isinstance(exc, asyncio.TimeoutError):
             return MSG_PULL_TIMEOUT
+        if isinstance(exc, GeminiFileTimeoutError):
+            text = str(exc).strip()
+            return text or MSG_PULL_TIMEOUT
         if isinstance(exc, GeminiFileTooLargeError):
-            return MSG_FILE_TOO_LARGE
+            text = str(exc).strip()
+            return text or MSG_FILE_TOO_LARGE
         status = getattr(exc, "status_code", None)
         kind = files_error_kind(status if isinstance(status, int) else None, str(exc), listing=listing)
         fixed = fixed_files_message(kind)
@@ -4501,20 +4544,95 @@ class AntigravitySandboxPlugin(Star):
             suffix = ""
         return directory / f"{uuid.uuid4().hex}{suffix}"
 
-    async def _pull_chat_file(
-        self, task_ref: str, name: str
-    ) -> tuple[str, Path | None, str]:
-        """Chat/LLM pull. Does not take the WebUI download semaphore."""
+    def _track_agget_task(self, task: asyncio.Task[None]) -> None:
+        self._agget_tasks.add(task)
+        task.add_done_callback(self._agget_tasks.discard)
+
+    async def _send_pull_notice(
+        self,
+        umo: str,
+        text: str,
+        path: Path | None = None,
+        display: str = "",
+    ) -> None:
+        if not umo:
+            logger.warning("拉取结果没有会话，无法发送")
+            return
+        chain = MessageChain()
+        chain.message(text)
+        if path is not None:
+            chain.chain.append(Comp.File(name=display or path.name, file=str(path)))
         try:
-            return await asyncio.wait_for(
-                self._pull_chat_file_inner(task_ref, name),
-                CHAT_PULL_TIMEOUT_SECONDS,
+            await self.context.send_message(umo, chain)
+        except Exception as e:
+            logger.warning(f"发送拉取结果失败: {e}")
+
+    async def _agget_pull_job(self, umo: str, task_ref: str, name: str) -> None:
+        """Background /agget. No overall deadline; abort after 10 minutes without new bytes."""
+
+        async def _report(text: str) -> None:
+            await self._send_pull_notice(umo, text)
+
+        try:
+            text, path, display = await self._pull_chat_file(
+                task_ref,
+                name,
+                on_progress=_report,
+                limit=self._pull_max_bytes(),
+                total_timeout=None,
+                download_timeout=AGGET_STALL_SECONDS,
+                timeout_message=agget_stall_message(),
+                abort_on_head_timeout=False,
             )
+        except Exception as e:
+            logger.warning(f"/agget 后台拉取失败: {e}")
+            await self._send_pull_notice(umo, "拉取失败。建议改用图床或 WebUI 获取。")
+            return
+        await self._send_pull_notice(umo, text, path, display)
+
+    async def _pull_chat_file(
+        self,
+        task_ref: str,
+        name: str,
+        *,
+        on_progress: Any = None,
+        limit: int | None = None,
+        total_timeout: float | None = None,
+        download_timeout: float | None = None,
+        timeout_message: str | None = None,
+        abort_on_head_timeout: bool = True,
+    ) -> tuple[str, Path | None, str]:
+        """Chat/LLM pull. Does not take the WebUI download semaphore.
+
+        total_timeout caps the whole call. None means no overall deadline.
+        download_timeout is the httpx read-idle limit on the file stream.
+        """
+        inner = self._pull_chat_file_inner(
+            task_ref,
+            name,
+            on_progress=on_progress,
+            limit=limit,
+            download_timeout=download_timeout,
+            timeout_message=timeout_message,
+            abort_on_head_timeout=abort_on_head_timeout,
+        )
+        if total_timeout is None:
+            return await inner
+        try:
+            return await asyncio.wait_for(inner, total_timeout)
         except asyncio.TimeoutError:
             return MSG_PULL_TIMEOUT, None, ""
 
     async def _pull_chat_file_inner(
-        self, task_ref: str, name: str
+        self,
+        task_ref: str,
+        name: str,
+        *,
+        on_progress: Any = None,
+        limit: int | None = None,
+        download_timeout: float | None = None,
+        timeout_message: str | None = None,
+        abort_on_head_timeout: bool = True,
     ) -> tuple[str, Path | None, str]:
         try:
             short, _task_id, sandbox_id, key = self._resolve_file_target(task_ref)
@@ -4538,8 +4656,8 @@ class AntigravitySandboxPlugin(Star):
         if self._chat_pull_blocked(match):
             return "该文件不能通过聊天或指令拉取。", None, ""
         size = int(match.get("size_bytes") or 0)
-        if size > CHAT_PULL_MAX_BYTES:
-            return MSG_FILE_TOO_LARGE, None, ""
+        if limit is not None and size > limit:
+            return file_too_large_message(limit), None, ""
         rel = workspace_download_path(_as_str(match.get("path")) or _as_str(match.get("name")))
         try:
             remote_size = await client.head_environment_file_size(
@@ -4550,25 +4668,48 @@ class AntigravitySandboxPlugin(Star):
             )
         except GeminiClientError as e:
             kind = files_error_kind(getattr(e, "status_code", None), str(e), listing=False)
-            if kind == "timeout":
+            if kind == "timeout" and abort_on_head_timeout:
                 return MSG_PULL_TIMEOUT, None, ""
             if kind in {"key", "env"}:
                 return fixed_files_message(kind), None, ""
             remote_size = None
-        if remote_size is not None and remote_size > CHAT_PULL_MAX_BYTES:
-            return MSG_FILE_TOO_LARGE, None, ""
+        if limit is not None and remote_size is not None and remote_size > limit:
+            return file_too_large_message(limit), None, ""
         display = _as_str(match.get("name")) or PurePosixPath(rel).name or "download.bin"
+        if remote_size and remote_size > 0:
+            known_size: int | None = int(remote_size)
+        elif size > 0:
+            known_size = size
+        else:
+            known_size = None
+        # 已知大小低于阈值时不发进度；大小未知时，下载跨过阈值才发。
+        step = self._pull_progress_step_bytes() if on_progress is not None else 0
+        tracker = PullProgress(step, known_size)
+        report = on_progress
         dest = self._chat_pull_dest(display)
+        loaded = 0
         try:
             with dest.open("wb") as out:
                 async for chunk in client.iter_environment_file(
                     sandbox_id,
                     rel,
                     api_key=key,
-                    max_bytes=CHAT_PULL_MAX_BYTES,
-                    timeout=CHAT_PULL_TIMEOUT_SECONDS,
+                    max_bytes=limit,
+                    timeout=download_timeout,
+                    timeout_message=timeout_message,
                 ):
                     out.write(chunk)
+                    loaded += len(chunk)
+                    for mark in tracker.marks(loaded):
+                        if report is None:
+                            break
+                        try:
+                            await report(
+                                format_pull_progress(short, display, mark, tracker.known)
+                            )
+                        except Exception as e:
+                            logger.warning(f"发送拉取进度失败: {e}")
+                            report = None
         except (GeminiFileTooLargeError, GeminiFileTimeoutError, GeminiClientError) as e:
             dest.unlink(missing_ok=True)
             return self._files_failure_text(e, listing=False), None, ""
@@ -4586,7 +4727,23 @@ class AntigravitySandboxPlugin(Star):
         event: Any = None,
         **_kwargs: Any,
     ) -> str:
-        text, path, display = await self._pull_chat_file(task_id, name)
+        on_progress = None
+        if event is not None:
+
+            async def _report(text: str) -> None:
+                await event.send(event.plain_result(text))
+
+            on_progress = _report
+        text, path, display = await self._pull_chat_file(
+            task_id,
+            name,
+            on_progress=on_progress,
+            limit=self._tool_pull_max_bytes(),
+            total_timeout=CHAT_PULL_TIMEOUT_SECONDS,
+            download_timeout=CHAT_PULL_TIMEOUT_SECONDS,
+            timeout_message=MSG_PULL_TIMEOUT,
+            abort_on_head_timeout=True,
+        )
         if path is None or event is None:
             return text
         if self._computer_use_runtime(event) == "local":
@@ -4618,7 +4775,7 @@ class AntigravitySandboxPlugin(Star):
             return text + "\n文件已下载，但发送到聊天失败。"
         return (
             f"已把 {display} 发给用户。"
-            "沙盒网络存疑，不一定能成功拉取文件；超过 20MB 或超时请改用图床或 WebUI。"
+            "沙盒网络存疑，不一定能成功拉取文件；超过工具拉取大小上限或 90 秒请改用图床或 WebUI。"
         )
 
     async def handle_list_sandbox_task(self, *, task_id: str = "", **_kwargs: Any) -> str:
@@ -5356,6 +5513,7 @@ class AntigravitySandboxPlugin(Star):
             self._auto_retrieve_task,
             self._file_poll_task,
             self._pull_cleanup_task,
+            *list(self._agget_tasks),
         ):
             if task is not None and not task.done():
                 task.cancel()

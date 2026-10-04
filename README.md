@@ -6,7 +6,7 @@ AstrBot 插件：用 Google **Antigravity** 托管智能体在云端沙盒里跑
 
 - 插件名：`astrbot_plugin_antigravity_sandbox`
 - 作者：珂夜
-- 版本：1.6.3beta4
+- 版本：1.6.3beta7
 - 需要 AstrBot `>=4.5.7,<5`
 
 ## 介绍
@@ -81,7 +81,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 
 ## 配置
 
-最少只要填 Key。配置分成接入、代理、回执、测试功能、图床和环境回收几组：
+最少只要填 Key。配置分成接入、代理、聊天拉取、回执、测试功能、图床和环境回收几组：
 
 | 分组 | 配置 | 说明 |
 | --- | --- | --- |
@@ -91,6 +91,10 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | 接入与模型 | `submit_background` | 默认开启：提交后立刻回 ID，稍后取回 |
 | 接入与模型 | `max_in_progress_per_key` | 每个 Key 同时处于 `in_progress` 的任务上限，默认 4。新建任务优先给更空闲的 Key；额度相同则轮到上一把的下一把。续接不换 Key |
 | 网络代理 | `proxy` | 插件访问 Gemini 的代理。留空直连。图床 Webhook 不走这里 |
+| 聊天拉取 | `max_mb` | `/agget` 的大小上限，单位 MB。默认 0，不限制。`/agget` 不设总超时，进度停 10 分钟会中止 |
+| 聊天拉取 | `tool_max_mb` | `get_sandbox_task` 的大小上限，单位 MB。默认 0，不限制。该工具固定 90 秒超时 |
+| 聊天拉取 | `progress` | 拉取进度反馈。默认开启。下载每跨过一次阈值就发一条进度。文件小于阈值时不发 |
+| 聊天拉取 | `progress_mb` | 进度反馈阈值，单位 MB。默认 40。小于 1 时按 40 处理 |
 | 取回回执 | `image_receipt` | 图片回执。默认开启，仅对 status 为 `completed` 且达到字数阈值的取回生效；其它状态或字数不足时发纯文本 |
 | 取回回执 | `image_receipt_min_length` | 触发图片回执的最少字符数。默认 200。开启图片回执且 status 为 completed 时，仅当回执内容长度大于或等于此阈值时才会渲染成图片，否则保持纯文本发送。配置为 0 或负数时视为不限制长度（任意长度均转图） |
 | 取回回执 | `truncate_chars` | 文本回执截断字符数，默认 2000。只有确定会发图片回执时不截断 |
@@ -126,7 +130,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 | `/agretrieve` 或 `/agr` | 按任务编号取回执。确定会发图片回执时不截断，其余按 `truncate_chars` |
 | `/agcontinue` 或 `/agc` | 同沙盒续跑，不换 Key。不写类型时默认 md，沙盒写入带时间戳的 `result.md`。附件 PUT 进已有沙盒 |
 | `/agls <任务编号>` | 列出该沙盒 workspace 文件，渲染成表格图片发送 |
-| `/agget <任务编号> <完整路径>` | 拉取文件发到聊天。超过 20MB 或 90 秒则中止 |
+| `/agget <任务编号> <完整路径>` | 后台拉取文件，马上返回，好了再发到聊天。大小上限见配置，默认不限制。进度默认每 40MB 一次。不设总超时，进度停 10 分钟会中止 |
 | `/agenvlist` 或 `/agels` | 管理员：查看当前项目沙盒占用 |
 | `/agenvcleanup` 或 `/agecl` | 管理员：回收闲置环境。`all` 扫整个项目；短号立即删指定沙盒 |
 
@@ -161,7 +165,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 /agget 0003:workspace/index.html     # 早期冒号写法仍兼容
 ```
 
-`/agget` 会先看列表里的 `size_bytes`，再用 HEAD 的 Content-Length 卡住 20MB，然后流式下载。沙盒网络不一定能通，失败时请改用图床或 WebUI。临时文件会定时清理。`get_sandbox_task` 工具同样按 任务编号 + 文件名 拉取，语义与前者一致。
+`/agget` 会先回一句「开始拉取」，再在后台看列表里的 `size_bytes` 和 HEAD 的 Content-Length，对照「/agget 大小上限」（默认不限制）后流式下载。进度反馈开启时，每跨过一次阈值（默认 40MB）发一条进度；文件小于该阈值时不发。不设总超时。连续 10 分钟没有新的下载数据会中止，并建议改用图床或 WebUI。沙盒网络不一定能通。临时文件会定时清理。`get_sandbox_task` 用另一套「工具拉取大小上限」，并在 90 秒时中止。
 
 ### 给大模型用的工具
 
@@ -171,7 +175,7 @@ plugin i https://github.com/ElaraKaya/astrbot_plugin_antigravity_sandbox
 - `retrieve_sandbox_task`：按短号取回。确定会发图片回执时插件直接把图片发给用户，工具只回简报
 - `continue_sandbox_task`：同沙盒续跑，不换 Key。不写产出文件时默认 `result.md`。附件 PUT 进 workspace，不走 interaction sources
 - `list_sandbox_task`：列出 workspace 文件
-- `get_sandbox_task`：拉取单个文件。沙盒网络存疑，不一定能成功；超过 20MB 或 90 秒会中止
+- `get_sandbox_task`：拉取单个文件。沙盒网络存疑，不一定能成功。大小上限见「工具拉取大小上限」，默认不限制；超过上限或 90 秒会中止
 
 提交时把任务写清楚、独立，不要把无关聊天记忆硬塞进提示词。  
 需要产出文件时，写原始文件名即可（如 `report.docx`），插件会自动加时间戳前缀，避免互相覆盖。文件名里的中文等非 ASCII 字符会变成下划线（`文转图模板.tar` → `260922123022_file.tar`），扩展名始终保留；想让图床链接带中文原名，需要把 `_safe_upload_name` 的正则放宽成支持 Unicode。
@@ -191,6 +195,10 @@ Project environment storage quota exceeded
 `/agenvcleanup 0002`：按短号立即删除对应沙盒，不受 TTL / 最近保留限制。
 
 ## 更新日志
+
+**1.6.3beta7**：`get_sandbox_task` 单独使用「工具拉取大小上限」，超时 90 秒。`/agget` 改为后台拉取，不设总超时，进度停 10 分钟会中止并建议换方式。详见 [CHANGELOG.md](CHANGELOG.md)。
+
+**1.6.3beta6**：`/agget` 和 `get_sandbox_task` 的大小上限改到配置里，默认不限制。进度反馈默认每 40MB 一次，可以关闭或改阈值，比阈值小的文件不发进度。详见 [CHANGELOG.md](CHANGELOG.md)。
 
 **1.6.3beta4**：图床 Token 改为项目内 bearer 凭据，由出站代理注入到 Webhook 主机，不再挂到沙盒文件。续接附件只 PUT 进沙盒，不再由插件再传一次图床。本版不删除历史沙盒里的 Token 文件，旧 Token 要在图床侧轮换后才算失效。详见 [CHANGELOG.md](CHANGELOG.md)。
 

@@ -90,12 +90,16 @@ TERMINAL_STATUS = frozenset(
 )
 RUNNING_STATUS = frozenset({"in_progress", "queued"})
 
-CHAT_PULL_MAX_BYTES = 20 * 1024 * 1024
+# 续接附件写入沙盒的上限。聊天拉取（/agget、get_sandbox_task）不走这里，大小由配置决定。
+CONTINUE_PUT_MAX_BYTES = 20 * 1024 * 1024
 CHAT_PULL_TIMEOUT_SECONDS = 90.0
+# /agget 不设总超时。下载字节数连续这么久不增加，就中止并建议换方式。
+AGGET_STALL_SECONDS = 10 * 60.0
 UI_PULL_CONCURRENCY = 2
 UI_PULL_PROGRESS_INTERVAL = 0.5
 DEFAULT_RECEIPT_TRUNCATE_CHARS = 2000
 DEFAULT_IN_PROGRESS_PER_KEY = 4
+DEFAULT_PULL_PROGRESS_MB = 40
 
 MSG_NO_CAPACITY = "目前无空余沙盒分配"
 MSG_ENV_404 = "沙盒环境不存在或已过期。"
@@ -103,7 +107,7 @@ MSG_KEY_INVALID = "API Key 无效或没有权限。"
 MSG_PULL_TIMEOUT = "拉取超时（90 秒），已中止。请改用图床或 WebUI 获取。"
 MSG_LIST_EMPTY = "该沙盒文件列表为空。"
 MSG_FILE_MISSING = "沙盒中没有这个文件。"
-MSG_FILE_TOO_LARGE = "文件超过 20MB，请使用图床或 WebUI 获取。"
+MSG_FILE_TOO_LARGE = "文件超过大小上限，请使用图床或 WebUI 获取。"
 
 OnStorageQuota = Callable[[str], Awaitable[int]]
 
@@ -309,6 +313,91 @@ def clip_text(text: str, limit: int, *, keep_full: bool) -> str:
     return body[:cap] + "\n…(过长已截断，全文见下方链接)"
 
 
+def format_bytes(n: int) -> str:
+    size = float(max(0, int(n or 0)))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} GB"
+
+
+def file_too_large_message(max_bytes: int) -> str:
+    """User-facing cap message. Whole megabytes stay as '20MB'."""
+    if max_bytes > 0 and max_bytes % (1024 * 1024) == 0:
+        label = f"{max_bytes // (1024 * 1024)}MB"
+    else:
+        label = format_bytes(max_bytes)
+    return f"文件超过 {label}，请使用图床或 WebUI 获取。"
+
+
+def pull_limit_bytes(megabytes: Any) -> int | None:
+    """Config megabytes → byte cap. 0, negative, or unparsable means no limit."""
+    try:
+        mb = int(megabytes)
+    except (TypeError, ValueError):
+        return None
+    if mb <= 0:
+        return None
+    return mb * 1024 * 1024
+
+
+def pull_progress_step_bytes(megabytes: Any, *, enabled: bool = True) -> int:
+    """Bytes between chat-pull progress messages. 0 disables reporting."""
+    if not enabled:
+        return 0
+    try:
+        mb = int(megabytes)
+    except (TypeError, ValueError):
+        mb = DEFAULT_PULL_PROGRESS_MB
+    if mb < 1:
+        mb = DEFAULT_PULL_PROGRESS_MB
+    return mb * 1024 * 1024
+
+
+def agget_stall_message(seconds: float = AGGET_STALL_SECONDS) -> str:
+    minutes = max(1, int(float(seconds) // 60))
+    return f"拉取已中止：{minutes} 分钟没有新的下载进度。建议改用图床或 WebUI 获取。"
+
+
+def format_pull_progress(short: str, name: str, loaded: int, total: int | None) -> str:
+    label = (name or "").strip() or "文件"
+    if total and total > 0:
+        size = f"{format_bytes(loaded)} / {format_bytes(total)}"
+    else:
+        size = f"已下载 {format_bytes(loaded)}"
+    if short:
+        return f"任务编号 {short} 正在拉取 {label}：{size}"
+    return f"正在拉取 {label}：{size}"
+
+
+class PullProgress:
+    """Fire once each time a chat pull crosses another `step` bytes.
+
+    A known size below `step` never fires. Unknown size (0 / None) fires only
+    after the download itself crosses `step`, so a smaller file stays silent.
+    """
+
+    def __init__(self, step: int, known_size: int | None = None) -> None:
+        self.step = int(step or 0)
+        known = int(known_size or 0)
+        self.known = known if known > 0 else None
+        if self.step > 0 and self.known is not None and self.known < self.step:
+            self.step = 0
+        self._next = self.step
+
+    def marks(self, loaded: int) -> list[int]:
+        if self.step <= 0:
+            return []
+        found: list[int] = []
+        while loaded >= self._next:
+            found.append(self._next)
+            self._next += self.step
+        return found
+
+
 def files_error_kind(status_code: int | None, message: str, *, listing: bool) -> str:
     """Map an environment-files failure onto a fixed reply kind."""
     text = (message or "").lower()
@@ -392,7 +481,7 @@ async def consume_bounded(
         if not chunk:
             continue
         if max_bytes is not None and total + len(chunk) > max_bytes:
-            raise GeminiFileTooLargeError(MSG_FILE_TOO_LARGE)
+            raise GeminiFileTooLargeError(file_too_large_message(max_bytes))
         total += len(chunk)
         out.append(chunk)
     return b"".join(out)
@@ -1401,10 +1490,12 @@ class GeminiSandboxClient:
         cancel_event: Any = None,
         max_bytes: int | None = None,
         timeout: float | None = None,
+        timeout_message: str | None = None,
     ):
         """Stream an environment file (alt=media) as byte chunks.
 
         cancel_event stops the read between chunks. max_bytes aborts instead of truncating.
+        timeout is the httpx read idle limit, not a cap on the whole download.
         """
         self.require_api_key()
         target_key = api_key or (self.api_keys[0] if self.api_keys else None)
@@ -1430,13 +1521,13 @@ class GeminiSandboxClient:
                         if not chunk:
                             continue
                         if max_bytes is not None and total + len(chunk) > max_bytes:
-                            raise GeminiFileTooLargeError(MSG_FILE_TOO_LARGE)
+                            raise GeminiFileTooLargeError(file_too_large_message(max_bytes))
                         total += len(chunk)
                         yield chunk
             except GeminiClientError:
                 raise
             except httpx.TimeoutException as e:
-                raise GeminiFileTimeoutError(MSG_PULL_TIMEOUT) from e
+                raise GeminiFileTimeoutError(timeout_message or MSG_PULL_TIMEOUT) from e
             except httpx.HTTPError as e:
                 raise GeminiClientError(f"下载沙盒文件网络错误: {e}") from e
 
@@ -1474,44 +1565,21 @@ class GeminiSandboxClient:
         encoded_path = encode_environment_file_path(rel)
         url = f"{GEMINI_UPLOAD_ENV_BASE}/{encoded_env}/files/{encoded_path}"
         mime = (content_type or "application/octet-stream").strip() or "application/octet-stream"
-        params: dict[str, Any] = {"overwrite": "true"} if overwrite else {}
-        async with httpx.AsyncClient(
-            **self._client_kwargs(
-                ENV_FILES_UPLOAD_TIMEOUT,
-                target_key,
-                content_type=mime,
-            )
-        ) as client:
-            try:
-                resp = await client.put(url, params=params or None, content=data)
-            except httpx.HTTPError as e:
-                raise GeminiClientError(f"写入沙盒文件网络错误: {e}") from e
-        if resp.status_code >= 400:
-            raise GeminiClientError(
-                self._format_http_error(resp, "写入沙盒文件"),
-                status_code=resp.status_code,
-            )
-        try:
-            payload = resp.json()
-        except Exception:
-            payload = {}
-        if isinstance(payload, dict):
-            files = payload.get("files")
-            if isinstance(files, list) and files and isinstance(files[0], dict):
-                normalized = normalize_environment_file_entry(files[0])
-                if normalized:
-                    return normalized
-            if payload:
-                normalized = normalize_environment_file_entry(payload)
-                if normalized.get("name") or normalized.get("path"):
-                    return normalized
-        return {
-            "name": rel.split("/")[-1],
-            "path": rel,
-            "type": "file",
-            "size_bytes": len(data),
-            "mime_type": mime,
-        }
+        # 官方 REST 单文件上传：PUT /upload/v1beta/.../files/{path}，直接带正文。
+        # 沙盒对这种裸 PUT 常回 504 deadline_expired，所以实际走文档的
+        # uploadType=resumable 会话：空正文开会话，再带 Content-Range 传正文。
+        params: dict[str, Any] = {"uploadType": "resumable"}
+        if overwrite:
+            params["overwrite"] = "true"
+        return await self._resumable_put(
+            url,
+            data,
+            mime=mime,
+            params=params,
+            api_key=target_key,
+            target_key=target_key,
+            action="写入沙盒文件",
+        )
 
     async def download_environment_file_to(
         self,
@@ -1539,7 +1607,13 @@ class GeminiSandboxClient:
         overwrite: bool = True,
         api_key: str | None = None,
     ) -> dict[str, Any]:
-        """Upload bytes into an environment via resumable Scotty protocol."""
+        """Upload bytes into an environment (WebUI upload route).
+
+        Official (2026-09-17) resumable session:
+        PUT /upload/v1beta/environments/{id}/files/{path}?uploadType=resumable
+        with X-Upload-Content-Type / X-Upload-Content-Length and an empty body,
+        then PUT the payload at the Location URL with a Content-Range header.
+        """
         self.require_api_key()
         env_id = environment_id_of({"id": env_id}) or (env_id or "").strip()
         if not env_id:
@@ -1553,71 +1627,107 @@ class GeminiSandboxClient:
             raise GeminiClientError("上传内容不能为空。")
         data = content if isinstance(content, (bytes, bytearray)) else bytes(content)
         rel = normalize_environment_file_path(path, default="")
+        if not rel:
+            raise GeminiClientError("上传路径不能为空。")
         encoded_env = quote(env_id, safe="")
         encoded_path = encode_environment_file_path(rel)
         if encoded_path:
             start_url = f"{GEMINI_UPLOAD_ENV_BASE}/{encoded_env}/files/{encoded_path}"
         else:
             start_url = f"{GEMINI_UPLOAD_ENV_BASE}/{encoded_env}/files"
-        params: dict[str, Any] = {}
+        params: dict[str, Any] = {"uploadType": "resumable"}
         if overwrite:
             params["overwrite"] = "true"
         mime = (content_type or "application/octet-stream").strip() or "application/octet-stream"
+        return await self._resumable_put(
+            start_url,
+            data,
+            mime=mime,
+            params=params,
+            api_key=target_key,
+            target_key=target_key,
+            action="上传沙盒文件",
+        )
+
+    async def _resumable_put(
+        self,
+        url: str,
+        data: bytes,
+        *,
+        mime: str,
+        params: dict[str, Any],
+        api_key: str,
+        target_key: str,
+        action: str,
+    ) -> dict[str, Any]:
+        """官方 resumable 上传：空正文开会话，再带 Content-Range 传正文。
+
+        直接 PUT 正文（文档里的单文件 curl）在沙盒侧常回 504
+        deadline_exceeded，改为走文档的 uploadType=resumable 会话。
+        """
+        total = len(data)
         start_headers = {
-            "x-goog-api-key": target_key,
+            "x-goog-api-key": api_key,
             "Api-Revision": API_REVISION,
-            "X-Goog-Upload-Protocol": "resumable",
-            "X-Goog-Upload-Command": "start",
-            "X-Goog-Upload-Header-Content-Length": str(len(data)),
-            "X-Goog-Upload-Header-Content-Type": mime,
+            "X-Upload-Content-Type": mime,
+            "X-Upload-Content-Length": str(total),
         }
-        timeout = httpx.Timeout(ENV_FILES_UPLOAD_TIMEOUT, connect=30.0)
         async with httpx.AsyncClient(
-            **build_httpx_client_kwargs(timeout=timeout, proxy=self.proxy, use_proxy=True)
+            **self._client_kwargs(ENV_FILES_UPLOAD_TIMEOUT, target_key, content_type=None)
         ) as client:
             try:
-                start_resp = await client.put(start_url, params=params, headers=start_headers)
+                start_resp = await client.put(
+                    url, params=params, headers=start_headers, content=b""
+                )
             except httpx.HTTPError as e:
-                raise GeminiClientError(f"开始上传沙盒文件网络错误: {e}") from e
+                raise GeminiClientError(f"{action}网络错误: {e}") from e
             if start_resp.status_code >= 400:
-                raise GeminiClientError(self._format_http_error(start_resp, "开始上传沙盒文件"))
-            upload_url = (
-                start_resp.headers.get("x-goog-upload-url")
-                or start_resp.headers.get("X-Goog-Upload-URL")
-                or ""
-            ).strip()
-            if not upload_url:
-                raise GeminiClientError("开始上传沙盒文件未返回 x-goog-upload-url。")
+                raise GeminiClientError(
+                    self._format_http_error(start_resp, action),
+                    status_code=start_resp.status_code,
+                )
+            session_url = (start_resp.headers.get("location") or "").strip()
+            if not session_url:
+                raise GeminiClientError(f"{action}未返回上传会话地址（Location）。")
             put_headers = {
-                "X-Goog-Upload-Command": "upload, finalize",
-                "X-Goog-Upload-Offset": "0",
                 "Content-Type": mime,
+                "Content-Range": f"bytes 0-{max(total - 1, 0)}/{total}",
             }
             try:
-                put_resp = await client.put(upload_url, content=data, headers=put_headers)
+                put_resp = await client.put(
+                    session_url, headers=put_headers, content=data
+                )
             except httpx.HTTPError as e:
-                raise GeminiClientError(f"上传沙盒文件网络错误: {e}") from e
+                raise GeminiClientError(f"{action}网络错误: {e}") from e
             if put_resp.status_code >= 400:
-                raise GeminiClientError(self._format_http_error(put_resp, "上传沙盒文件"))
+                raise GeminiClientError(
+                    self._format_http_error(put_resp, action),
+                    status_code=put_resp.status_code,
+                )
             try:
                 payload = put_resp.json()
             except Exception:
                 payload = {}
-            if isinstance(payload, dict) and payload:
-                return normalize_environment_file_entry(payload) or {
-                    "name": rel.split("/")[-1],
-                    "path": rel,
-                    "type": "file",
-                    "size_bytes": len(data),
-                    "mime_type": mime,
-                }
-            return {
-                "name": rel.split("/")[-1],
-                "path": rel,
-                "type": "file",
-                "size_bytes": len(data),
-                "mime_type": mime,
-            }
+        if isinstance(payload, dict) and payload:
+            batch = payload.get("files")
+            if isinstance(batch, list) and batch and isinstance(batch[0], dict):
+                normalized = normalize_environment_file_entry(batch[0])
+                if normalized.get("name") or normalized.get("path"):
+                    return normalized
+            normalized = normalize_environment_file_entry(payload)
+            if normalized.get("name") or normalized.get("path"):
+                return normalized
+        rel = normalize_environment_file_path(
+            url.rsplit("/files/", 1)[-1], default=""
+        ) if "/files/" in url else ""
+        name = rel.rsplit("/", 1)[-1] if rel else "upload"
+        return {
+            "name": name,
+            "path": rel or name,
+            "type": "file",
+            "size_bytes": total,
+            "mime_type": mime,
+        }
 
     def _parse_json_response(self, resp: httpx.Response, *, action: str) -> dict[str, Any]:
         if resp.status_code >= 400:

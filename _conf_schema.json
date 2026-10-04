@@ -60,6 +60,37 @@
       }
     }
   },
+  "pull": {
+    "description": "聊天拉取",
+    "hint": "控制 /agget 和 get_sandbox_task 从沙盒拉文件。两条路径的大小上限和超时分开。WebUI 沙盒文件页不走这里。",
+    "type": "object",
+    "items": {
+      "max_mb": {
+        "description": "/agget 大小上限（MB）",
+        "type": "int",
+        "hint": "只作用于 /agget。0 表示不限制。默认 0。/agget 不设总超时；连续 10 分钟没有新的下载数据会中止，并建议改用图床或 WebUI。",
+        "default": 0
+      },
+      "tool_max_mb": {
+        "description": "工具拉取大小上限（MB）",
+        "type": "int",
+        "hint": "只作用于 get_sandbox_task。0 表示不限制。默认 0。该工具固定 90 秒超时，超过大小或超时就中止。",
+        "default": 0
+      },
+      "progress": {
+        "description": "拉取进度反馈",
+        "type": "bool",
+        "hint": "开启后，下载每跨过一次阈值就在聊天里发一条进度。文件总大小低于阈值时不发。默认开启。",
+        "default": true
+      },
+      "progress_mb": {
+        "description": "进度反馈阈值（MB）",
+        "type": "int",
+        "hint": "每下载这么多就反馈一次。文件小于这个值时不反馈。默认 40。小于 1 时按 40 处理。",
+        "default": 40
+      }
+    }
+  },
   "receipt": {
     "description": "取回回执",
     "hint": "控制回执怎么发到聊天。图片回执只用于状态为 completed 的取回。沙盒路径回执只决定回执里写不写工作空间路径。",

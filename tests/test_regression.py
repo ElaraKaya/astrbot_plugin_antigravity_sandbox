@@ -16,8 +16,10 @@ sys.path.insert(0, str(ROOT))
 import httpx  # noqa: E402
 
 from gemini_client import (  # noqa: E402
-    CHAT_PULL_MAX_BYTES,
+    AGGET_STALL_SECONDS,
     CHAT_PULL_TIMEOUT_SECONDS,
+    CONTINUE_PUT_MAX_BYTES,
+    DEFAULT_PULL_PROGRESS_MB,
     DEFAULT_RECEIPT_TRUNCATE_CHARS,
     IMAGE_HOST_CREDENTIAL_ID,
     MSG_ENV_404,
@@ -38,15 +40,21 @@ from gemini_client import (  # noqa: E402
     GeminiSandboxClient,
     GeminiSubmitTimeoutError,
     ProgressThrottle,
+    PullProgress,
+    agget_stall_message,
     build_httpx_client_kwargs,
     build_upload_instruction,
     clip_text,
     count_key_in_progress,
     ensure_md_filename,
     environment_media_url,
+    file_too_large_message,
     files_error_kind,
     fixed_files_message,
+    format_pull_progress,
     image_host_network,
+    pull_limit_bytes,
+    pull_progress_step_bytes,
     select_balanced_keys,
     select_idle_keys,
     slim_environment_file_entry,
@@ -279,8 +287,45 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(rules[1], {"domain": "*"})
 
     def test_limits(self):
-        self.assertEqual(CHAT_PULL_MAX_BYTES, 20 * 1024 * 1024)
+        self.assertEqual(CONTINUE_PUT_MAX_BYTES, 20 * 1024 * 1024)
         self.assertEqual(CHAT_PULL_TIMEOUT_SECONDS, 90.0)
+        self.assertEqual(AGGET_STALL_SECONDS, 10 * 60.0)
+        self.assertEqual(
+            agget_stall_message(),
+            "拉取已中止：10 分钟没有新的下载进度。建议改用图床或 WebUI 获取。",
+        )
+        self.assertEqual(DEFAULT_PULL_PROGRESS_MB, 40)
+        self.assertIsNone(pull_limit_bytes(0))
+        self.assertIsNone(pull_limit_bytes(-1))
+        self.assertIsNone(pull_limit_bytes("nope"))
+        self.assertEqual(pull_limit_bytes(20), 20 * 1024 * 1024)
+        self.assertEqual(pull_progress_step_bytes(40, enabled=True), 40 * 1024 * 1024)
+        self.assertEqual(pull_progress_step_bytes(0, enabled=True), 40 * 1024 * 1024)
+        self.assertEqual(pull_progress_step_bytes(40, enabled=False), 0)
+        self.assertEqual(
+            file_too_large_message(20 * 1024 * 1024),
+            "文件超过 20MB，请使用图床或 WebUI 获取。",
+        )
+
+    def test_pull_progress_skips_files_under_the_threshold(self):
+        step = 40 * 1024 * 1024
+        small = PullProgress(step, 10 * 1024 * 1024)
+        self.assertEqual(small.marks(50 * 1024 * 1024), [])
+        unknown = PullProgress(step, None)
+        self.assertEqual(unknown.marks(39 * 1024 * 1024), [])
+        self.assertEqual(unknown.marks(40 * 1024 * 1024), [step])
+        self.assertEqual(unknown.marks(80 * 1024 * 1024), [step * 2])
+        big = PullProgress(step, 100 * 1024 * 1024)
+        self.assertEqual(big.marks(step), [step])
+        self.assertEqual(
+            format_pull_progress("0003", "a.zip", step, 100 * 1024 * 1024),
+            "任务编号 0003 正在拉取 a.zip：40.00 MB / 100.00 MB",
+        )
+        self.assertEqual(
+            format_pull_progress("", "a.zip", step, None),
+            "正在拉取 a.zip：已下载 40.00 MB",
+        )
+        self.assertEqual(PullProgress(0, None).marks(step * 3), [])
 
     def test_background_payload_carries_store_true(self):
         client = GeminiSandboxClient(api_keys=["k"])
@@ -318,9 +363,17 @@ class PolicyTests(unittest.TestCase):
 class HttpTests(unittest.TestCase):
     def test_put_uses_environment_upload_url(self):
         seen: list[httpx.Request] = []
+        session_url = (
+            "https://generativelanguage.googleapis.com/upload/v1beta/environments/"
+            "env123/files/workspace/notes.md?uploadType=resumable&upload_id=abc"
+        )
 
         def handler(request: httpx.Request) -> httpx.Response:
             seen.append(request)
+            if request.headers.get("x-upload-content-length"):
+                # Session start: empty body, returns the upload session URL.
+                return httpx.Response(200, headers={"location": session_url})
+            body = request.read()
             return httpx.Response(
                 200,
                 json={
@@ -329,7 +382,7 @@ class HttpTests(unittest.TestCase):
                             "name": "notes.md",
                             "path": "workspace/notes.md",
                             "type": "FILE",
-                            "size_bytes": "4",
+                            "size_bytes": str(len(body)),
                         }
                     ]
                 },
@@ -348,13 +401,43 @@ class HttpTests(unittest.TestCase):
 
         meta = _run(run())
         self.assertEqual(meta["name"], "notes.md")
-        self.assertEqual(len(seen), 1)
-        request = seen[0]
-        self.assertEqual(request.method, "PUT")
-        self.assertIn("/upload/v1beta/environments/env123/files/workspace/notes.md", str(request.url))
-        self.assertNotIn("/interactions", str(request.url))
-        self.assertEqual(request.content, b"data")
-        self.assertEqual(request.headers["x-goog-api-key"], "test-key")
+        self.assertEqual(len(seen), 2)
+        start, upload = seen
+        self.assertEqual(start.method, "PUT")
+        self.assertEqual(upload.method, "PUT")
+        self.assertIn("/upload/v1beta/environments/env123/files/workspace/notes.md", str(start.url))
+        self.assertIn("uploadType=resumable", str(start.url))
+        self.assertNotIn("/interactions", str(start.url))
+        self.assertEqual(start.content, b"")
+        self.assertEqual(start.headers["x-goog-api-key"], "test-key")
+        self.assertEqual(start.headers["x-upload-content-length"], "4")
+        self.assertEqual(start.headers["x-upload-content-type"], "text/markdown")
+        # Payload goes to the session URL with a Content-Range, not to the origin.
+        self.assertEqual(str(upload.url), session_url)
+        self.assertEqual(upload.content, b"data")
+        self.assertEqual(upload.headers["content-range"], "bytes 0-3/4")
+
+    def test_resumable_upload_falls_back_when_no_location(self):
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json={})
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["k"])
+
+        async def run():
+            return await client.upload_environment_file(
+                "env123",
+                "workspace/a.bin",
+                b"abc",
+                content_type="application/octet-stream",
+                api_key="k",
+            )
+
+        with self.assertRaises(GeminiClientError) as ctx:
+            _run(run())
+        self.assertIn("Location", str(ctx.exception))
 
     def test_pull_aborts_over_20mb_and_on_cancel(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -376,7 +459,7 @@ class HttpTests(unittest.TestCase):
 
         with self.assertRaises(GeminiFileTooLargeError) as ctx:
             _run(too_big())
-        self.assertEqual(str(ctx.exception), MSG_FILE_TOO_LARGE)
+        self.assertEqual(str(ctx.exception), file_too_large_message(4))
 
         cancel = asyncio.Event()
         cancel.set()
@@ -635,7 +718,18 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn("default_ext=None", text)
         schema = (ROOT / "_conf_schema.json").read_text(encoding="utf-8")
         self.assertIn("沙盒路径回执", schema)
+        self.assertIn("拉取大小上限", schema)
+        self.assertIn("拉取进度反馈", schema)
+        self.assertIn("进度反馈阈值", schema)
+        self.assertIn('"max_mb"', schema)
+        self.assertIn('"tool_max_mb"', schema)
+        self.assertIn("工具拉取大小上限", schema)
+        self.assertIn("_agget_pull_job", text)
+        self.assertIn("total_timeout=None", text)
+        self.assertIn("没有新的下载进度", client_text)
         self.assertIn("回执基础地址", schema)
+        self.assertNotIn("卡住 20MB", text)
+        self.assertIn("默认不限制", text)
         self.assertIn("回执图床 URL", schema)
         self.assertIn("完成标记提醒", schema)
         self.assertIn("完成标记查询间隔", schema)
@@ -942,32 +1036,72 @@ class CredentialTests(unittest.TestCase):
 
 
 class AgGetParseTests(unittest.TestCase):
-    """校验 /agget 的完整路径解析，覆盖优雅风格与旧写法兼容。"""
+    """校验 /agget 的完整路径解析，覆盖优雅风格与旧写法兼容。
+
+    直接执行 main.py 里 agget 的解析语句（yield 之前的部分），
+    这样测的是真实实现，不是测试里复制的副本。
+    """
 
     @staticmethod
-    def _parse(raw: str) -> tuple[str, str]:
-        """与 agget 中的解析逻辑保持一致（抽出来便于回归）。"""
-        import re as _re
+    def _parse_statements() -> tuple[str, list[str]]:
+        """返回 (imports 前缀, agget 解析语句源码)。"""
+        import ast as _ast
 
-        drive = _re.compile(r"^[A-Za-z]:$")
-        raw = (raw or "").strip()
-        task_ref = ""
-        name = raw
-        if (raw[:2] and drive.fullmatch(raw[:2])) or raw.startswith(("/", "\\")):
-            name = raw
-        elif ":" in raw:
-            head, _, tail = raw.partition(":")
-            head = head.strip()
-            tail = tail.strip().lstrip("/")
-            if head.isdigit() and tail:
-                task_ref = head
-                name = tail
-        elif " " in raw:
-            head, _, tail = raw.partition(" ")
-            if head.strip().isdigit() and tail.strip():
-                task_ref = head.strip()
-                name = tail.strip()
-        return task_ref, name
+        src = MAIN.read_text(encoding="utf-8")
+        tree = _ast.parse(src)
+        handler = None
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.AsyncFunctionDef) and node.name == "agget":
+                handler = node
+                break
+        assert handler is not None, "agget handler not found in main.py"
+        lines = src.splitlines()
+        kept: list[str] = []
+        for stmt in handler.body:
+            # 跳过 docstring
+            if isinstance(stmt, _ast.Expr) and isinstance(stmt.value, _ast.Constant):
+                continue
+            # 到 `short = task_ref or ...` 为止，后面是真正的调用与发送
+            if isinstance(stmt, _ast.Assign) and any(
+                isinstance(t, _ast.Name) and t.id == "short" for t in stmt.targets
+            ):
+                break
+            chunk = lines[stmt.lineno - 1 : stmt.end_lineno]
+            if any("yield event" in line for line in chunk):
+                continue
+            kept.append("\n".join(chunk))
+        prefix_lines: list[str] = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Assign) and any(
+                isinstance(t, _ast.Name) and t.id == "_DRIVE_PREFIX_RE"
+                for t in node.targets
+            ):
+                prefix_lines = lines[node.lineno - 1 : node.end_lineno]
+        return "\n".join(prefix_lines), kept
+
+    @classmethod
+    def setUpClass(cls):
+        import re as _re
+        import textwrap as _textwrap
+
+        prefix, statements = cls._parse_statements()
+        namespace: dict = {"re": _re}
+        exec(prefix, namespace)
+        body = _textwrap.dedent("\n".join(statements))
+        indented = "\n".join(
+            f"    {line}" if line.strip() else "" for line in body.splitlines()
+        )
+        wrapper = (
+            "def parse(rest):\n"
+            f"{indented}\n"
+            "    return task_ref, name\n"
+        )
+        exec(wrapper, namespace)
+        cls._real_parse = staticmethod(namespace["parse"])
+
+    @classmethod
+    def _parse(cls, raw: str) -> tuple[str, str]:
+        return cls._real_parse(raw)
 
     def test_space_form_is_primary(self):
         self.assertEqual(
@@ -1001,6 +1135,13 @@ class AgGetParseTests(unittest.TestCase):
 
     def test_empty_is_rejected(self):
         self.assertEqual(self._parse("   "), ("", ""))
+
+    def test_short_number_alone_is_not_a_path(self):
+        # 光有任务编号、没接路径：识别成编号并让上层给出用法提示，
+        # 不能把编号当成路径去查后报「未找到该任务编号」。
+        self.assertEqual(self._parse("0009"), ("0009", ""))
+        self.assertEqual(self._parse("9"), ("9", ""))
+        self.assertEqual(self._parse("0009:"), ("0009", ""))
 
 
 class ReceiptFormatTests(unittest.TestCase):
