@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import mimetypes
@@ -30,11 +31,11 @@ import stat
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import astrbot.api.message_components as Comp
-import httpx
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
@@ -45,17 +46,21 @@ from pydantic.dataclasses import dataclass
 
 try:
     from .gemini_client import (
-        CHAT_PULL_MAX_BYTES,
+        AGGET_STALL_SECONDS,
         CHAT_PULL_TIMEOUT_SECONDS,
+        CONTINUE_PUT_MAX_BYTES,
         DEFAULT_AGENT,
         DEFAULT_IN_PROGRESS_PER_KEY,
+        DEFAULT_PULL_PROGRESS_MB,
         DEFAULT_RECEIPT_TRUNCATE_CHARS,
+        IMAGE_HOST_CREDENTIAL_ID,
         MSG_FILE_MISSING,
         MSG_FILE_TOO_LARGE,
         MSG_LIST_EMPTY,
         MSG_NO_CAPACITY,
         MSG_PULL_TIMEOUT,
         RUNNING_STATUS,
+        TERMINAL_STATUS,
         UI_PULL_CONCURRENCY,
         UI_PULL_PROGRESS_INTERVAL,
         GeminiClientError,
@@ -66,35 +71,48 @@ try:
         GeminiSandboxClient,
         GeminiSubmitTimeoutError,
         ProgressThrottle,
-        build_httpx_client_kwargs,
+        PullProgress,
+        agget_stall_message,
+        build_upload_instruction,
         clip_text,
         count_key_in_progress,
         ensure_md_filename,
         environment_id_of,
+        file_too_large_message,
+        files_error_kind,
+        fixed_files_message,
+        format_bytes,
+        format_pull_progress,
+        image_host_network,
         is_safe_local_file_path,
         environment_size_bytes,
         extract_output_text,
-        files_error_kind,
-        fixed_files_message,
         normalize_environment_file_path,
+        pull_limit_bytes,
+        pull_progress_step_bytes,
         select_balanced_keys,
         slim_environment_file_entry,
         summarize_steps,
+        webhook_upload_host,
         workspace_download_path,
     )
 except ImportError:  # loaded as a loose main.py, not a package
     from gemini_client import (
-        CHAT_PULL_MAX_BYTES,
+        AGGET_STALL_SECONDS,
         CHAT_PULL_TIMEOUT_SECONDS,
+        CONTINUE_PUT_MAX_BYTES,
         DEFAULT_AGENT,
         DEFAULT_IN_PROGRESS_PER_KEY,
+        DEFAULT_PULL_PROGRESS_MB,
         DEFAULT_RECEIPT_TRUNCATE_CHARS,
+        IMAGE_HOST_CREDENTIAL_ID,
         MSG_FILE_MISSING,
         MSG_FILE_TOO_LARGE,
         MSG_LIST_EMPTY,
         MSG_NO_CAPACITY,
         MSG_PULL_TIMEOUT,
         RUNNING_STATUS,
+        TERMINAL_STATUS,
         UI_PULL_CONCURRENCY,
         UI_PULL_PROGRESS_INTERVAL,
         GeminiClientError,
@@ -105,20 +123,29 @@ except ImportError:  # loaded as a loose main.py, not a package
         GeminiSandboxClient,
         GeminiSubmitTimeoutError,
         ProgressThrottle,
-        build_httpx_client_kwargs,
+        PullProgress,
+        agget_stall_message,
+        build_upload_instruction,
         clip_text,
         count_key_in_progress,
         ensure_md_filename,
         environment_id_of,
+        file_too_large_message,
+        files_error_kind,
+        fixed_files_message,
+        format_bytes,
+        format_pull_progress,
+        image_host_network,
         is_safe_local_file_path,
         environment_size_bytes,
         extract_output_text,
-        files_error_kind,
-        fixed_files_message,
         normalize_environment_file_path,
+        pull_limit_bytes,
+        pull_progress_step_bytes,
         select_balanced_keys,
         slim_environment_file_entry,
         summarize_steps,
+        webhook_upload_host,
         workspace_download_path,
     )
 
@@ -135,7 +162,6 @@ STATE_FILES = (
     "auto_retrieve.json",
     "submit_key_cursor.json",
 )
-ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 SHORT_INDEX_LIMIT = 2000
 SHORT_INDEX_DROP = 1000
 SHORT_ID_WIDTH = 4
@@ -150,10 +176,14 @@ SANDBOX_ID_RE = re.compile(r"^[0-9a-f]{32}$", re.I)
 ENV_META_LIMIT = 2000
 PROTECT_RECENT_SECONDS = 15 * 60
 EMERGENCY_RUNNING_SECONDS = 2 * 60 * 60
-DEFAULT_IDLE_TTL_HOURS = 24
+DEFAULT_IDLE_TTL_HOURS = 72
 DEFAULT_KEEP_RECENT = 2
+DEFAULT_SESSION_IDLE_HOURS = 24
+DEFAULT_SESSION_KEEP_RECENT = 1
 AUTO_RETRIEVE_SECONDS = 60 * 60
 AUTO_RETRIEVE_TICK_SECONDS = 30.0
+FILE_POLL_SECONDS = 60 * 60
+FILE_POLL_INTERVAL_SECONDS = 30.0
 PULL_TEMP_TTL_SECONDS = 30 * 60
 
 RETRIEVE_QUERY_FAIL_PREFIX = "取回失败（查询超时或网络错误）"
@@ -195,6 +225,10 @@ def _is_retrieve_query_failure_text(text: str) -> bool:
 # 回执图片渲染宽度（px）。仅在网络模板渲染（remote）时作为 options.viewport_width 传出；
 # 不传时远端默认 800。本地 PIL 兜底渲染不走这里。
 RECEIPT_T2I_VIEWPORT_WIDTH = 1600
+# 单张聊天图片走多模态 input 的大小上限。官方文档没有给 inline 图片的明确
+# 上限，这里取一个保守值：base64 后要约 1.34 倍体积，10MB 图片的 JSON 约
+# 13MB，避免把请求体推到荒谬的大小。超过上限的图片记警告并跳过。
+INLINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 OUTPUT_EXTS = frozenset(
     {
         "html",
@@ -264,6 +298,14 @@ def _as_str(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def file_poll_should_stop(status: str) -> bool:
+    """/agr 问到终态才停 .completed 轮询。in_progress、queued 继续查。"""
+    text = _as_str(status).lower()
+    if not text or text in RUNNING_STATUS | {"unknown"}:
+        return False
+    return text in TERMINAL_STATUS
 
 
 def receipt_image_applies(
@@ -375,6 +417,7 @@ def grouped_config_from_flat(flat: dict[str, Any]) -> dict[str, Any]:
         },
         "receipt": {
             "image_receipt": True,
+            "sandbox_path_receipt": True,
             "image_receipt_min_length": _pick_flat(flat, "image_receipt_min_length", 200),
             "receipt_template": _as_str(_pick_flat(flat, "receipt_template", "")),
             "auto_retrieve": _as_bool(_pick_flat(flat, "auto_retrieve", True), True),
@@ -385,6 +428,8 @@ def grouped_config_from_flat(flat: dict[str, Any]) -> dict[str, Any]:
             "public_base_url": public_base,
             "token": _as_str(flat.get("upload_token")),
             "prefix": _as_str(_pick_flat(flat, "upload_prefix", "agysb")) or "agysb",
+            "receipt_base_url": "",
+            "receipt_url": True,
         },
         "environment": {
             "auto_cleanup": _as_bool(_pick_flat(flat, "env_auto_cleanup", True), True),
@@ -483,14 +528,7 @@ def _parse_iso(raw: str) -> datetime | None:
 
 
 def _fmt_bytes(n: int) -> str:
-    size = float(max(0, int(n or 0)))
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            if unit == "B":
-                return f"{int(size)} {unit}"
-            return f"{size:.2f} {unit}"
-        size /= 1024
-    return f"{size:.2f} GB"
+    return format_bytes(n)
 
 
 def _submit_stamp() -> str:
@@ -507,6 +545,79 @@ def _short_serial(raw: str) -> int | None:
 
 def _output_file_names(output_files: str) -> list[str]:
     return [x.strip() for x in _as_str(output_files).split(",") if x.strip()]
+
+
+def ensure_result_md(output_files: str) -> str:
+    """每一轮都带一份 result.md。调用方已经点名 result.md 时不追加第二份。"""
+    names = _output_file_names(output_files)
+    if not names:
+        return "result.md"
+    for name in names:
+        leaf = name.replace("\\", "/").split("/")[-1].lower()
+        if leaf == "result.md":
+            return output_files
+    return ",".join([*names, "result.md"])
+
+
+def _default_output_files(output_files: str) -> str:
+    return ensure_result_md(output_files)
+
+
+COMPLETED_MARKER_SUFFIX = ".completed"
+
+
+def completed_marker_name(stamp: str) -> str:
+    """这一轮完成标记文件名：{提交时间戳}.completed，与 result.md 同一时间戳。"""
+    text = _as_str(stamp) or _submit_stamp()
+    return f"{text}{COMPLETED_MARKER_SUFFIX}"
+
+
+def is_completed_marker_path(name: str) -> bool:
+    """判断路径是不是插件下发的完成标记，用来过滤旧版 result.md 轮询记录。"""
+    text = _as_str(name).replace("\\", "/").rstrip("/").lower()
+    return text.endswith(COMPLETED_MARKER_SUFFIX)
+
+
+def stamped_completed_path(stamp: str) -> str:
+    """这一轮完成标记在沙盒工作空间里的路径。"""
+    return "/workspace/" + completed_marker_name(stamp)
+
+
+def completed_marker_instruction(stamp: str) -> str:
+    """完成标记提醒开启时追加到沙盒提示词末尾的完成标记要求。"""
+    return (
+        "\n\n完成所有任务后请在工作空间创建文件 "
+        f"{completed_marker_name(stamp)}的空文件,此项不需要汇报。"
+    )
+
+
+def file_poll_notice(short: str) -> str:
+    return f"任务 {short} 可能已经完成，请使用 /agr {short} 取回"
+
+
+def _notify_from_event(event: Any, origin: str) -> dict[str, str] | None:
+    if event is None:
+        return None
+    umo = _as_str(getattr(event, "unified_msg_origin", ""))
+    if not umo:
+        return None
+    sender_id = ""
+    getter = getattr(event, "get_sender_id", None)
+    if callable(getter):
+        sender_id = _as_str(getter())
+    sender_name = ""
+    name_getter = getattr(event, "get_sender_name", None)
+    if callable(name_getter):
+        try:
+            sender_name = _as_str(name_getter())
+        except Exception:
+            sender_name = ""
+    return {
+        "umo": umo,
+        "sender_id": sender_id,
+        "sender_name": sender_name,
+        "origin": origin,
+    }
 
 
 def _safe_upload_name(name: str) -> str:
@@ -533,14 +644,69 @@ def _stamp_upload_name(name: str, stamp: str) -> str:
     return f"{stamp}_{safe}" if stamp else safe
 
 
-def sanitize_id_for_fs(raw: str, *, fallback: str = "unknown") -> str:
-    text = _as_str(raw)
-    if not text or ".." in text or "\x00" in text:
-        return fallback
-    text = text.replace("/", "_").replace("\\", "_")
-    text = ID_SAFE_RE.sub("_", text)
-    text = text.strip("._") or fallback
-    return text[:180]
+# 按文件头识别图片类型。扩展名不可靠（QQ 临时文件常是无后缀或错后缀），
+# 多模态 input 分节必须带正确的 mime_type。
+_IMAGE_MAGIC_PREFIXES: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+)
+
+
+def sniff_image_mime(head: bytes) -> str:
+    """按文件头猜测图片 MIME；识别不了返回空串。"""
+    if not head:
+        return ""
+    for magic, mime in _IMAGE_MAGIC_PREFIXES:
+        if head.startswith(magic):
+            return mime
+    if len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+def workspace_product_paths(names: list[str]) -> list[str]:
+    """沙盒工作空间里的预期产物路径，供 /agget 与 get_sandbox_task 使用。"""
+    paths: list[str] = []
+    for name in names:
+        cleaned = str(name or "").replace("\\", "/").strip().strip("/")
+        if not cleaned:
+            continue
+        paths.append("/workspace/" + cleaned.split("/")[-1])
+    return paths
+
+
+def swap_url_origin(url: str, receipt_base: str) -> str:
+    """只替换链接的域名。receipt_base 为空、或带了路径时，路径仍沿用原链接。"""
+    target = str(url or "").strip()
+    base = str(receipt_base or "").strip()
+    if not target or not base:
+        return target
+    if "://" not in base:
+        base = "https://" + base
+    new = urlsplit(base)
+    old = urlsplit(target)
+    if not new.netloc:
+        return target
+    scheme = new.scheme or old.scheme or "https"
+    return urlunsplit((scheme, new.netloc, old.path, old.query, old.fragment))
+
+
+def placement_instruction(paths: list[str]) -> str:
+    """要求沙盒把产物存到给出的工作空间路径。与图床开关无关。"""
+    cleaned = [str(path or "").strip() for path in paths if str(path or "").strip()]
+    if not cleaned:
+        return ""
+    lines = [
+        "【产物放置要求】将本轮产物保存到沙盒工作空间，路径必须严格使用：",
+        *cleaned,
+        "禁止改名，禁止放到其它目录。",
+    ]
+    if any(path.lower().endswith(".md") for path in cleaned):
+        lines.append("md 文件写入本轮回复内容，不要把上一轮已有报告复制后交差。")
+    return "\n\n" + "\n".join(lines)
 
 
 def _parse_short_int(raw: str) -> int | None:
@@ -552,6 +718,49 @@ def _parse_short_int(raw: str) -> int | None:
 
 def _format_short(n: int) -> str:
     return f"{n:0{SHORT_ID_WIDTH}d}"
+
+
+def _index_item_is_round(item: dict) -> bool:
+    """提交或续接写入的短号带预期路径或链接。回执格式化旁路插进来的行没有。"""
+    return bool(
+        _as_str(item.get("expected_paths"))
+        or _as_str(item.get("expected_urls"))
+        or _as_str(item.get("md_url"))
+        or _as_str(item.get("md_name"))
+    )
+
+
+def pick_latest_indexed_short(index: dict, sandbox_id: str) -> str:
+    """同一沙盒上的最新一轮。有正式轮次时忽略没有产物记录的旁路短号。"""
+    sandbox_id = _as_str(sandbox_id)
+    if not sandbox_id or not isinstance(index, dict):
+        return ""
+    rows: list[tuple[str, dict]] = []
+    for short, item in index.items():
+        if isinstance(item, dict) and _as_str(item.get("sandbox_id")) == sandbox_id:
+            rows.append((str(short), item))
+    if not rows:
+        return ""
+    rounds = [(short, item) for short, item in rows if _index_item_is_round(item)]
+    pool = rounds or rows
+    best_short = ""
+    best_rank: tuple[int, datetime, int] | None = None
+    fallback = datetime.min.replace(tzinfo=_now().tzinfo)
+    for short, item in pool:
+        ts = _parse_iso(_as_str(item.get("recorded_at")))
+        matched = CONTINUE_SHORT_RE.fullmatch(short)
+        if matched:
+            n = int(matched.group(1)) * (10**CONTINUE_SHORT_TIME_WIDTH) + int(
+                matched.group(2)
+            )
+        else:
+            parsed = _parse_short_int(short)
+            n = (parsed * (10**CONTINUE_SHORT_TIME_WIDTH)) if parsed is not None else -1
+        rank = (1 if ts is not None else 0, ts or fallback, n)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_short = short
+    return best_short
 
 
 def _user_source_count(sources: list[dict[str, Any]] | None) -> int:
@@ -614,17 +823,6 @@ def _split_continue_rest(rest: str) -> tuple[str, str]:
     return task_ref, prompt_raw
 
 
-def _body_sha256(text: str) -> str:
-    return hashlib.sha256(_as_str(text).encode("utf-8")).hexdigest()
-
-
-def _is_md_only_outputs(output_files: str) -> bool:
-    names = _output_file_names(output_files)
-    if not names:
-        return False
-    return all(Path(name).suffix.lower() == ".md" for name in names)
-
-
 def _split_stored_urls(raw: str) -> list[str]:
     text = _as_str(raw).replace(",", "\n")
     urls: list[str] = []
@@ -633,6 +831,10 @@ def _split_stored_urls(raw: str) -> list[str]:
         if item.startswith(("http://", "https://")):
             urls.append(item)
     return urls
+
+
+def _split_stored_lines(raw: str) -> list[str]:
+    return [piece.strip() for piece in _as_str(raw).splitlines() if piece.strip()]
 
 
 def _is_image_blank(image_path: str) -> bool:
@@ -772,23 +974,38 @@ AGHELP_TEXT = (
     "Antigravity 沙盒指令：\n"
     "\n"
     "/agsubmit 或 /ags [类型...] <任务文本>\n"
-    "  提交新任务。默认产出 result.md。例如：/ags png 查询今日新闻\n"
+    "  提交新任务。默认产出 result.md。指定 png、html 等类型时仍会额外要求一份 result.md。\n"
+    "  例如：/ags png 查询今日新闻\n"
     "  可在本条消息附带图片/文件，或回复一条带图/文件的消息后再发送本指令。\n"
+    "\n"
+    "/agnew <任务编号> [类型...] <任务文本>\n"
+    "  复用该任务的沙盒文件，新建独立会话和全新短号，不继承旧对话。\n"
+    "  使用原任务绑定的 Key；多个会话共享文件，删除沙盒会影响全部会话。\n"
     "\n"
     "/agretrieve 或 /agr <任务编号>\n"
     "  取回任务回执。确定会发图片回执时正文不截断；其余按配置字数截断。\n"
     "\n"
-    "/agcontinue 或 /agc [类型...] <任务文本>\n"
-    "  在同一沙盒会话中续接任务。不写类型时默认 md，并返回对应预期网址。\n"
-    "  附件可用本条消息附带图片/文件，或回复一条带图/文件的消息后再发送本指令。\n"
+    "/agcontinue 或 /agc <任务编号> [类型...] <任务文本>\n"
+    "  在同一沙盒会话中续接任务。不写类型时默认 md。\n"
+    "  指定其它类型时仍会额外要求一份带时间戳的 result.md。\n"
+    "  可用本条消息附带图片/文件，或回复一条带图/文件的消息后再发送本指令。\n"
+    "  图片直接作为多模态输入发给 agent；其它文件写入沙盒 workspace 并回读校验。\n"
     "  若上一轮尚未取回会先自动取回。未完成任务无法续接。\n"
+    "\n"
+    "/agnew <任务编号|sandbox_id> [类型...] <任务文本>\n"
+    "  使用旧任务绑定的 Key，在原沙盒开启独立新会话并分配新短号。\n"
+    "  共享文件，不继承旧对话；旧短号保留。可附带/引用图片，会直接发给 agent 看。\n"
+    "  也可直接传 sandbox_id：用能访问该沙盒的 Key 开启首个会话，用于收养\n"
+    "  只在远端存在、本地没有会话的沙盒。会在该沙盒真实产生一次交互。\n"
+    "  不要求旧任务 completed；受该 Key 的进行中任务上限约束。\n"
     "\n"
     "/agls <任务编号>\n"
     "  列出该短号沙盒 workspace 文件。\n"
     "\n"
     "/agget <任务编号> <完整路径>\n"
-    "  拉取文件发到聊天。先按大小卡住 20MB，超过请改用图床或 WebUI。\n"
-    "  90 秒超时会直接中止。沙盒网络存疑，不一定能拉取成功。\n"
+    "  马上返回，文件在后台拉取，好了再发到聊天。大小上限在配置里，默认不限制。\n"
+    "  进度反馈默认每 40MB 一次，文件小于该阈值时不发。可在配置里关闭或改阈值。\n"
+    "  不设总超时。下载进度停了 10 分钟会中止，并建议改用图床或 WebUI。\n"
     "\n"
     "/agenvlist 或 /agels\n"
     "  管理员：列出当前项目沙盒环境数量与占用。\n"
@@ -814,6 +1031,7 @@ class HandlerReceipt:
         source_count: int = 0,
         output: str = "",
         expected_urls: list[str] | None = None,
+        expected_paths: list[str] | None = None,
         steps: str = "",
         continue_blocked: bool = False,
         auto_retrieved: bool = False,
@@ -821,8 +1039,8 @@ class HandlerReceipt:
         pre_receipt: HandlerReceipt | None = None,
         pre_image_sent: bool = False,
         image_path: str = "",
-        image_url: str = "",
         put_notes: list[str] | None = None,
+        image_count: int = 0,
     ) -> None:
         self.text = text
         self.ok = ok
@@ -832,6 +1050,7 @@ class HandlerReceipt:
         self.source_count = source_count
         self.output = output
         self.expected_urls = list(expected_urls or [])
+        self.expected_paths = list(expected_paths or [])
         self.steps = steps
         self.continue_blocked = continue_blocked
         self.auto_retrieved = auto_retrieved
@@ -839,13 +1058,15 @@ class HandlerReceipt:
         self.pre_receipt = pre_receipt
         self.pre_image_sent = pre_image_sent
         self.image_path = image_path
-        self.image_url = image_url
         self.put_notes = list(put_notes or [])
+        self.image_count = image_count
 
 
 SUBMIT_TOOL_DESC = (
 "在 Linux 沙盒环境中异步执行耗时任务、长脚本，或进行深度网络调研与复杂项目分析时调用此工具。\n"
-"支持传入指令并附带本地文件，返回任务编号 及产物预期公网地址。后续取回/续接只使用短号，不要向用户发送内部长 ID。\n"
+"支持传入指令并附带本地文件，返回任务编号。沙盒会把产物存到工作空间。"
+"回执是否附带预期路径和图床链接由插件配置决定。"
+"后续取回/续接只使用短号，不要向用户发送内部长 ID。\n"
 "主要触发场景：\n"
 "1. 深度调查与溯源：追查图片与文件来源、深度抓取与分析目标网站、检视开源项目源码等（此类深度任务优先于普通网页搜索调用）；\n"
 "2. 长时间后台任务：耗时计算、批量处理、编译运行或生成复杂文件。"
@@ -864,7 +1085,9 @@ CONTINUE_TOOL_DESC = (
     "基于已有沙盒任务的任务编号，异步提交后续交互指令进行追问、修正或执行下一步。"
     "插件会按短号查找当时绑定的 Key，并续接该沙盒最新一轮交互（不能从祖先 id 分叉）。"
     "续接不换 Key；该 Key 的 in_progress 已达上限时直接拒绝。"
-    "附件用 Environments Files PUT 写入已有沙盒 workspace，不要走 interaction sources。"
+    "同沙盒有多个独立会话时，只续接该任务编号所属会话，不切到其他会话。"
+    "图片附件作为多模态输入直接发送（inline base64），agent 可立即查看；"
+    "其它文件用 Environments Files PUT 写入已有沙盒 workspace（写入后会回读校验字节数）。"
     "无后缀的附件按 .md 写入。写入失败仍继续续接。"
     "若上一轮尚未取回，会先自动取回：status 为 completed、开启了图片回执且正文字数达标时把回执图片直接发给用户，否则发文本。"
     "status 不是 completed 则只返回当前状态、不提交续接。"
@@ -878,20 +1101,12 @@ LIST_TOOL_DESC = (
 )
 
 GET_TOOL_DESC = (
-    "从 Antigravity 沙盒 workspace 拉取一个文件发给用户。只使用任务编号 和文件名。"
-    "沙盒网络存疑，不一定能成功拉取文件。超过 20MB 或 90 秒会中止，请改用图床或 WebUI。"
-    "不要把文件内容复述进回复。"
+    "从 Antigravity 沙盒 workspace 拉取一个文件。只使用任务编号和文件名。"
+    "电脑能力为 local 时，文件写入当前会话工作区并返回相对路径，不要发到聊天，也不要把内容复述进回复。"
+    "电脑能力为 none 或 sandbox 时，插件把文件直接发给用户。"
+    "沙盒网络存疑，不一定能成功拉取文件。大小上限见插件配置「工具拉取大小上限」，默认不限制。"
+    "超过上限或 90 秒会中止，请改用图床或 WebUI。这条和 /agget 的大小上限、超时不是同一套。"
 )
-
-
-def _upload_parameters() -> dict:
-    return {
-        "type": "string",
-        "description": (
-            "任务完成后需要上传到图床的文件名，逗号分隔，例如 "
-            "result.jpg,report.pdf,archive.tar.gz；留空表示不上传文件。"
-        ),
-    }
 
 
 def _submit_parameters() -> dict:
@@ -906,9 +1121,12 @@ def _submit_parameters() -> dict:
                 "type": "string",
                 "description": (
                     "由调用方指定的任务产出原始文件名，逗号分隔；例如 "
-                    "result.jpg,report.pdf,archive.tar.gz。"
-                    "插件提交时自动加 YYMMDDHHMMSS_ 前缀（如 260901131456_new.docx），"
-                    "用于上传路径和预期公网地址，避免多次任务覆盖同一文件名。插件不替调用方决定后缀。"
+                    "result.jpg,report.pdf,archive.tar.gz。留空则默认 result.md。"
+                    "无论是否指定其它类型，都会额外要求一份 result.md；已经包含 result.md 时不追加。"
+                    "插件提交时自动加 YYMMDDHHMMSS_ 前缀，并要求沙盒保存到 "
+                    "/workspace/<时间戳文件名>。图床开启且配置齐全时同时要求上传。"
+                    "「取回回执 / 完成标记提醒」开启时，还会额外要求沙盒在完成时创建 "
+                    "<时间戳>.completed 空文件。"
                 ),
             },
             "file_paths": {
@@ -961,9 +1179,12 @@ def _continue_parameters() -> dict:
             "output_files": {
                 "type": "string",
                 "description": (
-                    "本轮产出需上传到图床的文件名，逗号分隔；例如 "
-                    "result.jpg,report.pdf。插件自动加时间戳前缀。"
-                    "留空则默认 result.md，并返回对应预期网址。"
+                    "本轮产出文件名，逗号分隔；例如 result.jpg,report.pdf。"
+                    "留空则默认 result.md。无论是否指定其它类型，都会额外要求一份 result.md；"
+                    "已经包含 result.md 时不追加。插件自动加时间戳前缀，并要求沙盒保存到 "
+                    "/workspace/<时间戳文件名>。图床开启且配置齐全时同时要求上传。"
+                    "「取回回执 / 完成标记提醒」开启时，还会额外要求沙盒在完成时创建 "
+                    "<时间戳>.completed 空文件。"
                 ),
             },
             "file_paths": {
@@ -1002,7 +1223,10 @@ def _get_parameters() -> dict:
             },
             "name": {
                 "type": "string",
-                "description": "要拉取的文件名或 workspace 相对路径。中文名按原样传入。",
+                "description": (
+                    "要拉取的文件名或工作空间路径，例如 /workspace/260927153045_result.md。"
+                    "中文名按原样传入。"
+                ),
             },
         },
         "required": ["task_id", "name"],
@@ -1020,14 +1244,16 @@ class AntigravitySandboxPlugin(Star):
         self._short_index: dict[str, dict[str, str]] = self._load_short_index()
         self._env_meta: dict[str, dict[str, str]] = self._load_env_meta()
         self._pending_retrieve: dict[str, dict[str, str]] = self._load_pending_retrieve()
+        self._file_polls: dict[str, dict[str, str]] = self._load_file_polls()
         self._scrub_persisted_secrets()
         self._cleanup_lock = asyncio.Lock()
         self._startup_task: asyncio.Task[None] | None = None
         self._auto_retrieve_task: asyncio.Task[None] | None = None
+        self._file_poll_task: asyncio.Task[None] | None = None
         self._pull_cleanup_task: asyncio.Task[None] | None = None
+        self._agget_tasks: set[asyncio.Task[None]] = set()
         self._ui_pull_sem = asyncio.Semaphore(UI_PULL_CONCURRENCY)
         self._ui_jobs: dict[str, dict[str, Any]] = {}
-        self._ui_jobs_lock = asyncio.Lock()
         submit_tool = SubmitSandboxTaskTool()
         retrieve_tool = RetrieveSandboxTaskTool()
         continue_tool = ContinueSandboxTaskTool()
@@ -1049,6 +1275,7 @@ class AntigravitySandboxPlugin(Star):
 
     async def initialize(self):
         self._auto_retrieve_task = asyncio.create_task(self._auto_retrieve_loop())
+        self._file_poll_task = asyncio.create_task(self._file_poll_loop())
         self._pull_cleanup_task = asyncio.create_task(self._pull_temp_cleanup_loop())
         if not self._env_auto_cleanup():
             return
@@ -1064,6 +1291,12 @@ class AntigravitySandboxPlugin(Star):
             raise
         except Exception as e:
             logger.warning(f"启动时环境回收失败: {e}")
+        try:
+            await self._sweep_sessions(reason="startup")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"启动时会话清理失败: {e}")
 
     def _resolve_data_dir(self) -> Path:
         try:
@@ -1109,6 +1342,9 @@ class AntigravitySandboxPlugin(Star):
     def _pending_retrieve_file(self) -> Path:
         return self._data_dir / "auto_retrieve.json"
 
+    def _file_poll_file(self) -> Path:
+        return self._data_dir / "file_poll.json"
+
     def _group(self, name: str) -> dict[str, Any]:
         raw = (self.config or {}).get(name)
         return raw if isinstance(raw, dict) else {}
@@ -1123,6 +1359,16 @@ class AntigravitySandboxPlugin(Star):
         section = self._group(group)
         if key in section and section[key] is not None:
             return section[key]
+        # 完成标记原先放在「测试功能」。新配置没写时仍读旧分组。
+        if group == "receipt" and key in {"file_status_poll", "file_poll_interval"}:
+            probe = self._group("probe")
+            if key in probe and probe[key] is not None:
+                return probe[key]
+        # 工具提交提醒现在放在「测试功能」。配置还写在取回回执时也认。
+        if group == "probe" and key == "completed_notify":
+            receipt = self._group("receipt")
+            if key in receipt and receipt[key] is not None:
+                return receipt[key]
         cfg = self.config or {}
         if legacy and legacy in cfg and cfg[legacy] is not None:
             return cfg[legacy]
@@ -1178,15 +1424,14 @@ class AntigravitySandboxPlugin(Star):
             stored = _as_str(item.get("key"))
             if not stored:
                 continue
+            # stored 非空时 _stored_key_ref 只会返回 sha256: 前缀或 ""，
+            # 两者都与原值不同，因此统一走赋值分支；空引用视为绑定失效。
             ref = self._stored_key_ref(stored)
-            if stored != ref:
-                if ref:
-                    item["key"] = ref
-                else:
-                    item.pop("key", None)
-                index_changed = True
-            elif not stored.startswith("sha256:"):
+            if ref:
                 item["key"] = ref
+                index_changed = True
+            else:
+                item.pop("key", None)
                 index_changed = True
         for item in self._short_index.values():
             if _as_str(item.get("key")):
@@ -1240,6 +1485,7 @@ class AntigravitySandboxPlugin(Star):
         sandbox_id: str = "",
         previous_task_id: str = "",
         overwrite_short: str = "",
+        allocate: bool = True,
     ) -> str:
         stored = self._stored_key_ref(key)
         if stored:
@@ -1260,6 +1506,7 @@ class AntigravitySandboxPlugin(Star):
                 previous_task_id=previous_task_id,
                 key=stored,
                 overwrite_short=overwrite_short,
+                allocate=allocate,
             )
         return short
 
@@ -1435,6 +1682,281 @@ class AntigravitySandboxPlugin(Star):
             first_line = (receipt.text or "").split("\n", 1)[0]
             logger.warning(f"自动取回 {short} 失败: {first_line}")
 
+    def _file_poll_enabled(self) -> bool:
+        return _as_bool(
+            self._setting("receipt", "file_status_poll", "file_status_poll", True),
+            True,
+        )
+
+    def _file_poll_interval(self) -> float:
+        raw = self._setting("receipt", "file_poll_interval", "file_poll_interval", 30)
+        try:
+            seconds = float(raw)
+        except (TypeError, ValueError):
+            seconds = FILE_POLL_INTERVAL_SECONDS
+        if seconds < 5:
+            seconds = 5
+        return seconds
+
+    def _load_file_polls(self) -> dict[str, dict[str, str]]:
+        path = self._file_poll_file()
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            pending: dict[str, dict[str, str]] = {}
+            for key, value in data.items():
+                short = _as_str(key)
+                if not short or not isinstance(value, dict):
+                    continue
+                task_id = _as_str(value.get("task_id"))
+                sandbox_id = _as_str(value.get("sandbox_id"))
+                result_path = _as_str(value.get("result_path"))
+                deadline = _as_str(value.get("deadline"))
+                if not task_id or not sandbox_id or not deadline:
+                    continue
+                # 1.6.7 起的轮询目标是 .completed 空文件；旧版 result.md 记录直接丢弃
+                if result_path and not is_completed_marker_path(result_path):
+                    continue
+                pending[short] = {
+                    "task_id": task_id,
+                    "sandbox_id": sandbox_id,
+                    "result_path": result_path,
+                    "deadline": deadline,
+                    "next_poll_at": _as_str(value.get("next_poll_at")),
+                    "umo": _as_str(value.get("umo")),
+                    "sender_id": _as_str(value.get("sender_id")),
+                    "sender_name": _as_str(value.get("sender_name")),
+                    "origin": _as_str(value.get("origin")),
+                }
+            return pending
+        except Exception as e:
+            logger.warning(f"读取 file_poll.json 失败: {e}")
+            return {}
+
+    def _save_file_polls(self) -> None:
+        try:
+            _write_json(self._file_poll_file(), self._file_polls)
+        except Exception as e:
+            logger.warning(f"写入 file_poll.json 失败: {e}")
+
+    def _schedule_file_poll(
+        self,
+        short: str,
+        *,
+        task_id: str,
+        sandbox_id: str,
+        result_path: str,
+        notify: dict[str, str] | None,
+    ) -> None:
+        short = _as_str(short)
+        task_id = _as_str(task_id)
+        sandbox_id = _as_str(sandbox_id)
+        result_path = _as_str(result_path)
+        if not self._file_poll_enabled():
+            return
+        if not short or not task_id or not sandbox_id or not result_path:
+            return
+        note = notify or {}
+        now = _now()
+        self._file_polls[short] = {
+            "task_id": task_id,
+            "sandbox_id": sandbox_id,
+            "result_path": result_path,
+            "deadline": (now + timedelta(seconds=FILE_POLL_SECONDS)).isoformat(),
+            "next_poll_at": (now + timedelta(seconds=self._file_poll_interval())).isoformat(),
+            "umo": _as_str(note.get("umo")),
+            "sender_id": _as_str(note.get("sender_id")),
+            "sender_name": _as_str(note.get("sender_name")),
+            "origin": _as_str(note.get("origin")),
+        }
+        self._save_file_polls()
+
+    def _cancel_file_poll(self, short: str) -> None:
+        short = _as_str(short)
+        if not short or short not in self._file_polls:
+            return
+        self._file_polls.pop(short, None)
+        self._save_file_polls()
+
+    async def _file_poll_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    delay = await self._file_poll_tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"文件状态轮询循环异常: {e}")
+                    delay = self._file_poll_interval()
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+
+    async def _file_poll_tick(self) -> float:
+        now = _now()
+        if not self._file_poll_enabled():
+            expired = [
+                short
+                for short, info in self._file_polls.items()
+                if (deadline := _parse_iso(_as_str(info.get("deadline")))) is not None
+                and deadline <= now
+            ]
+            if expired:
+                for short in expired:
+                    self._file_polls.pop(short, None)
+                    logger.info(f"文件状态轮询放弃 {short}：1 小时内未取到 .completed 完成标记")
+                self._save_file_polls()
+            return self._file_poll_interval()
+        due: list[str] = []
+        next_due: datetime | None = None
+        for short, info in list(self._file_polls.items()):
+            deadline = _parse_iso(_as_str(info.get("deadline")))
+            nxt = _parse_iso(_as_str(info.get("next_poll_at")))
+            if deadline is not None and deadline <= now:
+                due.append(short)
+                continue
+            if nxt is None or nxt <= now:
+                due.append(short)
+                continue
+            if next_due is None or nxt < next_due:
+                next_due = nxt
+        for short in due:
+            await self._file_poll_one(short)
+        if next_due is None:
+            return self._file_poll_interval()
+        wait = (next_due - _now()).total_seconds()
+        interval = self._file_poll_interval()
+        return max(1.0, min(interval, wait))
+
+    async def _file_poll_one(self, short: str) -> None:
+        short = _as_str(short)
+        info = self._file_polls.get(short)
+        if not info:
+            return
+        deadline = _parse_iso(_as_str(info.get("deadline")))
+        if deadline is not None and deadline <= _now():
+            self._file_polls.pop(short, None)
+            self._save_file_polls()
+            logger.info(f"文件状态轮询放弃 {short}：1 小时内未取到 .completed 完成标记")
+            return
+        found = False
+        try:
+            found = await self._sandbox_has_file(short, _as_str(info.get("result_path")))
+        except Exception as e:
+            logger.info(f"文件状态轮询 {short} 尚未取到: {e}")
+        if not found:
+            info["next_poll_at"] = (
+                _now() + timedelta(seconds=self._file_poll_interval())
+            ).isoformat()
+            self._save_file_polls()
+            return
+        self._file_polls.pop(short, None)
+        self._save_file_polls()
+        logger.info(f"文件状态轮询取到 {short} {_as_str(info.get('result_path'))}")
+        await self._notify_file_ready(short, info)
+
+    async def _sandbox_has_file(self, task_ref: str, name: str) -> bool:
+        short, _task_id, sandbox_id, key = self._resolve_file_target(task_ref)
+        del short
+        files = await self._client().list_environment_files(
+            sandbox_id,
+            "workspace",
+            recursive=True,
+            api_key=key,
+        )
+        match = self._match_listed_file(files, name)
+        return bool(match) and _as_str(match.get("type")) != "directory"
+
+    def _completed_notify_enabled_for(self, origin: str) -> bool:
+        """指令提交照常提示；工具提交默认只写日志，开关打开才提示。
+
+        定时任务和模型自主提交都是外层模型调工具进来的，让它们抓到完成标记后
+        往会话里发「请用 /agr 取回」会打断正在进行的对话。
+        """
+        if _as_str(origin) != "command":
+            return _as_bool(
+                self._setting("probe", "completed_notify", "completed_notify", False),
+                False,
+            )
+        return True
+
+    async def _notify_file_ready(self, short: str, info: dict[str, str]) -> None:
+        umo = _as_str(info.get("umo"))
+        origin = _as_str(info.get("origin"))
+        if not umo:
+            logger.info(f"文件状态轮询 {short} 没有会话，跳过通知")
+            return
+        if not self._completed_notify_enabled_for(origin):
+            logger.info(
+                f"文件状态轮询取到 {short}，提交来源 origin={origin or 'unknown'} "
+                "按设置只写日志，未在会话中提示"
+            )
+            return
+        text = file_poll_notice(short)
+        chain = MessageChain()
+        sender_id = _as_str(info.get("sender_id"))
+        if origin == "command" and sender_id:
+            chain.at(_as_str(info.get("sender_name")) or sender_id, sender_id)
+        chain.message(text)
+        try:
+            await self.context.send_message(umo, chain)
+        except Exception as e:
+            logger.warning(f"文件状态轮询通知 {short} 失败: {e}")
+
+    def _computer_use_runtime(self, event: Any) -> str:
+        umo = _as_str(getattr(event, "unified_msg_origin", "")) if event is not None else ""
+        settings: Any = {}
+        try:
+            getter = self.context.get_config
+            cfg = getter(umo=umo) if umo else getter()
+            if cfg is not None:
+                settings = cfg.get("provider_settings", {}) or {}
+        except Exception as e:
+            logger.warning(f"读取电脑能力配置失败: {e}")
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        return str(settings.get("computer_use_runtime") or "none").strip().lower()
+
+    async def _session_workspace_root(self, umo: str) -> Path:
+        from astrbot.core.workspace import resolve_workspace_root_for_umo
+
+        db = getattr(self.context, "_db", None)
+        return await resolve_workspace_root_for_umo(umo, db)
+
+    async def _save_pulled_file_to_workspace(
+        self, event: Any, src: Path, display: str
+    ) -> str:
+        umo = _as_str(getattr(event, "unified_msg_origin", ""))
+        if not umo:
+            return ""
+        root = (await self._session_workspace_root(umo)).resolve(strict=False)
+        root.mkdir(parents=True, exist_ok=True)
+        leaf = Path(str(display or "")).name.replace("\\", "/").split("/")[-1]
+        if not leaf or leaf in {".", ".."}:
+            leaf = src.name or "download.bin"
+        dest = (root / leaf).resolve(strict=False)
+        if not dest.is_relative_to(root):
+            return ""
+        if dest.exists():
+            stem = dest.stem
+            suffix = dest.suffix
+            n = 2
+            while True:
+                candidate = (root / f"{stem}_{n}{suffix}").resolve(strict=False)
+                if not candidate.is_relative_to(root):
+                    return ""
+                if not candidate.exists():
+                    dest = candidate
+                    break
+                n += 1
+        shutil.copyfile(src, dest)
+        return dest.relative_to(root).as_posix()
+
     def _touch_sandbox(self, sandbox_id: str, *, status: str = "") -> None:
         sandbox_id = _as_str(sandbox_id)
         if not sandbox_id:
@@ -1442,7 +1964,14 @@ class AntigravitySandboxPlugin(Star):
         item = dict(self._env_meta.get(sandbox_id) or {})
         item["last_used_at"] = _now_iso()
         if status:
-            item["status"] = _as_str(status)
+            # Environment status is shared: one completed session must not hide
+            # another running session from automatic cleanup protection.
+            running = any(
+                _as_str(row.get("sandbox_id")) == sandbox_id
+                and _as_str(row.get("last_status")).lower() in RUNNING_STATUS
+                for row in self._short_index.values()
+            )
+            item["status"] = "in_progress" if running else _as_str(status)
         self._env_meta[sandbox_id] = item
         self._save_env_meta()
 
@@ -1453,40 +1982,76 @@ class AntigravitySandboxPlugin(Star):
         )
 
     def _env_idle_ttl_hours(self) -> float:
+        # 0 是合法值（不按闲置时间回收），只有缺失才回退默认。
+        raw = self._setting(
+            "environment",
+            "idle_ttl_hours",
+            "env_idle_ttl_hours",
+            None,
+        )
+        if raw is None or raw == "":
+            return float(DEFAULT_IDLE_TTL_HOURS)
         try:
-            value = float(
-                self._setting(
-                    "environment",
-                    "idle_ttl_hours",
-                    "env_idle_ttl_hours",
-                    DEFAULT_IDLE_TTL_HOURS,
-                )
-                or DEFAULT_IDLE_TTL_HOURS
-            )
+            return max(0.0, float(raw))
         except (TypeError, ValueError):
-            value = float(DEFAULT_IDLE_TTL_HOURS)
-        return max(0.0, value)
+            return float(DEFAULT_IDLE_TTL_HOURS)
 
     def _env_keep_recent(self) -> int:
+        # 0 表示不做“最近保留”保护，只有缺失才回退默认。
+        raw = self._setting(
+            "environment",
+            "keep_recent",
+            "env_keep_recent",
+            None,
+        )
+        if raw is None or raw == "":
+            return DEFAULT_KEEP_RECENT
         try:
-            value = int(
-                self._setting(
-                    "environment",
-                    "keep_recent",
-                    "env_keep_recent",
-                    DEFAULT_KEEP_RECENT,
-                )
-                or DEFAULT_KEEP_RECENT
-            )
+            return max(0, int(raw))
         except (TypeError, ValueError):
-            value = DEFAULT_KEEP_RECENT
-        return max(0, value)
+            return DEFAULT_KEEP_RECENT
 
     def _env_cleanup_scope(self) -> str:
         raw = _as_str(
             self._setting("environment", "scope", "env_cleanup_scope", "tracked")
         ).lower()
         return "all" if raw == "all" else "tracked"
+
+    def _cleanup_sessions_enabled(self) -> bool:
+        return _as_bool(
+            self._setting("environment", "cleanup_sessions", "cleanup_sessions", True),
+            True,
+        )
+
+    def _session_idle_hours(self) -> float:
+        """会话闲置阈值。0 表示不按闲置时间清理；只有缺失才回退默认。"""
+        raw = self._setting(
+            "environment",
+            "session_idle_hours",
+            "session_idle_hours",
+            None,
+        )
+        if raw is None or raw == "":
+            return float(DEFAULT_SESSION_IDLE_HOURS)
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return float(DEFAULT_SESSION_IDLE_HOURS)
+
+    def _session_keep_recent(self) -> int:
+        """每个沙盒至少保留的最近会话数。0 仍会保留 1 条，避免沙盒变空。"""
+        raw = self._setting(
+            "environment",
+            "session_keep_recent",
+            "session_keep_recent",
+            None,
+        )
+        if raw is None or raw == "":
+            return DEFAULT_SESSION_KEEP_RECENT
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return DEFAULT_SESSION_KEEP_RECENT
 
     def _env_cleanup_on_quota(self) -> bool:
         return _as_bool(
@@ -1622,6 +2187,7 @@ class AntigravitySandboxPlugin(Star):
                     self._save_short_index()
                     self._save_key_mapping()
                     self._save_pending_retrieve()
+                    self._save_file_polls()
         logger.info(
             f"环境回收[{reason or 'manual'}] scope={scope} listed={listed} "
             f"deleted={deleted} skipped={skipped} failed={failed} "
@@ -1733,6 +2299,9 @@ class AntigravitySandboxPlugin(Star):
             if short in self._pending_retrieve:
                 self._pending_retrieve.pop(short, None)
                 changed = True
+            if short in self._file_polls:
+                self._file_polls.pop(short, None)
+                changed = True
             if item:
                 tid = _as_str(item.get("task_id"))
                 if tid:
@@ -1749,6 +2318,7 @@ class AntigravitySandboxPlugin(Star):
             self._save_short_index()
             self._save_key_mapping()
             self._save_pending_retrieve()
+            self._save_file_polls()
         return changed
 
     def _load_short_index(self) -> dict[str, dict[str, str]]:
@@ -1885,38 +2455,36 @@ class AntigravitySandboxPlugin(Star):
         if last_status:
             dest["last_status"] = last_status
 
-    def _copy_md_meta(self, src: dict[str, str], dest: dict[str, str]) -> None:
-        for key in ("md_hash", "md_url", "md_name"):
-            val = _as_str(src.get(key))
-            if val:
-                dest[key] = val
-
     def _mark_round_outputs(
         self,
         short: str,
         *,
-        plugin_md: bool,
-        chat_reply: str,
         expected_urls: list[str] | None = None,
+        expected_paths: list[str] | None = None,
     ) -> None:
         short = _as_str(short)
         if not short or short not in self._short_index:
             return
         item = dict(self._short_index[short])
-        if plugin_md:
-            item["plugin_md"] = "1"
-        else:
-            item.pop("plugin_md", None)
-        reply = _as_str(chat_reply)
-        if reply:
-            item["chat_reply"] = reply
-        else:
-            item.pop("chat_reply", None)
+        for stale in (
+            "plugin_md",
+            "chat_reply",
+            "md_hash",
+            "md_url",
+            "md_name",
+            "md_plan_name",
+        ):
+            item.pop(stale, None)
         urls = [u for u in (expected_urls or []) if _as_str(u)]
         if urls:
             item["expected_urls"] = "\n".join(urls)
         else:
             item.pop("expected_urls", None)
+        paths = [p for p in (expected_paths or []) if _as_str(p)]
+        if paths:
+            item["expected_paths"] = "\n".join(paths)
+        else:
+            item.pop("expected_paths", None)
         self._short_index[short] = item
         self._save_short_index()
 
@@ -1930,15 +2498,215 @@ class AntigravitySandboxPlugin(Star):
         self._short_index[short] = item
         self._save_short_index()
 
-    def _remember_md_plan(self, short: str, name: str) -> None:
+    def _mark_short_status_checked(self, short: str, status: str) -> None:
+        """获取完成状态后落盘：last_status + last_checked_at。"""
         short = _as_str(short)
-        name = _as_str(name)
-        if not short or not name or short not in self._short_index:
+        if not short or short not in self._short_index:
             return
         item = dict(self._short_index[short])
-        item["md_plan_name"] = name
+        item["last_status"] = _as_str(status).lower() or "unknown"
+        item["last_checked_at"] = _now_iso()
         self._short_index[short] = item
         self._save_short_index()
+
+    def _forget_short(self, short: str, *, save: bool = True) -> bool:
+        """删除单条会话的本地痕迹：短号、task 映射、轮询、自动取回队列。"""
+        short = _as_str(short)
+        if not short:
+            return False
+        item = self._short_index.pop(short, None)
+        changed = item is not None
+        if short in self._pending_retrieve:
+            self._pending_retrieve.pop(short, None)
+            changed = True
+        if short in self._file_polls:
+            self._file_polls.pop(short, None)
+            changed = True
+        if item:
+            task_id = _as_str(item.get("task_id"))
+            if task_id and self._key_mapping.get(task_id):
+                # 仅删除映射到该 task 的条目，避免误删同沙盒其它会话的绑定。
+                if self._key_mapping.get(task_id) == _as_str(item.get("key")):
+                    self._key_mapping.pop(task_id, None)
+                    changed = True
+        if changed and save:
+            self._save_short_index()
+            self._save_pending_retrieve()
+            self._save_file_polls()
+            self._save_key_mapping()
+        return changed
+
+    async def _session_status(self, ref: str) -> tuple[bool, str, str]:
+        """获取并记录会话完成状态。返回 (ok, status, message)。
+
+        成功时写 last_status/last_checked_at 并打一条后台日志；
+        失败时保留原状态，message 供 UI 提示。
+        """
+        found = self._resolve_index_entry(ref)
+        if not found:
+            return False, "", "未找到该任务编号。"
+        short, item = found
+        task_id = _as_str(item.get("task_id"))
+        sandbox_id = _as_str(item.get("sandbox_id"))
+        if not task_id or not sandbox_id:
+            return False, "", "该任务缺少 task_id 或沙盒绑定。"
+        key = self._bound_key_of(item, task_id=task_id, sandbox_id=sandbox_id)
+        if not key or key not in self._configured_api_keys():
+            return False, "", "任务绑定的 API Key 不可用，请恢复对应配置。"
+        try:
+            status = await self._client().get_interaction_status(
+                task_id, api_key=key
+            )
+        except GeminiClientError as e:
+            logger.warning(f"获取会话 {short} 完成状态失败: {e}")
+            return False, "", f"获取失败: {e}"
+        except Exception as e:
+            logger.warning(f"获取会话 {short} 完成状态未预期错误: {type(e).__name__}")
+            return False, "", "获取失败（内部错误），请查看后台日志。"
+        self._mark_short_status_checked(short, status)
+        logger.info(
+            f"会话 {short} 完成状态: {status}"
+            f"（task_id={task_id}，sandbox={sandbox_id[:8]}…，来源=webui）"
+        )
+        return True, status, ""
+
+    async def _delete_session(self, ref: str) -> tuple[bool, str]:
+        """删除单条会话：任何状态都删，不判断、不阻拦。
+
+        卡在 in_progress / queued / requires_action 的会话永远不会自己跑完，
+        所以直接删远端交互 + 清本地记录。2026-10-08 实测 DELETE
+        /v1beta/interactions/{id} 对运行中的交互直接返回 200；远端删除失败
+        也清本地（会话记录只是索引，不该霸占位置），但回执如实说明远端可能
+        还在跑。状态查询只为回执描述服务，不再决定能不能删。
+        """
+        found = self._resolve_index_entry(ref)
+        if not found:
+            return False, "未找到该任务编号。"
+        short, item = found
+        task_id = _as_str(item.get("task_id"))
+        sandbox_id = _as_str(item.get("sandbox_id"))
+        if not task_id or not sandbox_id:
+            return False, "该任务缺少 task_id 或沙盒绑定。"
+        key = self._bound_key_of(item, task_id=task_id, sandbox_id=sandbox_id)
+        if not key or key not in self._configured_api_keys():
+            return False, "任务绑定的 API Key 不可用，请恢复对应配置。"
+        remote_status = ""
+        try:
+            remote_status = await self._client().get_interaction_status(
+                task_id, api_key=key
+            )
+        except GeminiClientError as e:
+            if e.status_code == 404:
+                remote_status = "gone"
+            else:
+                logger.warning(f"删除会话 {short} 前查询状态失败: {e}")
+        except Exception as e:
+            logger.warning(
+                f"删除会话 {short} 前查询状态未预期错误: {type(e).__name__}"
+            )
+        local_status = _as_str(item.get("last_status")).lower()
+        effective = remote_status or local_status
+        notes: list[str] = []
+        if remote_status == "gone":
+            notes.append("远端交互已不存在，仅清理本地记录")
+        elif effective in RUNNING_STATUS or effective == "requires_action":
+            notes.append(f"原状态 {effective}，已直接删除")
+        elif not effective or effective == "unknown":
+            notes.append("状态未知，直接删除")
+        try:
+            await self._client().delete_interaction(task_id, api_key=key)
+        except GeminiClientError as e:
+            if e.status_code == 404:
+                if "仅清理本地记录" not in "".join(notes):
+                    notes.append("远端交互已不存在，仅清理本地记录")
+            else:
+                # 远端删不掉也清本地，但如实说明远端可能仍在运行。
+                logger.warning(f"删除会话 {short} 远端失败: {e}")
+                self._forget_short(short)
+                return (
+                    True,
+                    f"已删除会话 {short} 的本地记录；远端删除失败（{e}），"
+                    "该交互可能仍在沙盒中运行。",
+                )
+        except Exception as e:
+            logger.error(f"删除会话 {short} 未预期错误: {type(e).__name__}")
+            self._forget_short(short)
+            return (
+                True,
+                f"已删除会话 {short} 的本地记录；远端删除失败（内部错误），"
+                "请查看后台日志。",
+            )
+        self._forget_short(short)
+        logger.info(
+            f"会话 {short} 已删除（task_id={task_id}，sandbox={sandbox_id[:8]}…，来源=webui）"
+        )
+        note = "".join(f"（{n}）" for n in notes)
+        return True, f"已删除会话 {short}{note}。"
+
+    async def _sweep_sessions(
+        self, *, sandbox_id: str = "", reason: str = ""
+    ) -> dict[str, int]:
+        """清理终态且闲置的会话。每个沙盒至少保留 session_keep_recent 条。"""
+        if not self._cleanup_sessions_enabled():
+            return {"deleted": 0, "kept": 0, "failed": 0}
+        idle_seconds = self._session_idle_hours() * 3600
+        keep = self._session_keep_recent()
+        now = _now()
+        result = {"deleted": 0, "kept": 0, "failed": 0}
+        groups: dict[str, list[tuple[str, dict[str, str]]]] = {}
+        for short, item in self._short_index.items():
+            if not isinstance(item, dict):
+                continue
+            sid = _as_str(item.get("sandbox_id"))
+            if sandbox_id and sid != sandbox_id:
+                continue
+            if not sid:
+                continue
+            groups.setdefault(sid, []).append((short, item))
+        for sid, rows in groups.items():
+            # 新的在前：保留窗口取最近 keep 条，其余才进入清理候选。
+            rows.sort(
+                key=lambda pair: _parse_iso(_as_str(pair[1].get("recorded_at")))
+                or datetime.min.replace(tzinfo=now.tzinfo),
+                reverse=True,
+            )
+            for short, item in rows[:keep]:
+                result["kept"] += 1
+            for short, item in rows[keep:]:
+                status = _as_str(item.get("last_status")).lower()
+                task_id = _as_str(item.get("task_id"))
+                if not task_id:
+                    continue
+                if status not in TERMINAL_STATUS:
+                    continue
+                if short in self._file_polls or short in self._pending_retrieve:
+                    continue
+                recorded = _parse_iso(_as_str(item.get("recorded_at")))
+                if recorded is not None:
+                    age = (now - recorded).total_seconds()
+                    if age < idle_seconds:
+                        continue
+                key = self._bound_key_of(
+                    item,
+                    task_id=task_id,
+                    sandbox_id=sid,
+                )
+                if not key or key not in self._configured_api_keys():
+                    continue
+                try:
+                    await self._client().delete_interaction(task_id, api_key=key)
+                except Exception as e:
+                    logger.warning(f"清理会话 {short} 失败: {e}")
+                    result["failed"] += 1
+                    continue
+                self._forget_short(short)
+                result["deleted"] += 1
+        if result["deleted"]:
+            logger.info(
+                f"会话清理完成（{reason or 'manual'}）：删除 {result['deleted']} 条，"
+                f"保留 {result['kept']} 条，失败 {result['failed']} 条"
+            )
+        return result
 
     def _in_progress_limit(self) -> int:
         raw = self._setting(
@@ -1951,6 +2719,21 @@ class AntigravitySandboxPlugin(Star):
             return int(raw)
         except (TypeError, ValueError):
             return DEFAULT_IN_PROGRESS_PER_KEY
+
+    def _pull_max_bytes(self) -> int | None:
+        """/agget size cap. None means unlimited (config 0 or empty)."""
+        return pull_limit_bytes(self._setting("pull", "max_mb", None, 0))
+
+    def _tool_pull_max_bytes(self) -> int | None:
+        """get_sandbox_task size cap. None means unlimited."""
+        return pull_limit_bytes(self._setting("pull", "tool_max_mb", None, 0))
+
+    def _pull_progress_step_bytes(self) -> int:
+        enabled = _as_bool(self._setting("pull", "progress", None, True), True)
+        return pull_progress_step_bytes(
+            self._setting("pull", "progress_mb", None, DEFAULT_PULL_PROGRESS_MB),
+            enabled=enabled,
+        )
 
     def _in_progress_count(self, key: str) -> int:
         fp = self._stored_key_ref(key)
@@ -2037,10 +2820,6 @@ class AntigravitySandboxPlugin(Star):
         await self._refresh_in_progress_cache(client)
         return self._idle_keys_from_cache(keys)
 
-    def _round_chat_link_only(self, short: str) -> bool:
-        item = self._short_index.get(_as_str(short)) or {}
-        return _as_str(item.get("chat_reply")).lower() == "link"
-
     def _mark_short_retrieved(self, short: str, status: str) -> None:
         short = _as_str(short)
         if not short or short not in self._short_index:
@@ -2065,6 +2844,7 @@ class AntigravitySandboxPlugin(Star):
         previous_task_id: str = "",
         key: str = "",
         overwrite_short: str = "",
+        allocate: bool = True,
     ) -> str:
         task_id = _as_str(task_id)
         sandbox_id = _as_str(sandbox_id)
@@ -2087,6 +2867,8 @@ class AntigravitySandboxPlugin(Star):
                 recorded_at=_as_str(old.get("recorded_at")),
             )
             self._copy_retrieve_meta(old, item)
+            if _as_str(old.get("session_short")):
+                item["session_short"] = _as_str(old["session_short"])
             self._short_index[existing_short] = item
             self._save_short_index()
             return existing_short
@@ -2094,17 +2876,21 @@ class AntigravitySandboxPlugin(Star):
         short = _as_str(overwrite_short) or (
             self._short_for_task(previous_task_id) if previous_task_id else ""
         )
-        if short:
+        if short and (allocate or short in self._short_index):
             old = self._short_index.get(short) or {}
             item = self._short_item(
                 task_id,
                 sandbox_id,
                 key=key or _as_str(old.get("key")),
             )
-            self._copy_md_meta(old, item)
+            session_short = _as_str(old.get("session_short"))
+            if session_short:
+                item["session_short"] = session_short
             self._short_index[short] = item
             self._save_short_index()
             return short
+        if not allocate:
+            return ""
         if len(self._short_index) >= SHORT_INDEX_LIMIT:
             self._trim_short_index()
         short = self._alloc_submit_short()
@@ -2114,9 +2900,9 @@ class AntigravitySandboxPlugin(Star):
 
     def _bound_key_of(self, item: dict[str, str] | None, *, task_id: str = "", sandbox_id: str = "") -> str:
         item = item or {}
-        key = self._materialize_key(item.get("key"))
-        if key:
-            return key
+        stored = _as_str(item.get("key"))
+        if stored:
+            return self._materialize_key(stored)
         return self._find_key_for(
             task_id=task_id or _as_str(item.get("task_id")),
             sandbox_id=sandbox_id or _as_str(item.get("sandbox_id")),
@@ -2168,9 +2954,31 @@ class AntigravitySandboxPlugin(Star):
     def _follow_latest_on_sandbox(
         self, task_id: str, sandbox_id: str, assigned_key: str
     ) -> tuple[str, str, str, str]:
-        """续接必须接到该沙盒最新一轮，不能从祖先 interaction 分叉。"""
-        latest_short = self._latest_short_for_sandbox(sandbox_id)
+        """跟随选中会话的最新一轮；不能跳到同沙盒的另一独立会话。"""
         user_short = self._short_for_task(task_id)
+        user_item = self._short_index.get(user_short) or {}
+        session_short = _as_str(user_item.get("session_short"))
+        has_independent_sessions = any(
+            _as_str(item.get("sandbox_id")) == sandbox_id and _as_str(item.get("session_short"))
+            for item in self._short_index.values()
+        )
+        if session_short:
+            session_index = {
+                short: item
+                for short, item in self._short_index.items()
+                if _as_str(item.get("session_short")) == session_short
+            }
+            latest_short = pick_latest_indexed_short(session_index, sandbox_id)
+        elif user_short and has_independent_sessions:
+            # Pre-/agnew rows have no session marker. Stay on their own task,
+            # rather than following a newer independent interaction in this env.
+            latest_short = user_short
+        elif has_independent_sessions:
+            # A stale long interaction ID does not identify its session. Never
+            # silently turn it into a continuation of the newest other session.
+            return "", sandbox_id, assigned_key, ""
+        else:
+            latest_short = self._latest_short_for_sandbox(sandbox_id)
         if not latest_short:
             return task_id, sandbox_id, assigned_key, user_short
         item = self._short_index.get(latest_short) or {}
@@ -2206,44 +3014,101 @@ class AntigravitySandboxPlugin(Star):
         return self._latest_short_for_sandbox(only)
 
     def _latest_short_for_sandbox(self, sandbox_id: str) -> str:
-        sandbox_id = _as_str(sandbox_id)
-        if not sandbox_id:
-            return ""
-        best_rank: tuple[int, datetime, int] | None = None
-        fallback = datetime.min.replace(tzinfo=_now().tzinfo)
-        for short, item in self._short_index.items():
-            if _as_str(item.get("sandbox_id")) != sandbox_id:
-                continue
-            ts = _parse_iso(_as_str(item.get("recorded_at")))
-            matched = CONTINUE_SHORT_RE.fullmatch(short)
-            if matched:
-                n = int(matched.group(1)) * (10**CONTINUE_SHORT_TIME_WIDTH) + int(
-                    matched.group(2)
-                )
-            else:
-                parsed = _parse_short_int(short)
-                n = (parsed * (10**CONTINUE_SHORT_TIME_WIDTH)) if parsed is not None else -1
-            rank = (1 if ts is not None else 0, ts or fallback, n)
-            if best_rank is None or rank > best_rank:
-                best_rank = rank
-                best_short = short
-        return best_short
+        return pick_latest_indexed_short(self._short_index, sandbox_id)
 
-    def _url_block(self, receipt: HandlerReceipt) -> str:
-        if not receipt.expected_urls:
-            return ""
-        return "\n预期公网地址:\n" + "\n".join(receipt.expected_urls)
+    def _path_receipt_enabled(self) -> bool:
+        return _as_bool(
+            self._setting("receipt", "sandbox_path_receipt", "sandbox_path_receipt", True),
+            True,
+        )
+
+    def _url_receipt_enabled(self) -> bool:
+        return _as_bool(
+            self._setting("image_host", "receipt_url", "receipt_url", True),
+            True,
+        )
+
+    def _receipt_base_url(self) -> str:
+        return _as_str(
+            self._setting("image_host", "receipt_base_url", "receipt_base_url", "")
+        )
+
+    def _visible_paths(self, paths: list[str] | None) -> list[str]:
+        if not self._path_receipt_enabled():
+            return []
+        return [_as_str(path) for path in (paths or []) if _as_str(path)]
+
+    def _visible_urls(self, urls: list[str] | None) -> list[str]:
+        if not self._url_receipt_enabled():
+            return []
+        base = self._receipt_base_url()
+        visible: list[str] = []
+        for url in urls or []:
+            text = _as_str(url)
+            if text:
+                visible.append(swap_url_origin(text, base))
+        return visible
+
+    def _product_lines(
+        self,
+        receipt: HandlerReceipt,
+        *,
+        for_llm: bool,
+        retrieve: bool,
+    ) -> list[str]:
+        paths = self._visible_paths(receipt.expected_paths)
+        urls = self._visible_urls(receipt.expected_urls)
+        lines: list[str] = []
+        if paths:
+            lines.append("产物路径:" if retrieve else "预期文件路径:")
+            lines.extend(paths)
+            if retrieve and for_llm:
+                short = self._public_task_short(receipt)
+                if short and short != "(未知)":
+                    listed = "、".join(paths)
+                    lines.append(
+                        "需要文件时调用 get_sandbox_task，"
+                        f"task_id={short}，name 填路径：{listed}。"
+                    )
+        if urls:
+            lines.append("产物链接:" if retrieve else "预期公网地址:")
+            lines.extend(urls)
+        return lines
+
+    def _product_plain(
+        self,
+        receipt: HandlerReceipt,
+        *,
+        for_llm: bool,
+        retrieve: bool,
+    ) -> str:
+        return "\n".join(
+            self._product_lines(receipt, for_llm=for_llm, retrieve=retrieve)
+        )
+
+    def _stored_product_urls(self, item: dict[str, str]) -> list[str]:
+        md_url = _as_str(item.get("md_url"))
+        if md_url.startswith(("http://", "https://")):
+            return [md_url]
+        return _split_stored_urls(_as_str(item.get("expected_urls")))
+
+    def _stored_product_paths(self, item: dict[str, str]) -> list[str]:
+        stored = _split_stored_lines(_as_str(item.get("expected_paths")))
+        if stored:
+            return stored
+        name = _as_str(item.get("md_name"))
+        if name:
+            return workspace_product_paths([name])
+        return []
 
     def _public_task_short(self, receipt: HandlerReceipt) -> str:
-        short = self._short_for_task(receipt.task_id)
-        if short:
-            return short
-        if receipt.task_id and receipt.sandbox_id:
-            return self._record_short(receipt.task_id, receipt.sandbox_id)
-        return ""
+        # 只查已有短号。续接覆盖后上一轮 id 已经不在索引里，这里再分配会插进一条更新的旁路短号，
+        # 下一轮会把它当成最新交互，已取回的标记也对不上。
+        return self._short_for_task(receipt.task_id)
 
     def _command_ack(self, receipt: HandlerReceipt) -> str:
-        url_block = self._url_block(receipt)
+        product = self._product_plain(receipt, for_llm=False, retrieve=False)
+        product_suffix = f"\n{product}" if product else ""
         if receipt.continue_blocked:
             short = self._public_task_short(receipt) or self._short_for_task(
                 receipt.task_id
@@ -2257,7 +3122,7 @@ class AntigravitySandboxPlugin(Star):
         if not receipt.ok:
             text = receipt.text or "提交失败。"
             if "回执超时" in text:
-                return "提交超时，未取得任务 id。详情见后台日志。" + url_block
+                return "提交超时，未取得任务 id。详情见后台日志。" + product_suffix
             if _is_retrieve_query_failure_text(text):
                 return text
             first = text.split("\n", 1)[0]
@@ -2267,7 +3132,7 @@ class AntigravitySandboxPlugin(Star):
         if not receipt.task_id:
             text = receipt.text or "提交失败。"
             if "回执超时" in text:
-                return "提交超时，未取得任务 id。详情见后台日志。" + url_block
+                return "提交超时，未取得任务 id。详情见后台日志。" + product_suffix
             return text.split("\n", 1)[0]
         short = self._public_task_short(receipt)
         lines = [
@@ -2275,27 +3140,38 @@ class AntigravitySandboxPlugin(Star):
             f"status: {receipt.status or 'unknown'}",
             f"挂载文件数: {receipt.source_count}",
         ]
+        if receipt.image_count:
+            lines.append(f"随任务直接发送图片: {receipt.image_count} 张（多模态输入）")
         if receipt.auto_retrieved:
             lines.append("已自动取回上一轮（completed）后提交续接。")
-        if url_block:
-            lines.append(url_block.lstrip("\n"))
+        if product:
+            lines.append(product)
         if receipt.put_notes:
             lines.append("续接写入:")
             lines.extend(receipt.put_notes)
         lines.extend(
             [
-                f"后续 /agr {short} 取回，",
+                "后续:",
+                f"/agr {short} 取回任务，",
                 f"/agc {short} [类型...] <任务文本> 续接任务，",
-                CONTINUE_GATE_HINT,
+                f"/agget {short} <文件路径> 获取文件(可能需先取回任务)",
             ]
         )
         return "\n".join(lines)
 
     def _llm_ack(self, receipt: HandlerReceipt) -> str:
-        url_block = self._url_block(receipt)
+        product = self._product_plain(receipt, for_llm=True, retrieve=False)
+        product_suffix = f"\n{product}" if product else ""
         prefix = ""
         if receipt.pre_image_sent:
-            prefix = "【上一轮已自动取回】回执图片已直接发送给用户，无需重复其全文。\n\n"
+            prefix = "【上一轮已自动取回】回执图片已直接发送给用户，无需重复其全文。\n"
+            if receipt.pre_receipt is not None:
+                prev = self._product_plain(
+                    receipt.pre_receipt, for_llm=True, retrieve=True
+                )
+                if prev:
+                    prefix += prev + "\n"
+            prefix += "\n"
         elif receipt.pre_retrieve_reply:
             prefix = "【上一轮已自动取回】\n" + receipt.pre_retrieve_reply + "\n\n"
         if receipt.continue_blocked:
@@ -2319,13 +3195,13 @@ class AntigravitySandboxPlugin(Star):
         if not receipt.ok or not receipt.task_id:
             text = receipt.text or "提交失败。"
             if "回执超时" in text:
-                return prefix + "提交超时，未取得任务 id。详情见后台日志。" + url_block
+                return prefix + "提交超时，未取得任务 id。详情见后台日志。" + product_suffix
             if _is_retrieve_query_failure_text(text):
-                return prefix + text + url_block
+                return prefix + text + product_suffix
             first = text.split("\n", 1)[0]
             if receipt.status:
-                return prefix + f"{first}\nstatus: {receipt.status}" + url_block
-            return prefix + first + url_block
+                return prefix + f"{first}\nstatus: {receipt.status}" + product_suffix
+            return prefix + first + product_suffix
         short = self._public_task_short(receipt)
         lines = [
             "【Antigravity 沙盒任务已受理】",
@@ -2335,32 +3211,22 @@ class AntigravitySandboxPlugin(Star):
         ]
         if receipt.auto_retrieved:
             lines.append("已自动取回上一轮（completed）后提交续接。")
-        if url_block:
-            lines.append(url_block.lstrip("\n"))
+        if product:
+            lines.append(product)
         if receipt.put_notes:
             lines.append("续接写入:")
             lines.extend(receipt.put_notes)
         lines.extend(
             [
                 "",
-                f"后续调用 retrieve_sandbox_task，传入 task_id={short} 取回；",
-                f"调用 continue_sandbox_task，传入 task_id={short} 与 prompt 续接；",
-                f"调用 list_sandbox_task / get_sandbox_task 时同样使用 task_id={short}。",
-                CONTINUE_GATE_HINT,
+                "后续:",
+                f"调用 retrieve_sandbox_task，传入 task_id={short} 取回任务；",
+                f"调用 continue_sandbox_task，传入 task_id={short} 与 prompt 续接任务；",
+                f"调用 get_sandbox_task，传入 task_id={short}，name 填文件路径，获取文件（可能需先取回任务）。",
                 "只使用短号任务编号，不要向用户发送内部长 ID。",
             ]
         )
         return prefix + "\n".join(lines)
-
-    def _receipt_link_urls(self, receipt: HandlerReceipt) -> list[str]:
-        urls = [_as_str(u) for u in receipt.expected_urls if _as_str(u)]
-        if urls:
-            return urls
-        short = self._short_for_task(receipt.task_id)
-        item = self._short_index.get(_as_str(short)) or {}
-        return _split_stored_urls(
-            _as_str(item.get("md_url")) or _as_str(item.get("expected_urls"))
-        )
 
     def _truncate_chars(self) -> int:
         raw = self._setting(
@@ -2388,10 +3254,9 @@ class AntigravitySandboxPlugin(Star):
         output = (receipt.output or "").strip() or "(尚无 output_text)"
         output = self._clip_user_text(output, keep_full=keep_full)
         lines = [f"任务编号: {short}", f"status: {status}", "", output]
-        urls = self._receipt_link_urls(receipt)
-        if urls:
-            lines.append("")
-            lines.extend(urls)
+        product = self._product_plain(receipt, for_llm=False, retrieve=True)
+        if product:
+            lines.extend(["", product])
         return "\n".join(lines)
 
     def _llm_retrieve_reply(self, receipt: HandlerReceipt) -> str:
@@ -2411,8 +3276,9 @@ class AntigravitySandboxPlugin(Star):
             "—— 回执文本（output_text）——",
             output,
         ]
-        if receipt.expected_urls:
-            lines.extend(["", "产物链接:"] + list(receipt.expected_urls))
+        product = self._product_plain(receipt, for_llm=True, retrieve=True)
+        if product:
+            lines.extend(["", product])
         if receipt.steps:
             lines.extend(["", "—— steps 摘要 ——", receipt.steps])
         return "\n".join(lines)
@@ -2427,6 +3293,9 @@ class AntigravitySandboxPlugin(Star):
             "回执已由插件渲染成图片并直接发送给用户。",
             "除非用户明确要求文字细节，不要在回复中重复回执全文。",
         ]
+        product = self._product_plain(receipt, for_llm=True, retrieve=True)
+        if product:
+            lines.extend(["", product])
         return "\n".join(lines)
 
     def _log_command_receipt(self, tag: str, text: str) -> None:
@@ -2454,12 +3323,20 @@ class AntigravitySandboxPlugin(Star):
         return str(dest)
 
     async def _collect_event_file_paths(self, event: AstrMessageEvent) -> list[str]:
-        messages = list(event.get_messages() or [])
+        # event 可能是不带 get_messages 的桩对象（测试/内部调用），按无附件处理。
+        getter = getattr(event, "get_messages", None)
+        messages = list(getter() or []) if callable(getter) else []
         segs: list[Any] = []
         for seg in messages:
             segs.append(seg)
-            if isinstance(seg, Comp.Reply) and getattr(seg, "chain", None):
-                segs.extend(seg.chain or [])
+            if isinstance(seg, Comp.Reply):
+                chain = getattr(seg, "chain", None) or []
+                if not chain:
+                    # 引用消息没展开（框架 get_msg 失败时回退成空 chain），
+                    # 被引用的图片因此不会进来。记一条日志，避免静默丢图。
+                    logger.debug("指令消息里的引用段没有可用 chain，被引用的附件不会收集")
+                else:
+                    segs.extend(chain)
         paths: list[str] = []
         seen: set[str] = set()
         for seg in segs:
@@ -2479,6 +3356,16 @@ class AntigravitySandboxPlugin(Star):
                 continue
             src = Path(local)
             if not src.is_file():
+                logger.warning(f"指令附件本地文件不存在，已跳过: {local}")
+                continue
+            try:
+                size = src.stat().st_size
+            except OSError:
+                size = -1
+            if size == 0:
+                # 下载失败时框架可能留下 0 字节占位文件；带着它上传只会
+                # 往沙盒里放一个空文件， agent 侧看到的就是坏附件。
+                logger.warning(f"指令附件是 0 字节文件，已跳过: {src.name}")
                 continue
             named = self._named_temp_copy(str(src), preferred)
             key = str(Path(named).resolve())
@@ -2487,6 +3374,60 @@ class AntigravitySandboxPlugin(Star):
             seen.add(key)
             paths.append(named)
         return paths
+
+    def _split_image_payloads(
+        self, file_list: list[str]
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """把收集到的附件分成「多模态图片」和「其余文件」。
+
+        图片走 Interactions 的 input image 分节（inline base64）——这是
+        往已有沙盒会话传图唯一可靠的通道：Files PUT 当前服务端落 0 字节，
+        environment_id + sources 会被 Google 400 拒绝。其余文件留给原来的
+        PUT 通道（带回读校验），非图片大文件等场景仍可用。
+        """
+        images: list[dict[str, Any]] = []
+        others: list[str] = []
+        for local in file_list or []:
+            path = Path(str(local)).expanduser()
+            if not path.is_file():
+                logger.warning(f"附件本地文件不存在，已跳过: {local}")
+                continue
+            size = path.stat().st_size
+            if size <= 0:
+                logger.warning(f"附件是 0 字节文件，已跳过: {path.name}")
+                continue
+            try:
+                with path.open("rb") as fh:
+                    head = fh.read(16)
+            except OSError as e:
+                logger.warning(f"读取附件失败，已跳过 {path.name}: {e}")
+                continue
+            mime = sniff_image_mime(head)
+            if not mime:
+                others.append(str(local))
+                continue
+            if size > INLINE_IMAGE_MAX_BYTES:
+                logger.warning(
+                    f"图片附件跳过（大小 {size} 字节，上限 "
+                    f"{INLINE_IMAGE_MAX_BYTES}）: {path.name}"
+                )
+                continue
+            try:
+                data = path.read_bytes()
+            except OSError as e:
+                logger.warning(f"读取图片附件失败，已跳过 {path.name}: {e}")
+                continue
+            if not sniff_image_mime(data[:16]):
+                logger.warning(f"图片附件文件头不像图片，已跳过: {path.name}")
+                continue
+            images.append(
+                {
+                    "name": path.name,
+                    "mime_type": mime,
+                    "data": base64.b64encode(data).decode("ascii"),
+                }
+            )
+        return images, others
 
     def _client(self) -> GeminiSandboxClient:
         try:
@@ -2585,91 +3526,40 @@ class AntigravitySandboxPlugin(Star):
         root = public_base.rstrip("/") + "/" + prefix.strip("/")
         return f"{root}/{name}"
 
-    def _expected_public_urls(self, output_files: str, stamp: str) -> list[str]:
-        _webhook, public_base, _token, prefix = self._resolved_upload_cfg()
-        names = self._stamped_upload_names(output_files, stamp)
-        if not public_base or not names:
-            return []
-        return [self._public_file_url(public_base, prefix, name) for name in names]
-
-    def _upload_instruction(self, output_files: str, stamp: str) -> str:
+    def _take_upload_snapshot(self, output_files: str, stamp: str) -> dict[str, Any]:
+        """One read of the image-host settings for this submit or continue."""
         webhook, public_base, token, prefix = self._resolved_upload_cfg()
         names = self._stamped_upload_names(output_files, stamp)
-        if not webhook or not public_base or not token or not names:
-            return ""
-        mapping = ", ".join(
-            f"{orig} -> {stamped}" for orig, stamped in zip(_output_file_names(output_files), names)
-        )
-        return (
-            "\n\n【文件上传要求】任务完成后，将以下文件上传到图床："
-            + ", ".join(names)
-            + f"。原始文件名与上传文件名对应：{mapping}。"
-            f"上传接口：{webhook}；上传目录：{prefix}/；"
-            + f"公网基础地址：{public_base.rstrip(chr(47))}。"
-            "必须使用上述带时间戳前缀的文件名上传，禁止使用未加前缀的原始文件名，避免覆盖历史文件。"
-            "从 /workspace/upload.token 读取 Bearer Token，禁止输出 Token。"
-            "文件后缀以调用方指定为准；如需上传大包，建议调用方指定 .tar.gz。上传后用 GET 验证公网文件 URL 返回 200，"
-            "并在最终回执中列出每个文件的公网 URL。"
-        )
-
-    def _public_url_from_upload_payload(
-        self, payload: dict[str, Any], *, public_base: str, fallback: str
-    ) -> str:
-        url = _as_str(payload.get("full_url") or payload.get("url"))
-        if url.startswith("/uploads/"):
-            url = public_base.rstrip("/") + url[len("/uploads") :]
-        elif url.startswith("/"):
-            url = public_base.rstrip("/") + url
-        return url or fallback
-
-    async def _upload_file_bytes(self, *, data: bytes, filename: str) -> str:
-        webhook, public_base, token, prefix = self._resolved_upload_cfg()
-        name = _safe_upload_name(filename)
-        if not webhook or not public_base or not token or not name:
-            return ""
-        dest_path = f"{prefix.strip('/')}/{name}"
-        fallback = self._public_file_url(public_base, prefix, name)
-        headers = {"Authorization": f"Bearer {token}"}
-        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        files = {
-            "file": (name, data, content_type),
+        expected_urls: list[str] = []
+        if public_base and names:
+            expected_urls = [self._public_file_url(public_base, prefix, name) for name in names]
+        snap: dict[str, Any] = {
+            "active": False,
+            "error": "",
+            "instruction": "",
+            "network": None,
+            "token": "",
+            "names": names,
+            "expected_urls": expected_urls,
         }
+        if not (webhook and public_base and token and names):
+            return snap
         try:
-            # 图床 Webhook 不走插件代理；沙盒内部访问图床也无法被该代理覆盖。
-            async with httpx.AsyncClient(
-                **build_httpx_client_kwargs(
-                    timeout=httpx.Timeout(30.0, connect=15.0),
-                    proxy=self._proxy_url(),
-                    use_proxy=False,
-                )
-            ) as client:
-                resp = await client.post(
-                    webhook,
-                    headers=headers,
-                    data={"path": dest_path},
-                    files=files,
-                )
-        except httpx.HTTPError as e:
-            logger.warning(f"插件上传 {name} 失败: {e}")
-            return ""
-        if resp.status_code >= 400:
-            preview = (resp.text or "")[:300].replace("\n", " ")
-            logger.warning(f"插件上传 {name} HTTP {resp.status_code}: {preview}")
-            return ""
-        try:
-            payload = resp.json()
-        except ValueError:
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-        return self._public_url_from_upload_payload(
-            payload, public_base=public_base, fallback=fallback
+            host = webhook_upload_host(webhook)
+        except GeminiClientError as exc:
+            snap["error"] = str(exc)
+            return snap
+        snap["active"] = True
+        snap["token"] = token
+        snap["network"] = image_host_network(host, IMAGE_HOST_CREDENTIAL_ID)
+        snap["instruction"] = build_upload_instruction(
+            names=names,
+            original_names=_output_file_names(output_files),
+            webhook=webhook,
+            public_base=public_base,
+            prefix=prefix,
         )
-
-    async def _upload_markdown_bytes(self, *, body: str, filename: str) -> str:
-        return await self._upload_file_bytes(
-            data=body.encode("utf-8"), filename=filename
-        )
+        return snap
 
     async def _do_render_t2i(
         self,
@@ -2770,7 +3660,6 @@ class AntigravitySandboxPlugin(Star):
         if not image_path:
             return
         receipt.image_path = image_path
-        receipt.image_url = ""
 
     async def _send_receipt_image(
         self,
@@ -2778,6 +3667,7 @@ class AntigravitySandboxPlugin(Star):
         image_path: str,
         extra_urls: list[str] | str | None = None,
         *args: Any,
+        extra_text: str = "",
         **kwargs: Any,
     ) -> bool:
         """工具调用途中或指令处理中把回执图片直接发给用户，不再拼接参考链接。"""
@@ -2794,7 +3684,7 @@ class AntigravitySandboxPlugin(Star):
             actual_urls = kwargs["urls"]
 
         try:
-            link_text = self._receipt_link_text(actual_urls)
+            link_text = _as_str(extra_text) or self._receipt_link_text(actual_urls)
             result = event.make_result().file_image(image_path)
             if link_text:
                 result.message("\n" + link_text)
@@ -2818,41 +3708,6 @@ class AntigravitySandboxPlugin(Star):
         clean = [_as_str(u) for u in target if _as_str(u)]
         return "\n".join(clean)
 
-    async def _maybe_plugin_upload_md(
-        self, short: str, output: str, status: str
-    ) -> list[str]:
-        short = _as_str(short)
-        item = self._short_index.get(short) or {}
-        stored_expected = _split_stored_urls(_as_str(item.get("expected_urls")))
-        if _as_str(item.get("plugin_md")).lower() not in {"1", "true", "yes"}:
-            return stored_expected
-        if _as_str(status).lower() != "completed":
-            md_url = _as_str(item.get("md_url"))
-            return [md_url] if md_url else stored_expected
-        body = (output or "").strip()
-        if not body:
-            md_url = _as_str(item.get("md_url"))
-            return [md_url] if md_url else stored_expected
-        digest = _body_sha256(body)
-        old_hash = _as_str(item.get("md_hash"))
-        old_url = _as_str(item.get("md_url"))
-        if digest == old_hash and old_url:
-            return [old_url]
-        planned = _as_str(item.get("md_plan_name"))
-        stamp = _submit_stamp()
-        name = planned or _stamp_upload_name("result.md", stamp)
-        url = await self._upload_markdown_bytes(body=body, filename=name)
-        if not url:
-            return [old_url] if old_url else stored_expected
-        item = dict(self._short_index.get(short) or item)
-        item["md_hash"] = digest
-        item["md_url"] = url
-        item["md_name"] = name
-        if short in self._short_index:
-            self._short_index[short] = item
-            self._save_short_index()
-        return [url]
-
     async def handle_submit(
         self,
         *,
@@ -2860,6 +3715,7 @@ class AntigravitySandboxPlugin(Star):
         file_paths: str = "",
         file_contents: str = "",
         output_files: str = "",
+        event: Any = None,
         **_kwargs: Any,
     ) -> str:
         receipt = await self._do_submit(
@@ -2867,6 +3723,7 @@ class AntigravitySandboxPlugin(Star):
             file_paths=file_paths,
             file_contents=file_contents,
             output_files=output_files,
+            notify=_notify_from_event(event, "tool"),
         )
         self._log_command_receipt("【submit_sandbox_task 完整回执】", receipt.text)
         return self._llm_ack(receipt)
@@ -2878,37 +3735,120 @@ class AntigravitySandboxPlugin(Star):
         file_paths: str = "",
         file_contents: str = "",
         output_files: str = "",
+        notify: dict[str, str] | None = None,
+        reuse_task_ref: str = "",
+        images: list[dict[str, Any]] | None = None,
     ) -> HandlerReceipt:
-        stamp = _submit_stamp()
-        expected_urls = self._expected_public_urls(output_files, stamp)
-        stamped_names = self._stamped_upload_names(output_files, stamp)
-        prompt = _as_str(prompt) + self._upload_instruction(output_files, stamp)
-        upload_token = self._resolved_upload_cfg()[2].strip()
-        if upload_token:
-            try:
-                existing = json.loads(_as_str(file_contents)) if file_contents else []
-                if not isinstance(existing, list):
-                    existing = []
-                has_token = any(
-                    isinstance(item, dict) and item.get("target") == TOKEN_TARGET
-                    for item in existing
+        # /agnew shares files, not interaction history or the old task number.
+        reuse_sandbox = ""
+        bound_key = ""
+        image_count = len(images or [])
+        reuse_task_ref = _as_str(reuse_task_ref)
+        if reuse_task_ref:
+            if not _as_str(prompt).strip():
+                return HandlerReceipt("新建会话失败: prompt 不能为空。", ok=False)
+            found = self._resolve_index_entry(reuse_task_ref)
+            if found:
+                _old_short, old_item = found
+                reuse_sandbox = environment_id_of({"id": _as_str(old_item.get("sandbox_id"))})
+                old_task_id = _as_str(old_item.get("task_id"))
+                stored_key = (
+                    _as_str(old_item.get("key"))
+                    or _as_str(self._key_mapping.get(old_task_id))
+                    or _as_str(self._key_mapping.get(reuse_sandbox))
                 )
-                if not has_token:
-                    existing.append({
-                        "target": TOKEN_TARGET,
-                        "content": upload_token,
-                    })
-                file_contents = json.dumps(existing, ensure_ascii=False)
-            except json.JSONDecodeError:
+                # A removed explicit binding is an error, not a reason to try a
+                # different task/environment Key.
+                bound_key = self._materialize_key(stored_key)
+                if not reuse_sandbox or not old_task_id:
+                    return HandlerReceipt("新建会话失败: 旧任务未绑定沙盒或任务 ID。", ok=False)
+                if not bound_key or bound_key not in self._configured_api_keys():
+                    return HandlerReceipt(
+                        "新建会话失败: 任务绑定的 API Key 不可用，请恢复对应配置。",
+                        ok=False,
+                    )
+            elif SANDBOX_ID_RE.fullmatch(reuse_task_ref):
+                # 收养：远端沙盒存在但没有本地会话记录。用能访问它的 Key
+                # 在里面开启首个会话，之后与普通沙盒完全一致。
+                reuse_sandbox = reuse_task_ref.strip().lower()
+                try:
+                    client = self._client()
+                except Exception as e:
+                    return HandlerReceipt(f"新建会话失败: 客户端初始化失败: {e}", ok=False)
+                if not client.api_keys:
+                    return HandlerReceipt(
+                        "新建会话失败: 未配置 Gemini API Key。",
+                        ok=False,
+                    )
+                reasons: list[str] = []
+                for candidate in client.api_keys:
+                    try:
+                        await client.get_environment(reuse_sandbox, api_key=candidate)
+                    except GeminiClientError as e:
+                        reasons.append(f"{e}")
+                        continue
+                    except Exception as e:
+                        reasons.append(f"{type(e).__name__}")
+                        continue
+                    bound_key = candidate
+                    break
+                if not bound_key:
+                    return HandlerReceipt(
+                        "新建会话失败: 没有可访问该沙盒的 Key（"
+                        + "；".join(dict.fromkeys(reasons))
+                        + "）。",
+                        ok=False,
+                    )
+            else:
+                return HandlerReceipt("新建会话失败: 未找到该任务编号。", ok=False)
+            if len(self._short_index) >= SHORT_INDEX_LIMIT:
                 return HandlerReceipt(
-                    "提交失败: file_contents 不是有效 JSON，无法挂载上传 Token。",
+                    "新建会话失败: 本地任务索引已满。为保留旧任务，本次未提交，请先整理任务索引。",
                     ok=False,
                 )
+            if _as_str(file_paths) or _as_str(file_contents):
+                return HandlerReceipt(
+                    "新建会话失败: 复用环境不挂载新 sources，请先通过沙盒文件页上传附件。",
+                    ok=False,
+                )
+        stamp = _submit_stamp()
+        output_files = _default_output_files(output_files)
+        upload_snap = self._take_upload_snapshot(output_files, stamp)
+        expected_urls = list(upload_snap["expected_urls"])
+        stamped_names = list(upload_snap["names"])
+        expected_paths = workspace_product_paths(stamped_names)
+        if upload_snap["error"]:
+            return HandlerReceipt(
+                f"提交失败: {upload_snap['error']}",
+                ok=False,
+                expected_urls=expected_urls,
+                expected_paths=expected_paths,
+            )
+        prompt = (
+            _as_str(prompt)
+            + placement_instruction(expected_paths)
+            + _as_str(upload_snap["instruction"])
+            + (
+                f"\n\n【用户图片】本次已随任务直接发送 {image_count} 张图片"
+                "（多模态输入，无需读取工作区文件）。"
+                if image_count
+                else ""
+            )
+            + (
+                completed_marker_instruction(stamp)
+                if self._file_poll_enabled()
+                else ""
+            )
+        )
         sources: list[dict[str, Any]] = []
         source_count = 0
         try:
             client = self._client()
-            if self._env_auto_cleanup():
+            if reuse_sandbox:
+                # Verify the environment with the SAME key before any interaction.
+                # Do not sweep here: the selected environment must not be reclaimed.
+                await client.get_environment(reuse_sandbox, api_key=bound_key)
+            elif self._env_auto_cleanup():
                 try:
                     await self._sweep_environments(
                         scope=self._env_cleanup_scope(),
@@ -2916,6 +3856,12 @@ class AntigravitySandboxPlugin(Star):
                     )
                 except Exception as e:
                     logger.warning(f"提交前环境回收失败: {e}")
+            if self._cleanup_sessions_enabled():
+                # 会话清理与沙盒回收同批触发；失败只记日志，不阻断提交。
+                try:
+                    await self._sweep_sessions(reason="submit")
+                except Exception as e:
+                    logger.warning(f"提交前会话清理失败: {e}")
             sources = client.build_sources_from_files(
                 _as_str(file_paths) or None,
                 _as_str(file_contents) or None,
@@ -2926,41 +3872,73 @@ class AntigravitySandboxPlugin(Star):
                     "提交失败: 未配置 Gemini API Key。请在插件设置「接入与模型」中填写。",
                     ok=False,
                     source_count=source_count,
-                    expected_urls=expected_urls,
+                    expected_urls=expected_urls, expected_paths=expected_paths,
                 )
-            idle_keys = await self._idle_keys_for_new_task(client)
+            if reuse_sandbox:
+                if self._in_progress_count(bound_key) >= self._in_progress_limit():
+                    await self._refresh_in_progress_cache(client)
+                idle_keys = (
+                    [bound_key]
+                    if self._in_progress_count(bound_key) < self._in_progress_limit()
+                    else []
+                )
+            else:
+                idle_keys = await self._idle_keys_for_new_task(client)
             if not idle_keys:
                 return HandlerReceipt(
                     MSG_NO_CAPACITY,
                     ok=False,
                     source_count=source_count,
-                    expected_urls=expected_urls,
+                    expected_urls=expected_urls, expected_paths=expected_paths,
                 )
-            # 先记下这把 Key。额度相同的下一次提交才能轮到下一把，不用等本次 in_progress 写入缓存。
-            self._remember_submit_key(idle_keys[0])
+            ready_keys = list(idle_keys)
+            if upload_snap["active"]:
+                ready_keys = await client.ensure_credentials_for_keys(
+                    idle_keys,
+                    IMAGE_HOST_CREDENTIAL_ID,
+                    _as_str(upload_snap["token"]),
+                )
+            # 凭据过滤之后再记 Key。额度相同的下一次提交才能轮到下一把。
+            self._remember_submit_key(ready_keys[0])
             try:
-                key_no = client.api_keys.index(idle_keys[0]) + 1
+                key_no = client.api_keys.index(ready_keys[0]) + 1
             except ValueError:
                 key_no = 0
             logger.info(
                 f"新建任务按负载分配到 Key #{key_no}"
-                f"（进行中 {self._in_progress_count(idle_keys[0])}/{self._in_progress_limit()}）"
+                f"（进行中 {self._in_progress_count(ready_keys[0])}/{self._in_progress_limit()}）"
             )
             payload = client.build_create_payload(
                 prompt=_as_str(prompt),
-                new_sandbox=True,
-                sandbox_id=None,
+                new_sandbox=not bool(reuse_sandbox),
+                sandbox_id=reuse_sandbox or None,
                 new_session=True,
                 previous_task_id=None,
                 sources=sources,
-                background=True,
+                background=client.submit_background,
+                network=upload_snap["network"] if upload_snap["active"] else None,
+                images=images,
             )
-            quota_hook = self._on_storage_quota if self._env_cleanup_on_quota() else None
+            # Reusing a sandbox must never switch project keys or emergency-sweep
+            # the environment selected by the user. Regular submits keep their policy.
+            quota_hook = (
+                self._on_storage_quota
+                if not reuse_sandbox and self._env_cleanup_on_quota()
+                else None
+            )
             data, used_key = await client.create_interaction(
                 payload,
-                candidate_keys=idle_keys,
+                api_key=bound_key if reuse_sandbox else None,
+                candidate_keys=ready_keys,
                 on_storage_quota=quota_hook,
             )
+            if reuse_sandbox:
+                returned_sandbox = environment_id_of({"id": _as_str(data.get("environment_id"))})
+                if returned_sandbox and returned_sandbox != reuse_sandbox:
+                    raise GeminiClientError("新建会话响应的沙盒与请求不一致，未写入本地索引。")
+                new_id = _as_str(data.get("id"))
+                if not new_id or self._short_for_task(new_id):
+                    raise GeminiClientError("新建会话未返回独立的新 task_id，未写入本地索引。")
             if used_key:
                 self._remember_submit_key(used_key)
         except GeminiSubmitTimeoutError as e:
@@ -2972,6 +3950,8 @@ class AntigravitySandboxPlugin(Star):
             ]
             if stamped_names:
                 lines.append("预期上传文件名: " + ", ".join(stamped_names))
+            if expected_paths:
+                lines.extend(["", "预期文件路径:"] + expected_paths)
             if expected_urls:
                 lines.extend(
                     [
@@ -2990,14 +3970,14 @@ class AntigravitySandboxPlugin(Star):
                 "\n".join(lines),
                 ok=False,
                 source_count=source_count,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
             )
         except GeminiClientError as e:
             return HandlerReceipt(
                 f"提交失败: {e}",
                 ok=False,
                 source_count=source_count,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
             )
         except Exception as e:
             logger.error(f"submit_sandbox_task 未预期错误: {e}")
@@ -3005,19 +3985,30 @@ class AntigravitySandboxPlugin(Star):
                 f"提交失败（内部错误）: {e}",
                 ok=False,
                 source_count=source_count,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
             )
 
         task_id = _as_str(data.get("id"))
-        sandbox = _as_str(data.get("environment_id"))
-        short = self._record_key(used_key or "", task_id=task_id, sandbox_id=sandbox)
+        sandbox = reuse_sandbox or _as_str(data.get("environment_id"))
+        short = self._record_key(used_key or bound_key or "", task_id=task_id, sandbox_id=sandbox)
+        if short:
+            # Each independent interaction chain has its own stable short number.
+            self._short_index[short]["session_short"] = short
+            self._save_short_index()
         self._mark_round_outputs(
             short,
-            plugin_md=False,
-            chat_reply="link" if _is_md_only_outputs(output_files) else "",
             expected_urls=expected_urls,
+            expected_paths=expected_paths,
         )
         self._schedule_auto_retrieve(short, task_id=task_id, sandbox_id=sandbox)
+        marker_path = stamped_completed_path(stamp) if self._file_poll_enabled() else ""
+        self._schedule_file_poll(
+            short,
+            task_id=task_id,
+            sandbox_id=sandbox,
+            result_path=marker_path,
+            notify=notify,
+        )
         status = _as_str(data.get("status")) or "unknown"
         if status in {"", "unknown"} and bool(payload.get("background")):
             status = "in_progress"
@@ -3025,40 +4016,30 @@ class AntigravitySandboxPlugin(Star):
         self._touch_sandbox(sandbox, status=status)
         output = extract_output_text(data)
         bg = bool(payload.get("background"))
-        lines = [
-            "【Antigravity 沙盒任务已受理】",
-            f"任务编号: {short or '(未分配)'}",
-            f"task_id: {task_id or '(响应中未找到 id)'}",
-            f"sandbox_id: {sandbox or '(响应中未找到 environment_id)'}",
-            f"status: {status}",
-            f"agent: {client.agent_label}",
-            f"model: {client.model_label}",
-            f"background: {bg}",
-        ]
-        if client.agent_warning:
-            lines.append(client.agent_warning)
-        if stamped_names:
-            lines.append("上传文件名已加提交时间戳前缀: " + ", ".join(stamped_names))
-        if sources:
-            lines.append(f"已挂载 inline 文件数: {len(sources)}")
-        if bg and (not output) and status in RUNNING_STATUS | {"", "unknown"}:
-            lines.append("任务已提交，尚未完成，请稍后取回。")
-        elif output:
-            lines.append("当前 output_text:")
-            lines.append(self._clip_user_text(output, keep_full=False))
-        if expected_urls:
-            lines.extend(["", "预期公网地址（后台任务未完成前可能暂时无法访问）:"])
-            lines.extend(expected_urls)
-        lines.extend(
-            [
-                "",
-                f"后续 /agretrieve {short} 取回；/agcontinue {short} [类型...] <任务文本> 续接；"
-                f"/agls {short} 查看文件；/agget {short} <完整路径> 拉取文件。",
-                "请注意：不要把内部长 task_id 和 sandbox_id 发给用户，后续只说任务编号。",
-                CONTINUE_GATE_HINT,
-                "请根据产物类型自行判断：稍后下载并直接发送给用户，或让用户稍后访问上述地址。",
-                "提交工具不轮询；需要确认状态或读取最终回执时，再调用 retrieve_sandbox_task。",
-            ]
+        lines = self._accepted_receipt_lines(
+            title="Antigravity 沙盒任务已受理",
+            short=short,
+            task_id=task_id,
+            sandbox_id=sandbox,
+            status=status,
+            bg=bg,
+            output=output,
+            agent_label=client.agent_label,
+            model_label=client.model_label,
+            agent_warning=client.agent_warning,
+            reuse_task_ref=reuse_task_ref if reuse_sandbox else "",
+            stamped_names=stamped_names,
+            source_count=source_count,
+            marker_path=marker_path,
+            expected_paths=expected_paths,
+            expected_urls=expected_urls,
+            image_count=image_count,
+        )
+        lines.append(
+            "请根据产物类型自行判断：稍后下载并直接发送给用户，或让用户稍后访问上述地址。"
+        )
+        lines.append(
+            "提交工具不轮询；需要确认状态或读取最终回执时，再调用 retrieve_sandbox_task。"
         )
         return HandlerReceipt(
             "\n".join(lines),
@@ -3067,8 +4048,91 @@ class AntigravitySandboxPlugin(Star):
             status=status,
             source_count=source_count,
             output=output,
-            expected_urls=expected_urls,
+            expected_urls=expected_urls, expected_paths=expected_paths,
+            image_count=image_count,
         )
+
+    def _accepted_receipt_lines(
+        self,
+        *,
+        title: str,
+        short: str,
+        task_id: str,
+        sandbox_id: str,
+        status: str,
+        bg: bool,
+        output: str,
+        agent_label: str,
+        model_label: str,
+        agent_warning: str,
+        previous_task_id: str = "",
+        reuse_task_ref: str = "",
+        auto_retrieved: bool = False,
+        stamped_names: list[str] | None = None,
+        source_count: int = 0,
+        marker_path: str = "",
+        expected_paths: list[str] | None = None,
+        expected_urls: list[str] | None = None,
+        put_notes: list[str] | None = None,
+        image_count: int = 0,
+    ) -> list[str]:
+        """提交/续接受理回执的公共文案（两条流程只保留差异字段）。"""
+        lines = [
+            f"【{title}】",
+            f"任务编号: {short or '(未分配)'}",
+            f"task_id: {task_id or '(响应中未找到 id)'}",
+        ]
+        if previous_task_id:
+            lines.append(f"previous_task_id: {previous_task_id}")
+        if reuse_task_ref:
+            lines.append(
+                f"基于任务编号 {reuse_task_ref} 新建独立会话，复用文件但不继承对话上下文。"
+            )
+        lines.extend(
+            [
+                f"sandbox_id: {sandbox_id or '(响应中未找到 environment_id)'}",
+                f"status: {status}",
+                f"agent: {agent_label}",
+                f"model: {model_label}",
+                f"background: {bg}",
+            ]
+        )
+        if agent_warning:
+            lines.append(agent_warning)
+        if auto_retrieved:
+            lines.append("已自动取回上一轮（completed）后提交续接。")
+        if stamped_names:
+            lines.append("上传文件名已加提交时间戳前缀: " + ", ".join(stamped_names))
+        if source_count:
+            lines.append(f"已挂载 inline 文件数: {source_count}")
+        if image_count:
+            lines.append(
+                f"已随任务直接发送图片 {image_count} 张（多模态输入，agent 可直接查看）"
+            )
+        if bg and (not output) and status in RUNNING_STATUS | {"", "unknown"}:
+            lines.append("任务已提交，尚未完成，请稍后取回。")
+        elif output:
+            lines.append("当前 output_text:")
+            lines.append(self._clip_user_text(output, keep_full=False))
+        if marker_path:
+            lines.append(f"完成标记: {marker_path}（完成标记提醒开启时按间隔查看）")
+        if expected_paths:
+            lines.extend(["", "预期文件路径:"] + expected_paths)
+        if expected_urls:
+            lines.extend(["", "预期公网地址（后台任务未完成前可能暂时无法访问）:"])
+            lines.extend(expected_urls)
+        if put_notes:
+            lines.extend(["", "续接写入:"] + put_notes)
+        lines.extend(
+            [
+                "",
+                f"后续 /agretrieve {short} 取回；/agcontinue {short} [类型...] <任务文本> 续接；"
+                f"/agls {short} 查看文件；/agget {short} <完整路径> 拉取文件。",
+                "请注意：不要把内部长 task_id 和 sandbox_id 发给用户，后续只说任务编号。",
+                CONTINUE_GATE_HINT,
+            ]
+        )
+        return lines
 
     async def handle_continue(
         self,
@@ -3081,15 +4145,14 @@ class AntigravitySandboxPlugin(Star):
         event: Any = None,
         **_kwargs: Any,
     ) -> str:
-        plugin_md = not bool(_output_file_names(output_files))
         receipt = await self._do_continue(
             prompt=prompt,
             task_id=task_id,
             sandbox_id=sandbox_id,
             output_files=output_files,
             file_paths=file_paths,
-            plugin_md=plugin_md,
             render_image=event is not None,
+            notify=_notify_from_event(event, "tool"),
         )
         self._log_command_receipt("【continue_sandbox_task 完整回执】", receipt.text)
         if event is not None:
@@ -3102,7 +4165,8 @@ class AntigravitySandboxPlugin(Star):
         pre = receipt.pre_receipt
         if pre is None or not pre.image_path:
             return
-        if await self._send_receipt_image(event, pre.image_path):
+        tail = self._product_plain(pre, for_llm=False, retrieve=True)
+        if await self._send_receipt_image(event, pre.image_path, extra_text=tail):
             receipt.pre_image_sent = True
 
     async def _put_continue_uploads(
@@ -3130,10 +4194,15 @@ class AntigravitySandboxPlugin(Star):
                 logger.warning(f"读取续接附件失败 {display}: {e}")
                 notes.append(f"{display}: 未能写入沙盒，已继续续接")
                 continue
-            if size > CHAT_PULL_MAX_BYTES:
-                notes.append(f"{display}: 超过 20MB，未写入，已继续续接")
+            if size > CONTINUE_PUT_MAX_BYTES:
+                notes.append(
+                    f"{display}: 超过 {CONTINUE_PUT_MAX_BYTES // (1024 * 1024)}MB，未写入，已继续续接"
+                )
                 continue
             target_name, added = ensure_md_filename(display)
+            if not (api_key or "").strip():
+                notes.append(f"{target_name}: 未能写入沙盒，已继续续接")
+                continue
             rel = f"workspace/{target_name}"
             mime = mimetypes.guess_type(target_name)[0] or (
                 "text/markdown" if target_name.lower().endswith(".md") else "application/octet-stream"
@@ -3144,23 +4213,35 @@ class AntigravitySandboxPlugin(Star):
                     rel,
                     data,
                     content_type=mime,
-                    api_key=api_key or None,
+                    api_key=api_key,
                 )
             except Exception as e:
                 logger.warning(f"续接 PUT 写入失败 {target_name}: {e}")
                 notes.append(f"{target_name}: 写入失败，已继续续接")
                 continue
-            suffix_note = "（无后缀，已按 md 写入）" if added else ""
-            public = ""
+            # PUT 端点只回 200 和元数据，不报服务端实际字节数；2026-10-07 实测
+            # 多种协议（resumable 会话/分块/裸 PUT）都拿 200 但落库 0 字节。
+            # 所以必须回读比对，否则会把空文件当成功写进 prompt。
             try:
-                stamped = _stamp_upload_name(target_name, _submit_stamp())
-                public = await self._upload_file_bytes(data=data, filename=stamped)
+                stored = await client.download_environment_file(
+                    sandbox_id, rel, api_key=api_key
+                )
             except Exception as e:
-                logger.warning(f"续接附件图床地址生成失败 {target_name}: {e}")
-            if public:
-                notes.append(f"{public}{suffix_note}")
-            else:
-                notes.append(f"/workspace/{target_name}{suffix_note}")
+                logger.warning(f"续接 PUT 回读校验失败 {target_name}: {e}")
+                notes.append(f"{target_name}: 写入后无法校验（{e}），已继续续接")
+                continue
+            if len(stored) != size:
+                logger.warning(
+                    f"续接 PUT 落库字节不符 {target_name}: "
+                    f"本地 {size} B / 服务端 {len(stored)} B"
+                )
+                notes.append(
+                    f"{target_name}: 写入后校验不一致（本地 {size} B / "
+                    f"服务端 {len(stored)} B），未生效，已继续续接"
+                )
+                continue
+            suffix_note = "（无后缀，已按 md 写入）" if added else ""
+            notes.append(f"/workspace/{target_name}{suffix_note}")
         return notes
 
     async def _do_continue(
@@ -3171,12 +4252,14 @@ class AntigravitySandboxPlugin(Star):
         sandbox_id: str = "",
         file_paths: str = "",
         output_files: str = "",
-        plugin_md: bool = False,
+        images: list[dict[str, Any]] | None = None,
         render_image: bool = False,
+        notify: dict[str, str] | None = None,
     ) -> HandlerReceipt:
         prompt_str = _as_str(prompt).strip()
         task_id = _as_str(task_id).strip()
         sandbox_id = _as_str(sandbox_id).strip()
+        image_count = len(images or [])
         if not prompt_str:
             return HandlerReceipt("续接交互失败: prompt 不能为空。", ok=False)
         resolved = self._resolve_ids(task_id)
@@ -3200,7 +4283,7 @@ class AntigravitySandboxPlugin(Star):
         if ".." in task_id or ".." in sandbox_id or "\x00" in task_id + sandbox_id:
             return HandlerReceipt("续接交互失败: id 含非法路径字符。", ok=False)
 
-        gate_short = overwrite_short or self._short_for_task(task_id)
+        gate_short = self._short_for_task(task_id) or overwrite_short
         auto_retrieved = False
         pre_retrieve_reply = ""
         pre: HandlerReceipt | None = None
@@ -3253,10 +4336,20 @@ class AntigravitySandboxPlugin(Star):
                     pre_receipt=pre,
                 )
             auto_retrieved = True
+        self._cancel_file_poll(gate_short)
 
         assigned_key = assigned_key or self._find_key_for(
             task_id=task_id, sandbox_id=sandbox_id
         ) or ""
+        if not assigned_key:
+            return HandlerReceipt(
+                "续接交互失败: 任务绑定的 API Key 不可用，请恢复对应配置。",
+                ok=False,
+                task_id=task_id,
+                sandbox_id=sandbox_id,
+                pre_retrieve_reply=pre_retrieve_reply,
+                pre_receipt=pre,
+            )
         if assigned_key and self._in_progress_count(assigned_key) >= self._in_progress_limit():
             return HandlerReceipt(
                 MSG_NO_CAPACITY,
@@ -3267,28 +4360,70 @@ class AntigravitySandboxPlugin(Star):
                 pre_receipt=pre,
             )
 
-        if plugin_md or not _output_file_names(output_files):
-            plugin_md = True
-            output_files = output_files or "result.md"
-            stamp = _submit_stamp()
-            expected_urls = self._expected_public_urls(output_files, stamp)
-            stamped_names = self._stamped_upload_names(output_files, stamp)
-            full_prompt = prompt_str
-        else:
-            stamp = _submit_stamp()
-            expected_urls = self._expected_public_urls(output_files, stamp)
-            stamped_names = self._stamped_upload_names(output_files, stamp)
-            full_prompt = prompt_str + self._upload_instruction(output_files, stamp)
+        output_files = _default_output_files(output_files)
+        stamp = _submit_stamp()
+        upload_snap = self._take_upload_snapshot(output_files, stamp)
+        expected_urls = list(upload_snap["expected_urls"])
+        stamped_names = list(upload_snap["names"])
+        expected_paths = workspace_product_paths(stamped_names)
+        if upload_snap["error"]:
+            return HandlerReceipt(
+                f"续接交互失败: {upload_snap['error']}",
+                ok=False,
+                task_id=task_id,
+                sandbox_id=sandbox_id,
+                expected_urls=expected_urls,
+                expected_paths=expected_paths,
+                pre_retrieve_reply=pre_retrieve_reply,
+                pre_receipt=pre,
+            )
+        full_prompt = (
+            prompt_str
+            + placement_instruction(expected_paths)
+            + _as_str(upload_snap["instruction"])
+        )
+        tail_instruction = (
+            completed_marker_instruction(stamp)
+            if self._file_poll_enabled()
+            else ""
+        )
         put_notes: list[str] = []
         try:
             client = self._client()
+            if not assigned_key or assigned_key not in client.api_keys:
+                return HandlerReceipt(
+                    "续接交互失败: 任务绑定的 API Key 不可用，请恢复对应配置。",
+                    ok=False,
+                    task_id=task_id,
+                    sandbox_id=sandbox_id,
+                    expected_urls=expected_urls,
+                    expected_paths=expected_paths,
+                    pre_retrieve_reply=pre_retrieve_reply,
+                    pre_receipt=pre,
+                )
+            if upload_snap["active"]:
+                await client.ensure_bearer_credential(
+                    assigned_key,
+                    IMAGE_HOST_CREDENTIAL_ID,
+                    _as_str(upload_snap["token"]),
+                )
             if _as_str(file_paths):
                 put_notes = await self._put_continue_uploads(
                     client, sandbox_id, assigned_key, file_paths
                 )
                 if put_notes:
                     full_prompt += "\n\n【用户附件】已尝试写入沙盒:\n" + "\n".join(put_notes)
-            # 延续会话时禁止 interaction sources。附件只走上面的 PUT。
+            if image_count:
+                # 图片走多模态 input 分节，agent 直接看得见；这里只在正文里
+                # 说明一句，避免 agent 去 workspace 找不存在的图片文件。
+                full_prompt += (
+                    f"\n\n【用户图片】本次已随任务直接发送 {image_count} 张图片"
+                    "（多模态输入，无需读取工作区文件）。"
+                )
+            # 完成标记要求放在最后，附件说明之后
+            full_prompt += tail_instruction
+            # 延续会话时禁止 interaction sources（Google 对 environment_id +
+            # sources 返回 400）。图片走 images 多模态 input，文件走上面的 PUT。
             payload = client.build_create_payload(
                 prompt=full_prompt,
                 new_sandbox=False,
@@ -3296,7 +4431,9 @@ class AntigravitySandboxPlugin(Star):
                 new_session=False,
                 previous_task_id=task_id,
                 sources=None,
-                background=True,
+                background=client.submit_background,
+                network=upload_snap["network"] if upload_snap["active"] else None,
+                images=images,
             )
             quota_hook = self._on_storage_quota if self._env_cleanup_on_quota() else None
             data, used_key = await client.create_interaction(
@@ -3310,6 +4447,8 @@ class AntigravitySandboxPlugin(Star):
             ]
             if stamped_names:
                 lines.append("预期上传文件名: " + ", ".join(stamped_names))
+            if expected_paths:
+                lines.extend(["", "预期文件路径:"] + expected_paths)
             if expected_urls:
                 lines.extend(
                     [
@@ -3321,7 +4460,7 @@ class AntigravitySandboxPlugin(Star):
             return HandlerReceipt(
                 "\n".join(lines),
                 ok=False,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
                 pre_retrieve_reply=pre_retrieve_reply,
                 pre_receipt=pre,
                 put_notes=put_notes,
@@ -3330,7 +4469,7 @@ class AntigravitySandboxPlugin(Star):
             return HandlerReceipt(
                 f"续接交互失败: {e}",
                 ok=False,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
                 pre_retrieve_reply=pre_retrieve_reply,
                 pre_receipt=pre,
                 put_notes=put_notes,
@@ -3340,7 +4479,7 @@ class AntigravitySandboxPlugin(Star):
             return HandlerReceipt(
                 f"续接交互失败（内部错误）: {e}",
                 ok=False,
-                expected_urls=expected_urls,
+                expected_urls=expected_urls, expected_paths=expected_paths,
                 pre_retrieve_reply=pre_retrieve_reply,
                 pre_receipt=pre,
                 put_notes=put_notes,
@@ -3354,20 +4493,27 @@ class AntigravitySandboxPlugin(Star):
             sandbox_id=returned_sandbox,
             previous_task_id=task_id,
             overwrite_short=overwrite_short,
+            allocate=False,
         )
-        chat_reply = ""
-        if plugin_md or _is_md_only_outputs(output_files):
-            chat_reply = "link"
+        if not short:
+            logger.warning(
+                f"续接未分配短号：覆盖目标为空 previous={task_id} new={new_task_id}"
+            )
         self._mark_round_outputs(
             short,
-            plugin_md=plugin_md,
-            chat_reply=chat_reply,
             expected_urls=expected_urls,
+            expected_paths=expected_paths,
         )
-        if plugin_md and stamped_names:
-            self._remember_md_plan(short, stamped_names[0])
         self._schedule_auto_retrieve(
             short, task_id=new_task_id, sandbox_id=returned_sandbox
+        )
+        marker_path = stamped_completed_path(stamp) if self._file_poll_enabled() else ""
+        self._schedule_file_poll(
+            short,
+            task_id=new_task_id,
+            sandbox_id=returned_sandbox,
+            result_path=marker_path,
+            notify=notify,
         )
         status = _as_str(data.get("status")) or "unknown"
         if status in {"", "unknown"} and bool(payload.get("background")):
@@ -3376,54 +4522,46 @@ class AntigravitySandboxPlugin(Star):
         self._touch_sandbox(returned_sandbox, status=status)
         output = extract_output_text(data)
         bg = bool(payload.get("background"))
-        lines = [
-            "【Antigravity 沙盒续接任务已受理】",
-            f"任务编号: {short or '(未分配)'}",
-            f"task_id: {new_task_id or '(响应中未找到 id)'}",
-            f"previous_task_id: {task_id}",
-            f"sandbox_id: {returned_sandbox}",
-            f"status: {status}",
-            f"agent: {client.agent_label}",
-            f"model: {client.model_label}",
-            f"background: {bg}",
-        ]
-        if client.agent_warning:
-            lines.append(client.agent_warning)
-        if auto_retrieved:
-            lines.append("已自动取回上一轮（completed）后提交续接。")
-        if stamped_names:
-            lines.append("上传文件名已加提交时间戳前缀: " + ", ".join(stamped_names))
-        if bg and (not output) and status in RUNNING_STATUS | {"", "unknown"}:
-            lines.append("任务已提交，尚未完成，请稍后取回。")
-        elif output:
-            lines.append("当前 output_text:")
-            lines.append(self._clip_user_text(output, keep_full=False))
-        if expected_urls:
-            lines.extend(["", "预期公网地址（后台任务未完成前可能暂时无法访问）:"])
-            lines.extend(expected_urls)
-        if put_notes:
-            lines.extend(["", "续接写入:"] + put_notes)
-        lines.extend(
-            [
-                "",
-                f"后续 /agretrieve {short} 取回；/agcontinue {short} [类型...] <任务文本> 续接；"
-                f"/agls {short} 查看文件；/agget {short} <完整路径> 拉取文件。",
-                "请注意：不要把内部长 task_id 和 sandbox_id 发给用户，后续只说任务编号。",
-                CONTINUE_GATE_HINT,
-            ]
+        lines = self._accepted_receipt_lines(
+            title="Antigravity 沙盒续接任务已受理",
+            short=short,
+            task_id=new_task_id,
+            sandbox_id=returned_sandbox,
+            status=status,
+            bg=bg,
+            output=output,
+            agent_label=client.agent_label,
+            model_label=client.model_label,
+            agent_warning=client.agent_warning,
+            previous_task_id=task_id,
+            auto_retrieved=auto_retrieved,
+            stamped_names=stamped_names,
+            marker_path=marker_path,
+            expected_paths=expected_paths,
+            expected_urls=expected_urls,
+            put_notes=put_notes,
+            image_count=image_count,
         )
         return HandlerReceipt(
             "\n".join(lines),
             task_id=new_task_id,
             sandbox_id=returned_sandbox,
             status=status,
-            source_count=sum(1 for note in put_notes if "失败" not in note and "未能" not in note and "超过" not in note),
+            source_count=sum(
+                1
+                for note in put_notes
+                if not any(
+                    mark in note
+                    for mark in ("失败", "未能", "超过", "未生效", "无法校验", "不一致")
+                )
+            ),
             output=output,
-            expected_urls=expected_urls,
+            expected_urls=expected_urls, expected_paths=expected_paths,
             auto_retrieved=auto_retrieved,
             pre_retrieve_reply=pre_retrieve_reply,
             pre_receipt=pre,
             put_notes=put_notes,
+            image_count=image_count,
         )
 
     async def handle_retrieve(
@@ -3435,13 +4573,18 @@ class AntigravitySandboxPlugin(Star):
         **_kwargs: Any,
     ) -> str:
         receipt = await self._do_retrieve(
-            task_id=task_id, sandbox_id=sandbox_id, render_image=event is not None
+            task_id=task_id,
+            sandbox_id=sandbox_id,
+            render_image=event is not None,
+            cancel_file_poll=True,
         )
         self._log_command_receipt("【retrieve_sandbox_task 完整回执】", receipt.text)
         image_sent = False
         if receipt.ok and receipt.image_path and event is not None:
             image_sent = await self._send_receipt_image(
-                event, receipt.image_path
+                event,
+                receipt.image_path,
+                extra_text=self._product_plain(receipt, for_llm=False, retrieve=True),
             )
         if image_sent:
             return self._llm_retrieve_brief(receipt)
@@ -3453,6 +4596,7 @@ class AntigravitySandboxPlugin(Star):
         task_id: str = "",
         sandbox_id: str = "",
         cancel_auto: bool = True,
+        cancel_file_poll: bool = False,
         render_image: bool = False,
     ) -> HandlerReceipt:
         task_id = _as_str(task_id)
@@ -3544,14 +4688,15 @@ class AntigravitySandboxPlugin(Star):
         if cancel_auto and short:
             self._cancel_auto_retrieve(short)
             self._mark_short_retrieved(short, status)
+        # 问到 in_progress / queued 说明任务还在跑，.completed 轮询不能停。
+        # 只有终态（完成、失败、取消等）才停，避免 /agr 查一次就把提醒掐掉。
+        if cancel_file_poll and short and file_poll_should_stop(status):
+            self._cancel_file_poll(short)
         output = extract_output_text(data)
         steps = summarize_steps(data)
-        expected_urls: list[str] = []
-        if short:
-            try:
-                expected_urls = await self._maybe_plugin_upload_md(short, output, status)
-            except Exception as e:
-                logger.warning(f"取回后插件上传 md 失败: {e}")
+        item = self._short_index.get(short) or {} if short else {}
+        expected_urls = self._stored_product_urls(item)
+        expected_paths = self._stored_product_paths(item)
         lines = [
             "【Antigravity 沙盒任务回执】",
             f"task_id: {task_id}",
@@ -3564,6 +4709,8 @@ class AntigravitySandboxPlugin(Star):
             "—— steps 摘要 ——",
             steps,
         ]
+        if expected_paths:
+            lines.extend(["", "产物路径:"] + expected_paths)
         if expected_urls:
             lines.extend(["", "产物链接:"] + expected_urls)
         usage = data.get("usage")
@@ -3576,7 +4723,7 @@ class AntigravitySandboxPlugin(Star):
             status=status,
             output=output,
             steps=steps,
-            expected_urls=expected_urls,
+            expected_urls=expected_urls, expected_paths=expected_paths,
         )
         if render_image and receipt_image_applies(
             self._image_receipt_enabled(),
@@ -3624,9 +4771,38 @@ class AntigravitySandboxPlugin(Star):
             prompt=prompt_text,
             output_files=output_files,
             file_paths=",".join(file_list),
+            notify=_notify_from_event(event, "command"),
         )
         self._log_command_receipt("【agsubmit 完整回执】", receipt.text)
         yield event.plain_result(self._command_ack(receipt))
+
+    @filter.command("agnew")
+    async def agnew(self, event: AstrMessageEvent, rest: GreedyStr):
+        """在旧沙盒新建独立会话: /agnew <任务编号> [类型...] <任务文本>"""
+        task_ref, prompt_raw = _split_continue_rest(str(rest))
+        prompt_text, output_files = _parse_command_prompt(prompt_raw, default_ext="md")
+        # 聊天里引用/附带的图片收集成多模态输入。新会话复用同一个沙盒，
+        # environment_id + sources 会被 Google 400 拒绝，Files PUT 又落 0 字节，
+        # 所以图片走 Interactions 的 input image 分节（与 /agc 一致）。
+        file_list = await self._collect_event_file_paths(event)
+        images, _other_files = self._split_image_payloads(file_list)
+        if not task_ref or not (prompt_text or images):
+            yield event.plain_result("用法: /agnew <任务编号> [类型...] <任务文本>")
+            return
+        if not prompt_text:
+            prompt_text = "请查看用户随本次任务发送的图片并完成相应处理。"
+        receipt = await self._do_submit(
+            prompt=prompt_text,
+            output_files=output_files,
+            reuse_task_ref=task_ref,
+            notify=_notify_from_event(event, "command"),
+            images=images,
+        )
+        self._log_command_receipt("【agnew 完整回执】", receipt.text)
+        reply = self._command_ack(receipt)
+        if receipt.ok:
+            reply = "已在原沙盒新建独立会话（共享文件，不继承旧对话）。\n" + reply
+        yield event.plain_result(reply)
 
     @filter.command("agretrieve", alias={"agr"})
     async def agretrieve(self, event: AstrMessageEvent, task_ref: str = ""):
@@ -3643,13 +4819,16 @@ class AntigravitySandboxPlugin(Star):
             return
         task_id, sandbox_id, _assigned_key = resolved
         receipt = await self._do_retrieve(
-            task_id=task_id, sandbox_id=sandbox_id, render_image=True
+            task_id=task_id,
+            sandbox_id=sandbox_id,
+            render_image=True,
+            cancel_file_poll=True,
         )
         self._log_command_receipt("【agretrieve 完整回执】", receipt.text)
         if receipt.image_path and await self._send_receipt_image(
             event,
             receipt.image_path,
-            extra_urls=self._receipt_link_urls(receipt),
+            extra_text=self._product_plain(receipt, for_llm=False, retrieve=True),
         ):
             return
         yield event.plain_result(self._command_retrieve_reply(receipt))
@@ -3659,12 +4838,11 @@ class AntigravitySandboxPlugin(Star):
         """在已有沙盒会话中续接任务: /agcontinue <任务编号> [类型...] <任务文本>"""
         task_ref, prompt_raw = _split_continue_rest(str(rest))
         prompt_text, output_files = _parse_command_prompt(
-            prompt_raw, default_ext=None
+            prompt_raw, default_ext="md"
         )
-        plugin_md = not bool(_output_file_names(output_files))
         prompt_preview = prompt_text if len(prompt_text) <= 500 else prompt_text[:500] + "…"
         logger.info(
-            f"agcontinue 解析 task_ref={task_ref} plugin_md={plugin_md} "
+            f"agcontinue 解析 task_ref={task_ref} "
             f"output_files={output_files or '-'} prompt={prompt_preview}"
         )
         if not task_ref or not prompt_text:
@@ -3678,20 +4856,24 @@ class AntigravitySandboxPlugin(Star):
             return
         task_id, sandbox_id, _assigned_key = resolved
         file_list = await self._collect_event_file_paths(event)
+        images, other_files = self._split_image_payloads(file_list)
         receipt = await self._do_continue(
             prompt=prompt_text,
             task_id=task_id,
             sandbox_id=sandbox_id,
             output_files=output_files,
-            file_paths=",".join(file_list),
-            plugin_md=plugin_md,
+            file_paths=",".join(other_files),
+            images=images,
             render_image=True,
+            notify=_notify_from_event(event, "command"),
         )
         self._log_command_receipt("【agcontinue 完整回执】", receipt.text)
         pre = receipt.pre_receipt
         if pre is not None and pre.image_path:
             receipt.pre_image_sent = await self._send_receipt_image(
-                event, pre.image_path, extra_urls=self._receipt_link_urls(pre)
+                event,
+                pre.image_path,
+                extra_text=self._product_plain(pre, for_llm=False, retrieve=True),
             )
         if not receipt.pre_image_sent and receipt.pre_retrieve_reply:
             yield event.plain_result(receipt.pre_retrieve_reply)
@@ -3746,30 +4928,38 @@ class AntigravitySandboxPlugin(Star):
             if head.isdigit() and tail:
                 task_ref = head
                 name = tail
+            elif head.isdigit():
+                # 只有编号、没有路径，例如「/agget 0009」
+                task_ref, name = head, ""
         elif " " in raw:
             # 主写法：<任务编号> <完整路径>，路径本身可含空格，只在首个空格切
             head, _, tail = raw.partition(" ")
             if head.strip().isdigit() and tail.strip():
                 task_ref = head.strip()
                 name = tail.strip()
+        elif raw.isdigit():
+            # 只给了编号，例如「/agget 0009」「/agget 9」
+            task_ref = raw
+            name = ""
         if not name:
-            yield event.plain_result(
-                "用法: /agget <任务编号> <完整路径>，例如 /agget 0003 workspace/a.md"
-            )
+            # 有编号但缺路径：说明用法，不要只说找不到任务编号。
+            if task_ref:
+                yield event.plain_result(
+                    f"任务编号 {task_ref} 缺少要拉取的文件路径。"
+                    f"用法: /agget {task_ref} <完整路径>，"
+                    f"例如 /agget {task_ref} workspace/result.md。"
+                    "可先用 /agls 查看该任务的 workspace 文件。"
+                )
+            else:
+                yield event.plain_result(
+                    "用法: /agget <任务编号> <完整路径>，例如 /agget 0003 workspace/a.md"
+                )
             return
         short = task_ref or self._single_latest_short_for_sandbox()
-        text, path, display = await self._pull_chat_file(short, name)
-        if path is not None:
-            if hasattr(event, "track_temporary_local_file"):
-                event.track_temporary_local_file(str(path))
-            yield event.chain_result(
-                [
-                    Comp.Plain(text),
-                    Comp.File(name=display or path.name, file=str(path)),
-                ]
-            )
-            return
-        yield event.plain_result(text)
+        umo = _as_str(getattr(event, "unified_msg_origin", ""))
+        task = asyncio.create_task(self._agget_pull_job(umo, short, name))
+        self._track_agget_task(task)
+        yield event.plain_result(f"开始拉取 {name}，完成后发到这里。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("agenvlist", alias={"agels"})
@@ -3830,10 +5020,14 @@ class AntigravitySandboxPlugin(Star):
 
 
     def _files_failure_text(self, exc: Exception, *, listing: bool) -> str:
-        if isinstance(exc, (asyncio.TimeoutError, GeminiFileTimeoutError)):
+        if isinstance(exc, asyncio.TimeoutError):
             return MSG_PULL_TIMEOUT
+        if isinstance(exc, GeminiFileTimeoutError):
+            text = str(exc).strip()
+            return text or MSG_PULL_TIMEOUT
         if isinstance(exc, GeminiFileTooLargeError):
-            return MSG_FILE_TOO_LARGE
+            text = str(exc).strip()
+            return text or MSG_FILE_TOO_LARGE
         status = getattr(exc, "status_code", None)
         kind = files_error_kind(status if isinstance(status, int) else None, str(exc), listing=listing)
         fixed = fixed_files_message(kind)
@@ -3972,20 +5166,95 @@ class AntigravitySandboxPlugin(Star):
             suffix = ""
         return directory / f"{uuid.uuid4().hex}{suffix}"
 
-    async def _pull_chat_file(
-        self, task_ref: str, name: str
-    ) -> tuple[str, Path | None, str]:
-        """Chat/LLM pull. Does not take the WebUI download semaphore."""
+    def _track_agget_task(self, task: asyncio.Task[None]) -> None:
+        self._agget_tasks.add(task)
+        task.add_done_callback(self._agget_tasks.discard)
+
+    async def _send_pull_notice(
+        self,
+        umo: str,
+        text: str,
+        path: Path | None = None,
+        display: str = "",
+    ) -> None:
+        if not umo:
+            logger.warning("拉取结果没有会话，无法发送")
+            return
+        chain = MessageChain()
+        chain.message(text)
+        if path is not None:
+            chain.chain.append(Comp.File(name=display or path.name, file=str(path)))
         try:
-            return await asyncio.wait_for(
-                self._pull_chat_file_inner(task_ref, name),
-                CHAT_PULL_TIMEOUT_SECONDS,
+            await self.context.send_message(umo, chain)
+        except Exception as e:
+            logger.warning(f"发送拉取结果失败: {e}")
+
+    async def _agget_pull_job(self, umo: str, task_ref: str, name: str) -> None:
+        """Background /agget. No overall deadline; abort after 10 minutes without new bytes."""
+
+        async def _report(text: str) -> None:
+            await self._send_pull_notice(umo, text)
+
+        try:
+            text, path, display = await self._pull_chat_file(
+                task_ref,
+                name,
+                on_progress=_report,
+                limit=self._pull_max_bytes(),
+                total_timeout=None,
+                download_timeout=AGGET_STALL_SECONDS,
+                timeout_message=agget_stall_message(),
+                abort_on_head_timeout=False,
             )
+        except Exception as e:
+            logger.warning(f"/agget 后台拉取失败: {e}")
+            await self._send_pull_notice(umo, "拉取失败。建议改用图床或 WebUI 获取。")
+            return
+        await self._send_pull_notice(umo, text, path, display)
+
+    async def _pull_chat_file(
+        self,
+        task_ref: str,
+        name: str,
+        *,
+        on_progress: Any = None,
+        limit: int | None = None,
+        total_timeout: float | None = None,
+        download_timeout: float | None = None,
+        timeout_message: str | None = None,
+        abort_on_head_timeout: bool = True,
+    ) -> tuple[str, Path | None, str]:
+        """Chat/LLM pull. Does not take the WebUI download semaphore.
+
+        total_timeout caps the whole call. None means no overall deadline.
+        download_timeout is the httpx read-idle limit on the file stream.
+        """
+        inner = self._pull_chat_file_inner(
+            task_ref,
+            name,
+            on_progress=on_progress,
+            limit=limit,
+            download_timeout=download_timeout,
+            timeout_message=timeout_message,
+            abort_on_head_timeout=abort_on_head_timeout,
+        )
+        if total_timeout is None:
+            return await inner
+        try:
+            return await asyncio.wait_for(inner, total_timeout)
         except asyncio.TimeoutError:
             return MSG_PULL_TIMEOUT, None, ""
 
     async def _pull_chat_file_inner(
-        self, task_ref: str, name: str
+        self,
+        task_ref: str,
+        name: str,
+        *,
+        on_progress: Any = None,
+        limit: int | None = None,
+        download_timeout: float | None = None,
+        timeout_message: str | None = None,
+        abort_on_head_timeout: bool = True,
     ) -> tuple[str, Path | None, str]:
         try:
             short, _task_id, sandbox_id, key = self._resolve_file_target(task_ref)
@@ -4009,8 +5278,8 @@ class AntigravitySandboxPlugin(Star):
         if self._chat_pull_blocked(match):
             return "该文件不能通过聊天或指令拉取。", None, ""
         size = int(match.get("size_bytes") or 0)
-        if size > CHAT_PULL_MAX_BYTES:
-            return MSG_FILE_TOO_LARGE, None, ""
+        if limit is not None and size > limit:
+            return file_too_large_message(limit), None, ""
         rel = workspace_download_path(_as_str(match.get("path")) or _as_str(match.get("name")))
         try:
             remote_size = await client.head_environment_file_size(
@@ -4021,25 +5290,48 @@ class AntigravitySandboxPlugin(Star):
             )
         except GeminiClientError as e:
             kind = files_error_kind(getattr(e, "status_code", None), str(e), listing=False)
-            if kind == "timeout":
+            if kind == "timeout" and abort_on_head_timeout:
                 return MSG_PULL_TIMEOUT, None, ""
             if kind in {"key", "env"}:
                 return fixed_files_message(kind), None, ""
             remote_size = None
-        if remote_size is not None and remote_size > CHAT_PULL_MAX_BYTES:
-            return MSG_FILE_TOO_LARGE, None, ""
+        if limit is not None and remote_size is not None and remote_size > limit:
+            return file_too_large_message(limit), None, ""
         display = _as_str(match.get("name")) or PurePosixPath(rel).name or "download.bin"
+        if remote_size and remote_size > 0:
+            known_size: int | None = int(remote_size)
+        elif size > 0:
+            known_size = size
+        else:
+            known_size = None
+        # 已知大小低于阈值时不发进度；大小未知时，下载跨过阈值才发。
+        step = self._pull_progress_step_bytes() if on_progress is not None else 0
+        tracker = PullProgress(step, known_size)
+        report = on_progress
         dest = self._chat_pull_dest(display)
+        loaded = 0
         try:
             with dest.open("wb") as out:
                 async for chunk in client.iter_environment_file(
                     sandbox_id,
                     rel,
                     api_key=key,
-                    max_bytes=CHAT_PULL_MAX_BYTES,
-                    timeout=CHAT_PULL_TIMEOUT_SECONDS,
+                    max_bytes=limit,
+                    timeout=download_timeout,
+                    timeout_message=timeout_message,
                 ):
                     out.write(chunk)
+                    loaded += len(chunk)
+                    for mark in tracker.marks(loaded):
+                        if report is None:
+                            break
+                        try:
+                            await report(
+                                format_pull_progress(short, display, mark, tracker.known)
+                            )
+                        except Exception as e:
+                            logger.warning(f"发送拉取进度失败: {e}")
+                            report = None
         except (GeminiFileTooLargeError, GeminiFileTimeoutError, GeminiClientError) as e:
             dest.unlink(missing_ok=True)
             return self._files_failure_text(e, listing=False), None, ""
@@ -4057,9 +5349,39 @@ class AntigravitySandboxPlugin(Star):
         event: Any = None,
         **_kwargs: Any,
     ) -> str:
-        text, path, display = await self._pull_chat_file(task_id, name)
+        on_progress = None
+        if event is not None:
+
+            async def _report(text: str) -> None:
+                await event.send(event.plain_result(text))
+
+            on_progress = _report
+        text, path, display = await self._pull_chat_file(
+            task_id,
+            name,
+            on_progress=on_progress,
+            limit=self._tool_pull_max_bytes(),
+            total_timeout=CHAT_PULL_TIMEOUT_SECONDS,
+            download_timeout=CHAT_PULL_TIMEOUT_SECONDS,
+            timeout_message=MSG_PULL_TIMEOUT,
+            abort_on_head_timeout=True,
+        )
         if path is None or event is None:
             return text
+        if self._computer_use_runtime(event) == "local":
+            try:
+                rel = await self._save_pulled_file_to_workspace(
+                    event, path, display or path.name
+                )
+            except Exception as e:
+                logger.warning(f"写入会话工作区失败，改为发到聊天: {e}")
+                rel = ""
+            if rel:
+                return (
+                    f"已保存到当前会话工作区：{rel}\n"
+                    "这是相对于会话工作区的路径。请用文件工具读取，"
+                    "不要把文件内容复述进回复，也不要再发到聊天。"
+                )
         try:
             if hasattr(event, "track_temporary_local_file"):
                 event.track_temporary_local_file(str(path))
@@ -4075,7 +5397,7 @@ class AntigravitySandboxPlugin(Star):
             return text + "\n文件已下载，但发送到聊天失败。"
         return (
             f"已把 {display} 发给用户。"
-            "沙盒网络存疑，不一定能成功拉取文件；超过 20MB 或超时请改用图床或 WebUI。"
+            "沙盒网络存疑，不一定能成功拉取文件；超过工具拉取大小上限或 90 秒请改用图床或 WebUI。"
         )
 
     async def handle_list_sandbox_task(self, *, task_id: str = "", **_kwargs: Any) -> str:
@@ -4106,6 +5428,18 @@ class AntigravitySandboxPlugin(Star):
                 "Download environment file",
             )
             register(
+                f"/{PLUGIN_NAME}/sandbox-files/upload-by-ref/<ref>/<sandbox_id>/<path:dest_path>",
+                self._web_sandbox_files_upload,
+                ["POST"],
+                "Upload environment file with selected session binding",
+            )
+            register(
+                f"/{PLUGIN_NAME}/sandbox-files/upload/<sandbox_id>/<path:dest_path>",
+                self._web_sandbox_files_upload,
+                ["POST"],
+                "Upload environment file with destination path",
+            )
+            register(
                 f"/{PLUGIN_NAME}/sandbox-files/upload/<sandbox_id>",
                 self._web_sandbox_files_upload,
                 ["POST"],
@@ -4116,6 +5450,24 @@ class AntigravitySandboxPlugin(Star):
                 self._web_sandbox_files_delete,
                 ["POST"],
                 "Delete sandbox from file desk",
+            )
+            register(
+                f"/{PLUGIN_NAME}/sandbox-files/session/status",
+                self._web_session_status,
+                ["POST"],
+                "Fetch and record a session completion status",
+            )
+            register(
+                f"/{PLUGIN_NAME}/sandbox-files/session/delete",
+                self._web_session_delete,
+                ["POST"],
+                "Delete one session interaction and its local record",
+            )
+            register(
+                f"/{PLUGIN_NAME}/sandbox-files/session/cleanup",
+                self._web_session_cleanup,
+                ["POST"],
+                "Clean up terminal idle sessions, keeping the newest per sandbox",
             )
             register(
                 f"/{PLUGIN_NAME}/sandbox-files/pull",
@@ -4157,25 +5509,14 @@ class AntigravitySandboxPlugin(Star):
         return status or "idle"
 
     def _web_collect_local_tasks(self) -> list[dict[str, Any]]:
-        """Build task rows from short_index, one row per sandbox (latest short)."""
-        best: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
-        fallback = datetime.min.replace(tzinfo=_now().tzinfo)
+        """One row per independent session; files still belong to the shared sandbox."""
+        rows: list[dict[str, Any]] = []
         for short, item in self._short_index.items():
             if not isinstance(item, dict):
                 continue
             sandbox_id = _as_str(item.get("sandbox_id"))
             if not sandbox_id:
                 continue
-            ts = _parse_iso(_as_str(item.get("recorded_at")))
-            matched = CONTINUE_SHORT_RE.fullmatch(short)
-            if matched:
-                n = int(matched.group(1)) * (10**CONTINUE_SHORT_TIME_WIDTH) + int(
-                    matched.group(2)
-                )
-            else:
-                parsed = _parse_short_int(short)
-                n = (parsed * (10**CONTINUE_SHORT_TIME_WIDTH)) if parsed is not None else -1
-            rank = (1 if ts is not None else 0, ts or fallback, n)
             status = self._web_task_status_of(sandbox_id=sandbox_id, item=item)
             row = {
                 "short": short,
@@ -4184,12 +5525,10 @@ class AntigravitySandboxPlugin(Star):
                 "label": short or f"{sandbox_id[:8]}…",
                 "recorded_at": _as_str(item.get("recorded_at")),
                 "task_id": _as_str(item.get("task_id")),
+                "session_short": _as_str(item.get("session_short")) or short,
                 "source": "local",
             }
-            prev = best.get(sandbox_id)
-            if prev is None or rank > prev[0]:
-                best[sandbox_id] = (rank, row)
-        rows = [row for _, row in best.values()]
+            rows.append(row)
         rows.sort(key=lambda r: _as_str(r.get("recorded_at")), reverse=True)
         return rows
 
@@ -4240,10 +5579,22 @@ class AntigravitySandboxPlugin(Star):
             found = self._resolve_index_entry(ref)
             if found:
                 short, item = found
-                sandbox_id = sandbox_id or _as_str(item.get("sandbox_id"))
-                key = self._bound_key_of(item, sandbox_id=sandbox_id)
+                bound_sandbox = _as_str(item.get("sandbox_id"))
+                if sandbox_id and sandbox_id != bound_sandbox:
+                    raise ValueError("任务编号与 sandbox_id 不匹配")
+                sandbox_id = bound_sandbox
+                stored = (
+                    _as_str(item.get("key"))
+                    or _as_str(self._key_mapping.get(_as_str(item.get("task_id"))))
+                    or _as_str(self._key_mapping.get(sandbox_id))
+                )
+                key = self._materialize_key(stored)
+                if not key or key not in self._configured_api_keys():
+                    raise ValueError("任务绑定的 API Key 不可用，请恢复对应配置。")
             elif SANDBOX_ID_RE.fullmatch(ref):
                 sandbox_id = sandbox_id or ref.lower()
+            else:
+                raise ValueError("未找到该任务编号")
         if sandbox_id and SANDBOX_ID_RE.fullmatch(sandbox_id):
             sandbox_id = sandbox_id.lower()
         elif sandbox_id:
@@ -4288,6 +5639,8 @@ class AntigravitySandboxPlugin(Star):
                 safe.append(
                     {
                         "short": _as_str(row.get("short")),
+                        "session_short": _as_str(row.get("session_short")) or _as_str(row.get("short")),
+                        "task_id": _as_str(row.get("task_id")),
                         "sandbox_id": _as_str(row.get("sandbox_id")),
                         "status": _as_str(row.get("status")) or "idle",
                         "label": _as_str(row.get("label"))
@@ -4430,14 +5783,17 @@ class AntigravitySandboxPlugin(Star):
             logger.warning(f"sandbox-files/download 失败: {e}")
             return error_response(str(e) or "下载失败")
 
-    async def _web_sandbox_files_upload(self, sandbox_id: str = ""):
+    async def _web_sandbox_files_upload(
+        self, sandbox_id: str = "", dest_path: str | None = None, ref: str = ""
+    ):
         try:
             from astrbot.api.web import error_response, json_response, request
         except ImportError:
             return {"status": "error", "message": "当前 AstrBot 不支持 Plugin Web API"}
         try:
             sid = _as_str(sandbox_id) or _as_str(request.query.get("sandbox_id", ""))
-            raw_dest = request.query.get("path")
+            raw_dest = dest_path if dest_path is not None else request.query.get("path")
+            ref = _as_str(ref) or _as_str(request.query.get("ref", ""))
             files = await request.files()
             upload = files.get("file") if files else None
             if upload is None:
@@ -4456,7 +5812,7 @@ class AntigravitySandboxPlugin(Star):
                     dest = normalize_environment_file_path(clean)
                     if is_dir:
                         dest = f"{dest.rstrip('/')}/{filename}"
-            sid, short, key = self._web_resolve_sandbox_key(sandbox_id=sid)
+            sid, short, key = self._web_resolve_sandbox_key(sandbox_id=sid, ref=ref)
             content = await upload.read()
             content_type = _as_str(getattr(upload, "content_type", "") or "") or (
                 mimetypes.guess_type(filename)[0] or "application/octet-stream"
@@ -4510,6 +5866,73 @@ class AntigravitySandboxPlugin(Star):
             logger.warning(f"sandbox-files/delete 失败: {e}")
             return error_response(str(e) or "删除失败")
 
+    async def _web_session_status(self):
+        try:
+            from astrbot.api.web import error_response, json_response, request
+        except ImportError:
+            return {"status": "error", "message": "当前 AstrBot 不支持 Plugin Web API"}
+        try:
+            payload = await request.json(default={})
+            if not isinstance(payload, dict):
+                payload = {}
+            ref = _as_str(payload.get("ref") or request.query.get("ref", ""))
+            if not ref:
+                return error_response("缺少 ref（短号或 sandbox_id）")
+            ok, status, message = await self._session_status(ref)
+            if not ok:
+                return json_response({"ok": False, "message": message})
+            return json_response({"ok": True, "status": status, "message": status})
+        except Exception as e:
+            logger.warning(f"sandbox-files/session/status 失败: {e}")
+            return error_response(str(e) or "获取状态失败")
+
+    async def _web_session_delete(self):
+        try:
+            from astrbot.api.web import error_response, json_response, request
+        except ImportError:
+            return {"status": "error", "message": "当前 AstrBot 不支持 Plugin Web API"}
+        try:
+            payload = await request.json(default={})
+            if not isinstance(payload, dict):
+                payload = {}
+            ref = _as_str(payload.get("ref") or request.query.get("ref", ""))
+            if not ref:
+                return error_response("缺少 ref（短号或 sandbox_id）")
+            ok, message = await self._delete_session(ref)
+            return json_response({"ok": ok, "message": message})
+        except Exception as e:
+            logger.warning(f"sandbox-files/session/delete 失败: {e}")
+            return error_response(str(e) or "删除会话失败")
+
+    async def _web_session_cleanup(self):
+        try:
+            from astrbot.api.web import error_response, json_response, request
+        except ImportError:
+            return {"status": "error", "message": "当前 AstrBot 不支持 Plugin Web API"}
+        try:
+            payload = await request.json(default={})
+            if not isinstance(payload, dict):
+                payload = {}
+            sandbox_id = _as_str(payload.get("sandbox_id"))
+            result = await self._sweep_sessions(
+                sandbox_id=sandbox_id, reason="webui"
+            )
+            return json_response(
+                {
+                    "ok": True,
+                    "deleted": result["deleted"],
+                    "kept": result["kept"],
+                    "failed": result["failed"],
+                    "message": (
+                        f"已清理 {result['deleted']} 条会话，"
+                        f"保留 {result['kept']} 条最近会话。"
+                    ),
+                }
+            )
+        except Exception as e:
+            logger.warning(f"sandbox-files/session/cleanup 失败: {e}")
+            return error_response(str(e) or "清理会话失败")
+
     def _ui_snapshot(self, job: dict[str, Any]) -> dict[str, Any]:
         total = int(job.get("total") or 0)
         loaded = int(job.get("loaded") or 0)
@@ -4532,7 +5955,6 @@ class AntigravitySandboxPlugin(Star):
         if not throttle.allow(time.monotonic(), force=force):
             return
         snap = self._ui_snapshot(job)
-        job["last_snap"] = snap
         for listener in list(job.get("listeners") or []):
             try:
                 listener.put_nowait(snap)
@@ -4647,7 +6069,8 @@ class AntigravitySandboxPlugin(Star):
             path = _as_str(payload.get("path") or request.query.get("path", ""))
             if not path:
                 return error_response("缺少 path")
-            sid, _short, key = self._web_resolve_sandbox_key(sandbox_id=sandbox_id)
+            ref = _as_str(payload.get("ref"))
+            sid, _short, key = self._web_resolve_sandbox_key(sandbox_id=sandbox_id, ref=ref)
             rel = normalize_environment_file_path(path)
             filename = PurePosixPath(rel).name or "download.bin"
             try:
@@ -4808,7 +6231,13 @@ class AntigravitySandboxPlugin(Star):
             task = job.get("task")
             if task is not None and not task.done():
                 task.cancel()
-        for task in (self._startup_task, self._auto_retrieve_task, self._pull_cleanup_task):
+        for task in (
+            self._startup_task,
+            self._auto_retrieve_task,
+            self._file_poll_task,
+            self._pull_cleanup_task,
+            *list(self._agget_tasks),
+        ):
             if task is not None and not task.done():
                 task.cancel()
                 try:
@@ -4836,7 +6265,7 @@ class SubmitSandboxTaskTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         plugin: AntigravitySandboxPlugin = self.plugin
-        return await plugin.handle_submit(**kwargs)
+        return await plugin.handle_submit(event=_tool_event(context), **kwargs)
 
 
 @dataclass

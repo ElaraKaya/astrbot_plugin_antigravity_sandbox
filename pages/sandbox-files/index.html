@@ -18,7 +18,6 @@
       --success: #00c853;
       --warning: #ffc107;
       --error: #f44336;
-      --info: #03c9d7;
       --bg: #ffffff;
       --surface: #fff;
       --lightprimary: #eef2f6;
@@ -40,7 +39,6 @@
       --success: #52c41a;
       --warning: #faad14;
       --error: #ff4d4f;
-      --info: #03c9d7;
       --bg: #1a1a1a;
       --surface: #242424;
       --lightprimary: #1a2e3d;
@@ -125,7 +123,30 @@
     .badge.run { color: var(--primary); background: var(--lightprimary); }
     .badge.err { color: var(--error); background: color-mix(in srgb, var(--error) 12%, transparent); }
 
-    .task-list { display: flex; flex-direction: column; gap: 6px; }
+    .task-list { display: flex; flex-direction: column; gap: 10px; }
+    .sb { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); overflow: hidden; }
+    .sb.on { border-color: color-mix(in srgb, var(--primary) 40%, var(--border)); }
+    .sb-hd { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 9px 11px 5px; cursor: pointer; }
+    .sb-hd .sid { font-family: var(--mono); font-size: 12px; font-weight: 500; }
+    .st { display: flex; gap: 10px; padding: 0 11px 7px; font-size: 11px; color: var(--text2); }
+    .acts { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 11px 9px; }
+    .acts .btn { font-size: 11px; }
+    .sess { margin: 0 9px 8px; padding: 7px 9px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--bg); cursor: pointer; }
+    .sess:hover { background: var(--hover); }
+    .sess.on { border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); background: var(--lightprimary); }
+    .sess .r1 { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+    .sess .r2 { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-top: 5px; }
+    .sess .no { font-family: var(--mono); font-size: 12px; font-weight: 500; }
+    .sess .tt { font-family: var(--mono); font-size: 11px; color: var(--muted); max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sess .ops { display: flex; gap: 5px; }
+    .b { font-size: 11px; padding: 1px 7px; border-radius: 6px; white-space: nowrap; cursor: pointer; border: 1px solid var(--border); background: var(--surface); color: var(--text2); }
+    .b:hover { border-color: var(--primary); color: var(--primary); }
+    .b.run { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); background: var(--lightprimary); }
+    .b.ok { color: var(--success); border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+    .b.err { color: var(--error); border-color: color-mix(in srgb, var(--error) 45%, var(--border)); }
+    .b.warn { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 50%, var(--border)); }
+    .b.none { color: var(--muted); }
+    .hint { padding: 0 11px 9px; font-size: 11px; color: var(--muted); line-height: 1.5; }
     .task {
       border: 1px solid transparent; border-radius: 8px; padding: 10px 10px;
       cursor: pointer; text-align: left; background: transparent; color: inherit; font-family: inherit;
@@ -134,7 +155,8 @@
     .task:hover { background: var(--hover); }
     .task.on { background: var(--active); border-color: color-mix(in srgb, var(--primary) 35%, transparent); }
     .task .id { font-family: var(--mono); font-size: 12px; color: var(--primary); }
-    .task .meta { font-size: 12px; color: var(--muted); margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .task .meta { font-size: 12px; color: var(--muted); margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; overflow-wrap: anywhere; }
+    .shared-note { padding: 10px 14px; color: var(--text2); font-size: 12px; line-height: 1.5; border-bottom: 1px solid var(--border-soft); background: var(--lightprimary); }
     .empty { color: var(--muted); font-size: 13px; padding: 18px 8px; text-align: center; line-height: 1.6; }
 
     .toolbar {
@@ -252,7 +274,7 @@
   <div class="content">
     <section class="card">
       <div class="card-hd">
-        <span>任务 / 环境</span>
+        <span>沙盒</span>
         <span class="badge" id="taskCount">0</span>
       </div>
       <div class="card-bd">
@@ -274,11 +296,14 @@
           <input id="fileInput" type="file" multiple hidden />
         </label>
         <button class="btn btn-sm" id="btnToggleSys" type="button" style="display:none" title="折叠/展开根目录下的系统目录">系统目录: 折叠</button>
-        <button class="btn btn-sm btn-danger" id="btnDelete" type="button" disabled>删除沙盒</button>
+        <button class="btn btn-sm" id="btnStatus" type="button" disabled title="查询并记录当前会话的完成状态">获取完成状态</button>
+        <button class="btn btn-sm btn-warn" id="btnSessionDel" type="button" disabled title="删除当前会话，不动沙盒文件">删除会话</button>
+        <button class="btn btn-sm btn-danger" id="btnDelete" type="button" disabled title="删除整个沙盒与共享文件">删除沙盒</button>
         <div class="path-bar" id="cwd">/workspace</div>
         <span class="badge" id="selMeta">已选 0</span>
       </div>
-      <div class="drop" id="dropzone">选择左侧沙盒后，拖拽文件到此处上传到 /workspace</div>
+      <div class="shared-note" id="sharedNote" style="display:none"></div>
+      <div class="drop" id="dropzone">选择左侧会话任务后，拖拽文件到此处上传到 /workspace</div>
       <div class="card-bd" style="padding-top:0">
         <table class="files">
           <thead>
@@ -287,6 +312,7 @@
               <th>名称</th>
               <th style="width:88px">类型</th>
               <th style="width:96px">大小</th>
+              <th style="width:140px">修改时间</th>
               <th style="width:120px">操作</th>
             </tr>
           </thead>
@@ -303,11 +329,21 @@
   <div class="toast" id="toast"></div>
   <div class="modal-mask" id="deleteModal" role="dialog" aria-modal="true">
     <div class="modal">
-      <h3>确认删除沙盒？</h3>
-      <p id="deleteMsg">将删除远端环境并清理本地短号索引。此操作不可恢复。</p>
+      <h3>确认删除整个沙盒？</h3>
+      <p id="deleteMsg">将删除远端环境与共享文件，并移除全部关联会话任务和短号。此操作不可恢复。</p>
       <div class="actions">
         <button class="btn btn-sm" type="button" id="deleteCancel">取消</button>
         <button class="btn btn-sm btn-danger-solid" type="button" id="deleteConfirm">确认删除</button>
+      </div>
+    </div>
+  </div>
+  <div class="modal-mask" id="sessionDelModal" role="dialog" aria-modal="true">
+    <div class="modal">
+      <h3>确认删除该会话？</h3>
+      <p id="sessionDelMsg">将删除这条会话记录与服务端交互，不可恢复；沙盒文件与其他会话不受影响。运行中的会话也可直接删除。</p>
+      <div class="actions">
+        <button class="btn btn-sm" type="button" id="sessionDelCancel">取消</button>
+        <button class="btn btn-sm btn-danger-solid" type="button" id="sessionDelConfirm">删除会话</button>
       </div>
     </div>
   </div>
@@ -329,7 +365,12 @@
       active: 0,
       toastTimer: null,
       loadingFiles: false,
+      filesRequestId: 0,
+      tasksRequestId: 0,
       deleteStep: 0,
+      deleteTarget: null,
+      sessionDeleteRef: "",
+      pendingDeleteSandbox: "",
     };
 
     function $(id) { return document.getElementById(id); }
@@ -350,6 +391,15 @@
       return (i === 0 ? v : v.toFixed(v >= 10 ? 1 : 2)) + " " + u[i];
     }
 
+    // Google 返回 ISO 时间（UTC），转本地时间到分钟；缺省/目录显示 —。
+    function fmtTime(v) {
+      if (v == null || v === "") return "—";
+      const d = new Date(v);
+      if (Number.isNaN(d.getTime())) return "—";
+      const p = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+
     function toast(msg) {
       const el = $("toast");
       el.textContent = String(msg || "");
@@ -362,6 +412,20 @@
       if (!e) return "未知错误";
       if (typeof e === "string") return e;
       return e.message || String(e);
+    }
+
+    // 卡片里只放紧凑时间：同年显示 MM-DD，跨年补年份，毫秒与时区不进卡片。
+    // 完整 ISO 时间放在 title 属性里，hover 仍能看到精确值。
+    function fmtShortTime(raw) {
+      const text = String(raw || "").trim();
+      if (!text) return "";
+      const d = new Date(text);
+      if (isNaN(d.getTime())) return text.slice(0, 10);
+      const pad = (n) => String(n).padStart(2, "0");
+      const md = pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+      const now = new Date();
+      if (d.getFullYear() !== now.getFullYear()) return d.getFullYear() + "-" + md;
+      return md;
     }
 
     function statusBadge(s) {
@@ -385,6 +449,28 @@
     function currentTask() {
       if (state.taskIdx < 0 || state.taskIdx >= state.tasks.length) return null;
       return state.tasks[state.taskIdx];
+    }
+
+    function taskKey(t) {
+      if (!t) return "";
+      const session = t.session_short || t.short || "";
+      return JSON.stringify([t.sandbox_id || "", session, session ? "" : (t.task_id || "")]);
+    }
+
+    function taskRef(t) {
+      return t ? (t.session_short || t.short || t.sandbox_id || "") : "";
+    }
+
+    function sandboxTasks(t) {
+      return t ? state.tasks.filter((row) => row.sandbox_id === t.sandbox_id) : [];
+    }
+
+    function uploadEndpoint(sandboxId, destPath, ref = "") {
+      const path = normalizeRelPath(destPath).split("/").map(encodeURIComponent).join("/");
+      const base = ref && ref !== sandboxId
+        ? "sandbox-files/upload-by-ref/" + encodeURIComponent(ref) + "/"
+        : "sandbox-files/upload/";
+      return base + encodeURIComponent(sandboxId) + "/" + path;
     }
 
     const SYSTEM_ROOT_DIRS = new Set([
@@ -473,12 +559,70 @@
     }
 
     function setFileControlsEnabled(on) {
+      const t = currentTask();
+      const ref = on && t ? taskRef(t) : "";
       $("btnRefresh").disabled = !on;
       $("btnDelete").disabled = !on;
       $("btnUp").disabled = !on || !normalizeRelPath(state.currentPath);
       $("btnUploadLabel").style.opacity = on ? "1" : ".45";
       $("btnUploadLabel").style.pointerEvents = on ? "auto" : "none";
       $("btnDl").disabled = !on || state.selected.size === 0;
+      $("btnStatus").disabled = !ref;
+      $("btnSessionDel").disabled = !ref;
+      if ($("btnSessionDel")) {
+        $("btnSessionDel").textContent = ref ? `删除会话 ${ref}` : "删除会话";
+      }
+      if ($("btnStatus")) {
+        $("btnStatus").title = ref ? `查询并记录会话 ${ref} 的完成状态` : "查询并记录完成状态";
+      }
+    }
+
+    function sessionStatusLabel(s) {
+      const v = String(s || "").toLowerCase();
+      if (!v || v === "unknown") return "未获取";
+      if (v === "in_progress" || v === "queued") return "运行中";
+      if (v === "completed") return "已完成";
+      if (v === "failed") return "失败";
+      if (v === "cancelled") return "已取消";
+      if (v === "incomplete") return "未完整";
+      if (v === "budget_exceeded") return "预算超限";
+      if (v === "requires_action") return "待操作";
+      return v;
+    }
+
+    function sessionStatusBadge(s) {
+      const v = String(s || "").toLowerCase();
+      if (v === "in_progress" || v === "queued") return '<span class="b run">' + sessionStatusLabel(v) + '</span>';
+      if (v === "completed") return '<span class="b ok">已完成</span>';
+      if (v === "failed" || v === "budget_exceeded") return '<span class="b err">' + sessionStatusLabel(v) + '</span>';
+      if (v === "cancelled" || v === "incomplete" || v === "requires_action") return '<span class="b warn">' + sessionStatusLabel(v) + '</span>';
+      return '<span class="b none">未获取</span>';
+    }
+
+    function sandboxGroups() {
+      const groups = new Map();
+      for (const t of state.tasks) {
+        const sid = t.sandbox_id || "";
+        if (!groups.has(sid)) groups.set(sid, []);
+        groups.get(sid).push(t);
+      }
+      return [...groups.entries()].map(([sid, rows]) => {
+        const running = rows.filter((r) => ["in_progress", "queued"].includes(String(r.status || "").toLowerCase())).length;
+        const known = rows.filter((r) => String(r.status || "").toLowerCase() && String(r.status || "").toLowerCase() !== "unknown").length;
+        const latest = rows.reduce((best, r) => {
+          if (!best) return r;
+          return String(r.recorded_at || "") > String(best.recorded_at || "") ? r : best;
+        }, null);
+        return { sid, rows, running, known, latest };
+      }).sort((a, b) => {
+        if (b.running !== a.running) return b.running - a.running;
+        return String((b.latest && b.latest.recorded_at) || "").localeCompare(String((a.latest && a.latest.recorded_at) || ""));
+      });
+    }
+
+    function selectedSandboxId() {
+      const t = currentTask();
+      return t ? (t.sandbox_id || "") : "";
     }
 
     function renderTasks() {
@@ -487,28 +631,112 @@
         $("taskList").innerHTML = '<div class="empty">暂无沙盒任务。<br/>提交任务后会显示在这里。</div>';
         return;
       }
-      $("taskList").innerHTML = state.tasks.map((t, i) => {
-        const label = t.label || t.short || ((t.sandbox_id || "").slice(0, 8) + "…");
-        const sid = t.sandbox_id || "";
-        return `
-          <button type="button" class="task ${i === state.taskIdx ? "on" : ""}" data-i="${i}">
-            <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
-              <span class="id">/${escapeHtml(t.short || label)}</span>
-              ${statusBadge(t.status)}
+      const activeSid = selectedSandboxId();
+      const html = sandboxGroups().map((g) => {
+        const active = g.sid === activeSid;
+        const remote = g.rows.every((r) => !r.short && !r.session_short);
+        const sum = [];
+        if (g.running) sum.push(`运行中 ${g.running}`);
+        if (g.known - g.running > 0) sum.push(`已结束 ${g.known - g.running}`);
+        if (g.rows.length - g.known > 0) sum.push(`未获取 ${g.rows.length - g.known}`);
+        const sessions = g.rows.map((t) => {
+          const short = t.session_short || t.short || "";
+          const on = active && taskRef(t) === taskRef(currentTask());
+          return `
+          <div class="sess ${on ? "on" : ""}" data-ref="${escapeHtml(short)}" data-sid="${escapeHtml(t.sandbox_id || "")}">
+            <div class="r1">
+              <span><span class="no">${short ? "/" + escapeHtml(short) : "无短号"}</span> ${sessionStatusBadge(t.status)}</span>
+              <span class="meta" title="${escapeHtml(t.recorded_at || "")}">${escapeHtml(fmtShortTime(t.recorded_at))}</span>
             </div>
-            <div style="font-size:13px;margin-top:4px">${escapeHtml(label)}</div>
-            <div class="meta"><span>${escapeHtml(sid.slice(0, 8))}${sid.length > 8 ? "…" : ""}</span><span>${escapeHtml(t.source || "local")}</span></div>
-          </button>`;
+            <div class="r2">
+              <span class="tt">${escapeHtml(t.task_id || (t.label || ""))}</span>
+              <span class="ops">
+                ${short ? `<span class="b act-status" data-ref="${escapeHtml(short)}">获取状态</span>` : ""}
+                ${short ? `<span class="b warn act-del" data-ref="${escapeHtml(short)}">删除会话</span>` : ""}
+              </span>
+            </div>
+          </div>`;
+        }).join("");
+        return `
+        <div class="sb ${active ? "on" : ""}">
+          <div class="sb-hd"><span class="sid">env ${escapeHtml((g.sid || "").slice(0, 12))}${(g.sid || "").length > 12 ? "…" : ""}</span><span class="meta">${g.rows.length} 会话${remote ? " · 远端" : ""}</span></div>
+          ${sum.length ? `<div class="st">${sum.join(" · ")}</div>` : ""}
+          <div class="acts">
+            <button class="btn i act-view" data-sid="${escapeHtml(g.sid)}">查看文件</button>
+            <button class="btn act-clean" data-sid="${escapeHtml(g.sid)}">清理会话</button>
+            <button class="btn d act-delsb" data-sid="${escapeHtml(g.sid)}">删除沙盒</button>
+          </div>
+          ${sessions}
+          ${remote ? '<div class="hint">用 /agnew &lt;sandbox_id&gt; &lt;任务文本&gt; 可在此沙盒开启首个会话</div>' : ""}
+        </div>`;
       }).join("");
-      $("taskList").querySelectorAll(".task").forEach((el) => {
+      $("taskList").innerHTML = html;
+      $("taskList").querySelectorAll(".act-view").forEach((el) => {
+        el.addEventListener("click", () => selectSandbox(el.dataset.sid));
+      });
+      $("taskList").querySelectorAll(".sb-hd").forEach((el) => {
         el.addEventListener("click", () => {
-          state.taskIdx = Number(el.dataset.i);
+          const card = el.closest(".sb");
+          const sid = card && card.querySelector(".act-view");
+          if (sid) selectSandbox(sid.dataset.sid);
+        });
+      });
+      $("taskList").querySelectorAll(".sess").forEach((el) => {
+        el.addEventListener("click", () => {
+          const idx = state.tasks.findIndex((t) => (t.session_short || t.short || "") === el.dataset.ref && (t.sandbox_id || "") === el.dataset.sid);
+          if (idx < 0) return;
+          state.taskIdx = idx;
           state.selected.clear();
           state.currentPath = "workspace";
           renderTasks();
           loadFiles();
         });
       });
+      $("taskList").querySelectorAll(".act-status").forEach((el) => {
+        el.addEventListener("click", (e) => { e.stopPropagation(); fetchSessionStatus(el.dataset.ref); });
+      });
+      $("taskList").querySelectorAll(".act-del").forEach((el) => {
+        el.addEventListener("click", (e) => { e.stopPropagation(); openDeleteSessionModal(el.dataset.ref); });
+      });
+      $("taskList").querySelectorAll(".act-delsb").forEach((el) => {
+        el.addEventListener("click", (e) => { e.stopPropagation(); state.pendingDeleteSandbox = el.dataset.sid; openDeleteSandboxModal(); });
+      });
+      $("taskList").querySelectorAll(".act-clean").forEach((el) => {
+        el.addEventListener("click", (e) => { e.stopPropagation(); cleanupSessions(el.dataset.sid); });
+      });
+    }
+
+    function selectSandbox(sid) {
+      const idx = state.tasks.findIndex((t) => (t.sandbox_id || "") === sid);
+      if (idx < 0) return;
+      state.taskIdx = idx;
+      state.selected.clear();
+      state.currentPath = "workspace";
+      renderTasks();
+      loadFiles();
+    }
+
+    async function fetchSessionStatus(ref) {
+      if (!ref) { toast("请先选择会话"); return; }
+      try {
+        const data = await state.bridge.apiPost("sandbox-files/session/status", { ref });
+        const ok = data && data.ok;
+        toast(ok ? ("已获取并记录：" + (data.status || "")) : ("获取失败: " + (data && data.message)));
+        await loadTasks({ keepSelection: true });
+      } catch (e) {
+        toast("获取失败: " + errMsg(e));
+      }
+    }
+
+    async function cleanupSessions(sid) {
+      try {
+        const data = await state.bridge.apiPost("sandbox-files/session/cleanup", { sandbox_id: sid || "" });
+        const ok = data && data.ok;
+        toast(ok ? (data.message || "已清理") : ("清理失败: " + (data && data.message)));
+        if (ok) await loadTasks({ keepSelection: true });
+      } catch (e) {
+        toast("清理失败: " + errMsg(e));
+      }
     }
 
     function fileApiPath(f) {
@@ -517,6 +745,111 @@
       return p;
     }
 
+    // 纯函数：按根目录/非根目录把文件分成用户可见与系统两类。
+    function splitFileEntries(files) {
+      const isRoot = !normalizeRelPath(state.currentPath);
+      const userEntries = [];
+      const sysEntries = [];
+      if (isRoot) {
+        for (const f of files) {
+          (isSystemEntry(f) ? sysEntries : userEntries).push(f);
+        }
+      } else {
+        userEntries.push(...files);
+      }
+      return { isRoot, userEntries, sysEntries };
+    }
+
+    // 纯函数：渲染单行（目录/文件、系统标记、选中态）。
+    function renderFileRow(f, isSys) {
+      const path = fileApiPath(f);
+      const isDir = String(f.type || "").toLowerCase() === "directory" || String(f.type || "").toLowerCase() === "dir";
+      const checked = state.selected.has(path) ? "checked" : "";
+      const dis = isDir ? "disabled" : "";
+      const size = f.size_bytes != null ? f.size_bytes : f.size;
+      const targetDirPath = isDir ? resolveDirPath(path) : "";
+      const rowStyle = isSys ? 'style="opacity:.65"' : '';
+      const nameClass = isDir ? 'name row-enter' : 'name';
+      const nameCursor = isDir ? 'cursor:pointer;' : '';
+      const nameColor = isDir ? 'color:var(--primary);font-weight:600;' : '';
+      return `
+          <tr data-path="${escapeHtml(path)}" ${rowStyle}>
+            <td><input class="check row-check" type="checkbox" data-path="${escapeHtml(path)}" ${checked} ${dis} /></td>
+            <td>
+              <div class="${nameClass}" data-dir="${escapeHtml(targetDirPath)}" style="${nameCursor}">
+                ${isDir ? "📂" : "📄"} <span class="mono" style="${nameColor}">${escapeHtml(f.name || path)}</span>
+                ${isSys ? '<span class="badge" style="margin-left:4px;font-size:10px;opacity:.75">系统</span>' : ''}
+              </div>
+              <div class="mono" style="color:var(--muted);font-size:11px;margin-top:2px">${escapeHtml(path)}</div>
+            </td>
+            <td>${escapeHtml(isDir ? "directory" : (f.type || "file"))}</td>
+            <td class="mono">${fmtSize(size)}</td>
+            <td class="mono">${fmtTime(f.modified)}</td>
+            <td>
+              ${isDir
+                ? `<button class="btn btn-sm row-enter" type="button" data-dir="${escapeHtml(targetDirPath)}" title="进入目录">进入</button>`
+                : `<button class="btn btn-sm btn-primary row-dl" type="button" data-path="${escapeHtml(path)}" data-name="${escapeHtml(f.name || path)}">下载</button>`}
+            </td>
+          </tr>`;
+    }
+
+    // 纯函数：把可见/系统条目拼成表格 HTML。
+    function buildFileRowsHtml() {
+      const { isRoot, userEntries, sysEntries } = splitFileEntries(state.files);
+      let rowsHtml = userEntries.map((f) => renderFileRow(f, false)).join("");
+      if (isRoot && sysEntries.length > 0) {
+        if (state.hideSystemDirs) {
+          rowsHtml += `
+            <tr id="rowExpandSys" style="cursor:pointer;background:color-mix(in srgb, var(--surface) 92%, var(--chip));">
+              <td colspan="6" style="text-align:center;padding:12px 10px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--border-soft);">
+                📁 已折叠 ${sysEntries.length} 个系统目录/文件（.agents、usr、etc 等） · <span style="color:var(--primary);text-decoration:underline;font-weight:600">点击展开</span>
+              </td>
+            </tr>`;
+        } else {
+          rowsHtml += `
+            <tr id="rowCollapseSys" style="cursor:pointer;background:color-mix(in srgb, var(--surface) 92%, var(--chip));">
+              <td colspan="6" style="text-align:center;padding:8px 10px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--border-soft);">
+                📁 系统目录已展开（${sysEntries.length} 项） · <span style="color:var(--primary);text-decoration:underline">点击折叠</span>
+              </td>
+            </tr>`;
+          rowsHtml += sysEntries.map((f) => renderFileRow(f, true)).join("");
+        }
+      }
+      return { rowsHtml, isRoot, sysEntries };
+    }
+
+    // 事件绑定：行点击、勾选、单行下载、系统目录展开折叠。
+    function bindFileRowEvents() {
+      const expEl = $("rowExpandSys");
+      if (expEl) expEl.addEventListener("click", () => { state.hideSystemDirs = false; renderFiles(); });
+      const colEl = $("rowCollapseSys");
+      if (colEl) colEl.addEventListener("click", () => { state.hideSystemDirs = true; renderFiles(); });
+
+      $("fileBody").querySelectorAll(".row-enter").forEach((el) => {
+        el.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const target = el.dataset.dir;
+          if (target != null) navigateTo(target);
+        });
+      });
+
+      $("fileBody").querySelectorAll(".row-check").forEach((c) => {
+        c.addEventListener("change", () => {
+          if (c.checked) state.selected.add(c.dataset.path);
+          else state.selected.delete(c.dataset.path);
+          $("selMeta").textContent = "已选 " + state.selected.size;
+          $("btnDl").disabled = state.selected.size === 0;
+          syncCheckAll();
+        });
+      });
+
+      $("fileBody").querySelectorAll(".row-dl").forEach((b) => {
+        b.addEventListener("click", () => enqueueDownload([{ path: b.dataset.path, name: b.dataset.name }]));
+      });
+      syncCheckAll();
+    }
+
+    // 渲染外壳：空态/徽标/共享提示/面包屑交给各 helper，表格与事件解耦。
     function renderFiles() {
       const t = currentTask();
       const empty = $("fileEmpty");
@@ -530,13 +863,19 @@
         setFileControlsEnabled(false);
         $("selMeta").textContent = "已选 0";
         if (btnToggleSys) btnToggleSys.style.display = "none";
-        $("dropzone").textContent = "选择左侧沙盒后，拖拽文件到此处上传";
+        $("dropzone").textContent = "选择左侧会话任务后，拖拽文件到此处上传";
+        $("sharedNote").style.display = "none";
         return;
       }
       setFileControlsEnabled(true);
       empty.style.display = "none";
       const sid = t.sandbox_id || "";
-      $("envBadge").textContent = "env · " + (sid.slice(0, 12) + (sid.length > 12 ? "…" : ""));
+      const short = t.session_short || t.short || "";
+      $("envBadge").textContent = "会话 /" + (short || "未选") + " · env " + (sid.slice(0, 12) + (sid.length > 12 ? "…" : ""));
+      $("envBadge").title = "沙盒 " + sid + (short ? " · 会话 /" + short : "");
+      const related = sandboxTasks(t).length;
+      $("sharedNote").style.display = "block";
+      $("sharedNote").textContent = (related > 1 ? `此沙盒关联 ${related} 个会话任务：会话上下文独立，文件共同使用。` : "此处显示所选会话所在沙盒的文件。") + "删除会话只移除该会话记录、不动文件；删除沙盒会连同共享文件与全部会话一起删除。";
       renderBreadcrumbs();
       $("selMeta").textContent = "已选 " + state.selected.size;
       $("btnDl").disabled = state.selected.size === 0;
@@ -561,79 +900,12 @@
         return;
       }
 
-      const isRoot = !normalizeRelPath(state.currentPath);
-      let userEntries = [];
-      let sysEntries = [];
-
-      if (isRoot) {
-        for (const f of state.files) {
-          if (isSystemEntry(f)) {
-            sysEntries.push(f);
-          } else {
-            userEntries.push(f);
-          }
-        }
-      } else {
-        userEntries = [...state.files];
-      }
-
+      const { rowsHtml, isRoot, sysEntries } = buildFileRowsHtml();
       if (isRoot && sysEntries.length > 0) {
         btnToggleSys.style.display = "inline-flex";
         btnToggleSys.textContent = state.hideSystemDirs ? `系统目录: 折叠(${sysEntries.length})` : `系统目录: 展开(${sysEntries.length})`;
       } else {
         btnToggleSys.style.display = "none";
-      }
-
-      function renderRow(f, isSys) {
-        const path = fileApiPath(f);
-        const isDir = String(f.type || "").toLowerCase() === "directory" || String(f.type || "").toLowerCase() === "dir";
-        const checked = state.selected.has(path) ? "checked" : "";
-        const dis = isDir ? "disabled" : "";
-        const size = f.size_bytes != null ? f.size_bytes : f.size;
-        const targetDirPath = isDir ? resolveDirPath(path) : "";
-        const rowStyle = isSys ? 'style="opacity:.65"' : '';
-        const nameClass = isDir ? 'name row-enter' : 'name';
-        const nameCursor = isDir ? 'cursor:pointer;' : '';
-        const nameColor = isDir ? 'color:var(--primary);font-weight:600;' : '';
-        return `
-          <tr data-path="${escapeHtml(path)}" ${rowStyle}>
-            <td><input class="check row-check" type="checkbox" data-path="${escapeHtml(path)}" ${checked} ${dis} /></td>
-            <td>
-              <div class="${nameClass}" data-dir="${escapeHtml(targetDirPath)}" style="${nameCursor}">
-                ${isDir ? "📂" : "📄"} <span class="mono" style="${nameColor}">${escapeHtml(f.name || path)}</span>
-                ${isSys ? '<span class="badge" style="margin-left:4px;font-size:10px;opacity:.75">系统</span>' : ''}
-              </div>
-              <div class="mono" style="color:var(--muted);font-size:11px;margin-top:2px">${escapeHtml(path)}</div>
-            </td>
-            <td>${escapeHtml(isDir ? "directory" : (f.type || "file"))}</td>
-            <td class="mono">${fmtSize(size)}</td>
-            <td>
-              ${isDir
-                ? `<button class="btn btn-sm row-enter" type="button" data-dir="${escapeHtml(targetDirPath)}" title="进入目录">进入</button>`
-                : `<button class="btn btn-sm btn-primary row-dl" type="button" data-path="${escapeHtml(path)}" data-name="${escapeHtml(f.name || path)}">下载</button>`}
-            </td>
-          </tr>`;
-      }
-
-      let rowsHtml = userEntries.map((f) => renderRow(f, false)).join("");
-
-      if (isRoot && sysEntries.length > 0) {
-        if (state.hideSystemDirs) {
-          rowsHtml += `
-            <tr id="rowExpandSys" style="cursor:pointer;background:color-mix(in srgb, var(--surface) 92%, var(--chip));">
-              <td colspan="5" style="text-align:center;padding:12px 10px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--border-soft);">
-                📁 已折叠 ${sysEntries.length} 个系统目录/文件（.agents、usr、etc 等） · <span style="color:var(--primary);text-decoration:underline;font-weight:600">点击展开</span>
-              </td>
-            </tr>`;
-        } else {
-          rowsHtml += `
-            <tr id="rowCollapseSys" style="cursor:pointer;background:color-mix(in srgb, var(--surface) 92%, var(--chip));">
-              <td colspan="5" style="text-align:center;padding:8px 10px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--border-soft);">
-                📁 系统目录已展开（${sysEntries.length} 项） · <span style="color:var(--primary);text-decoration:underline">点击折叠</span>
-              </td>
-            </tr>`;
-          rowsHtml += sysEntries.map((f) => renderRow(f, true)).join("");
-        }
       }
 
       if (!rowsHtml) {
@@ -644,33 +916,7 @@
       }
 
       $("fileBody").innerHTML = rowsHtml;
-
-      const expEl = $("rowExpandSys");
-      if (expEl) expEl.addEventListener("click", () => { state.hideSystemDirs = false; renderFiles(); });
-      const colEl = $("rowCollapseSys");
-      if (colEl) colEl.addEventListener("click", () => { state.hideSystemDirs = true; renderFiles(); });
-
-      $("fileBody").querySelectorAll(".row-enter").forEach((el) => {
-        el.addEventListener("click", (e) => {
-          e.stopPropagation();
-          const target = el.dataset.dir;
-          if (target != null) navigateTo(target);
-        });
-      });
-
-      $("fileBody").querySelectorAll(".row-check").forEach((c) => {
-        c.addEventListener("change", () => {
-          if (c.checked) state.selected.add(c.dataset.path);
-          else state.selected.delete(c.dataset.path);
-          $("selMeta").textContent = "已选 " + state.selected.size;
-          $("btnDl").disabled = state.selected.size === 0;
-          syncCheckAll();
-        });
-      });
-      $("fileBody").querySelectorAll(".row-dl").forEach((b) => {
-        b.addEventListener("click", () => enqueueDownload([{ path: b.dataset.path, name: b.dataset.name }]));
-      });
-      syncCheckAll();
+      bindFileRowEvents();
     }
 
     function syncCheckAll() {
@@ -711,7 +957,7 @@
             <div>
               ${canCancel ? `<button class="btn btn-sm btn-danger x-cancel" type="button" data-id="${x.id}">取消</button>` : ""}
             </div>
-            <div class="stats">${x.indeterminate && x.status === "running" ? "…" : (pct + "%")} · ${escapeHtml(x.speed || "—")}</div>
+            <div class="stats">${x.indeterminate && x.status === "running" ? "…" : (pct + "%")} · ${escapeHtml(x.speed || "—")} · ref ${escapeHtml(x.ref || x.sandbox_id)}</div>
             <div class="bar ${barClass}"><i style="width:${pct}%"></i></div>
           </div>`;
       }).join("");
@@ -753,6 +999,7 @@
           indeterminate: true,
           cancelled: false,
           sandbox_id: t.sandbox_id,
+          ref: taskRef(t),
         });
       }
       renderTransfers();
@@ -776,7 +1023,6 @@
           kind: "upload",
           path: destPath,
           name: file.name,
-          size: file.size || 0,
           loaded: 0,
           pct: 0,
           speed: "等待中",
@@ -784,6 +1030,7 @@
           indeterminate: true,
           cancelled: false,
           sandbox_id: t.sandbox_id,
+          ref: taskRef(t),
           file,
         });
       }
@@ -819,6 +1066,7 @@
     async function startTransfer(x) {
       if (x.cancelled) {
         x.status = "cancelled";
+        x.file = null;
         renderTransfers();
         return;
       }
@@ -829,7 +1077,8 @@
       state.active += 1;
       renderTransfers();
       const started = performance.now();
-      const cancelGate = attachCancelGate(x);
+      // 只有上传需要 gate：下载取消由 pullDownload 的 done Promise 承接。
+      const cancelGate = x.kind === "upload" ? attachCancelGate(x) : null;
       let tick = null;
       if (x.kind === "upload") {
         tick = setInterval(() => {
@@ -847,20 +1096,22 @@
         if (!state.bridge) throw new Error("Plugin bridge 未就绪");
         let work;
         if (x.kind === "upload") {
+          // 上传只能整体中断：Promise.race 另一方是 cancelGate（_cancelGate）。
           work = state.bridge.upload(
-            "sandbox-files/upload/" + encodeURIComponent(x.sandbox_id) + "?path=" + encodeURIComponent(x.path),
+            uploadEndpoint(x.sandbox_id, x.path, x.ref),
             x.file
           );
         } else {
-          work = pullDownload(x, cancelGate);
+          // 下载取消走 pullDownload 内部 done Promise：cancelTransfer 调
+          // x._finishPull 直接拒绝它，并把 job_id 通知服务端停任务。
+          work = pullDownload(x);
         }
         if (x.kind === "upload") {
           work.catch(() => {});
           await Promise.race([work, cancelGate]);
         } else {
           await work;
-        }
-        if (x.cancelled) throw Object.assign(new Error("cancelled"), { code: "CANCELLED" });
+        }        if (x.cancelled) throw Object.assign(new Error("cancelled"), { code: "CANCELLED" });
         const elapsed = (performance.now() - started) / 1000;
         x.pct = 100;
         x.status = "done";
@@ -889,6 +1140,8 @@
           state.bridge.unsubscribeSSE(sub).catch(() => {});
         }
         x._cancelGate = null;
+        // 终态不再需要 Blob 引用：只留文件名用于展示，避免大文件常驻内存。
+        x.file = null;
         state.active = Math.max(0, state.active - 1);
         renderTransfers();
         pumpQueue();
@@ -912,6 +1165,7 @@
 
     async function pullDownload(x) {
       const started = await state.bridge.apiPost("sandbox-files/pull", {
+        ref: x.ref,
         sandbox_id: x.sandbox_id,
         path: x.path,
         size_bytes: x.size || 0,
@@ -992,40 +1246,48 @@
 
     async function loadTasks({ keepSelection = true } = {}) {
       if (!state.bridge) return;
+      const requestId = ++state.tasksRequestId;
       try {
         const data = unwrapData(await state.bridge.apiGet("sandbox-files/tasks"));
+        if (requestId !== state.tasksRequestId) return;
         const tasks = (data && data.tasks) || (Array.isArray(data) ? data : []) || [];
-        const prevId = keepSelection && currentTask() ? currentTask().sandbox_id : "";
+        const prevKey = keepSelection ? taskKey(currentTask()) : "";
         state.tasks = Array.isArray(tasks) ? tasks : [];
-        if (prevId) {
-          const idx = state.tasks.findIndex((t) => t.sandbox_id === prevId);
-          state.taskIdx = idx >= 0 ? idx : (state.tasks.length ? 0 : -1);
-        } else {
-          state.taskIdx = state.tasks.length ? 0 : -1;
-        }
-        renderTasks();
-        if (state.taskIdx >= 0) await loadFiles({ silent: true });
-        else {
+        const idx = prevKey ? state.tasks.findIndex((t) => taskKey(t) === prevKey) : -1;
+        state.taskIdx = idx >= 0 ? idx : (state.tasks.length ? 0 : -1);
+        if (taskKey(currentTask()) !== prevKey) {
           state.files = [];
           state.selected.clear();
-          renderFiles();
+          state.currentPath = "workspace";
         }
+        renderTasks();
+        await loadFiles({ silent: true });
       } catch (e) {
+        if (requestId !== state.tasksRequestId) return;
         toast("加载任务失败: " + errMsg(e));
         state.tasks = [];
         state.taskIdx = -1;
+        state.files = [];
+        state.selected.clear();
+        state.filesRequestId += 1;
+        state.loadingFiles = false;
         renderTasks();
         renderFiles();
       }
     }
 
     async function loadFiles({ silent = false } = {}) {
+      const requestId = ++state.filesRequestId;
       const t = currentTask();
       if (!t || !state.bridge) {
         state.files = [];
+        state.loadingFiles = false;
         renderFiles();
         return;
       }
+      const key = taskKey(t);
+      const ref = taskRef(t);
+      const isCurrent = () => requestId === state.filesRequestId && taskKey(currentTask()) === key;
       state.loadingFiles = true;
       renderFiles();
       try {
@@ -1033,17 +1295,19 @@
         let res;
         try {
           res = unwrapData(await state.bridge.apiGet("sandbox-files/files", {
+            ref,
             sandbox_id: t.sandbox_id,
             path: reqPath,
             recursive: "1",
           }));
         } catch (err) {
+          if (!isCurrent()) return;
           const msg = errMsg(err).toLowerCase();
           const isNotFound = msg.includes("404") || msg.includes("not_found") || msg.includes("not found") || msg.includes("不存在");
           if (reqPath === "workspace" && isNotFound) {
             reqPath = "";
-            state.currentPath = "";
             res = unwrapData(await state.bridge.apiGet("sandbox-files/files", {
+              ref,
               sandbox_id: t.sandbox_id,
               path: "",
               recursive: "1",
@@ -1052,52 +1316,87 @@
             throw err;
           }
         }
-        if (res && typeof res.path === "string") {
-          state.currentPath = normalizeRelPath(res.path);
-        }
+        if (!isCurrent()) return;
+        state.currentPath = res && typeof res.path === "string" ? normalizeRelPath(res.path) : reqPath;
         state.files = (res && res.files) || [];
-        // drop selected paths that no longer exist
+        // 移除已不存在的选中文件。
         const alive = new Set(state.files.map(fileApiPath));
         state.selected = new Set([...state.selected].filter((p) => alive.has(p)));
         if (!silent) toast("已刷新文件列表");
       } catch (e) {
+        if (!isCurrent()) return;
         state.files = [];
         if (!silent) toast("加载文件失败: " + errMsg(e));
       } finally {
-        state.loadingFiles = false;
-        renderFiles();
+        if (isCurrent()) {
+          state.loadingFiles = false;
+          renderFiles();
+        }
       }
     }
 
-    function openDeleteModal() {
-      const t = currentTask();
-      if (!t) return;
+    function openDeleteSandboxModal() {
+      const sid = state.pendingDeleteSandbox || selectedSandboxId();
+      if (!sid) { toast("请先选择沙盒"); return; }
+      const rows = state.tasks.filter((t) => (t.sandbox_id || "") === sid);
+      const shorts = rows.map((row) => row.session_short || row.short).filter(Boolean);
+      const ref = shorts[0] || sid;
+      state.deleteTarget = { ref, sandbox_id: sid, count: rows.length, shorts: shorts.join("、") };
       state.deleteStep = 1;
-      const label = t.short || t.label || t.sandbox_id;
-      $("deleteMsg").textContent = "即将删除沙盒「" + label + "」（" + (t.sandbox_id || "").slice(0, 12) + "…）。将移除远端环境并清理本地短号。请再次确认。";
+      $("deleteMsg").textContent = `即将删除整个沙盒「${sid}」，不是仅删除所选会话。远端环境与共享文件将被删除，全部 ${rows.length} 个关联会话任务及短号${shorts.length ? "（" + shorts.join("、") + "）" : ""}都将移除。请再次确认。`;
       $("deleteConfirm").textContent = "下一步";
       $("deleteModal").classList.add("show");
     }
 
     function closeDeleteModal() {
       state.deleteStep = 0;
+      state.deleteTarget = null;
+      state.pendingDeleteSandbox = "";
       $("deleteModal").classList.remove("show");
       $("deleteConfirm").textContent = "确认删除";
     }
 
+    function openDeleteSessionModal(ref) {
+      if (!ref) { toast("请先选择会话"); return; }
+      state.sessionDeleteRef = ref;
+      $("sessionDelConfirm").disabled = false;
+      $("sessionDelModal").classList.add("show");
+    }
+
+    function closeDeleteSessionModal() {
+      state.sessionDeleteRef = "";
+      $("sessionDelModal").classList.remove("show");
+    }
+
+    async function confirmDeleteSession() {
+      const ref = state.sessionDeleteRef;
+      if (!ref) { closeDeleteSessionModal(); return; }
+      $("sessionDelConfirm").disabled = true;
+      try {
+        const data = await state.bridge.apiPost("sandbox-files/session/delete", { ref });
+        const ok = data && data.ok;
+        toast((data && data.message) || (ok ? "已删除会话" : "删除未完成"));
+        closeDeleteSessionModal();
+        if (ok) await loadTasks({ keepSelection: true });
+      } catch (e) {
+        toast("删除失败: " + errMsg(e));
+      } finally {
+        $("sessionDelConfirm").disabled = false;
+      }
+    }
+
     async function confirmDelete() {
-      const t = currentTask();
-      if (!t) { closeDeleteModal(); return; }
+      const target = state.deleteTarget;
+      if (!target) { closeDeleteModal(); return; }
       if (state.deleteStep < 2) {
         state.deleteStep = 2;
-        $("deleteMsg").textContent = "最后确认：删除后不可恢复。确定删除「" + (t.short || t.label || t.sandbox_id) + "」吗？";
-        $("deleteConfirm").textContent = "确定删除";
+        $("deleteMsg").textContent = `最后确认：整个沙盒「${target.sandbox_id}」及其共享文件将永久删除，全部 ${target.count} 个关联会话任务和短号${target.shorts ? "（" + target.shorts + "）" : ""}都将移除，不可恢复。确定继续吗？`;
+        $("deleteConfirm").textContent = "删除整个沙盒";
         return;
       }
       $("deleteConfirm").disabled = true;
       try {
-        const ref = t.short || t.sandbox_id;
-        const data = await state.bridge.apiPost("sandbox-files/delete", { ref });
+        const data = await state.bridge.apiPost("sandbox-files/delete", { ref: target.ref });
         const ok = data && data.ok;
         toast((data && data.message) || (ok ? "已删除" : "删除未完成"));
         closeDeleteModal();
@@ -1135,11 +1434,18 @@
         renderFiles();
       });
       $("btnReloadTasks").addEventListener("click", () => loadTasks());
-      $("btnDelete").addEventListener("click", openDeleteModal);
+      $("btnDelete").addEventListener("click", () => { state.pendingDeleteSandbox = ""; openDeleteSandboxModal(); });
+      $("btnStatus").addEventListener("click", () => fetchSessionStatus(taskRef(currentTask())));
+      $("btnSessionDel").addEventListener("click", () => openDeleteSessionModal(taskRef(currentTask())));
       $("deleteCancel").addEventListener("click", closeDeleteModal);
       $("deleteConfirm").addEventListener("click", confirmDelete);
       $("deleteModal").addEventListener("click", (e) => {
         if (e.target === $("deleteModal")) closeDeleteModal();
+      });
+      $("sessionDelCancel").addEventListener("click", closeDeleteSessionModal);
+      $("sessionDelConfirm").addEventListener("click", confirmDeleteSession);
+      $("sessionDelModal").addEventListener("click", (e) => {
+        if (e.target === $("sessionDelModal")) closeDeleteSessionModal();
       });
       $("fileInput").addEventListener("change", (e) => {
         enqueueUpload(e.target.files);

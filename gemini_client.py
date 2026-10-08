@@ -9,6 +9,8 @@ Direct Gemini REST only (no local WebUI, no protocol gateway):
   GET  https://generativelanguage.googleapis.com/v1beta/environments/{id}/files/{path}?alt=media
   PUT  https://generativelanguage.googleapis.com/upload/v1beta/environments/{id}/files/{path}
   GET  https://generativelanguage.googleapis.com/v1beta/files/{resourceId}:download?alt=media
+  POST https://generativelanguage.googleapis.com/v1beta/credentials
+  PATCH https://generativelanguage.googleapis.com/v1beta/credentials/{id}
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -40,17 +42,11 @@ except ImportError:  # local syntax tests without AstrBot installed
 
 GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 GEMINI_ENVIRONMENTS_URL = "https://generativelanguage.googleapis.com/v1beta/environments"
-GEMINI_FILES_BASE = "https://generativelanguage.googleapis.com/v1beta/files"
-DEFAULT_AGENT = "antigravity-preview-05-2026"
+GEMINI_CREDENTIALS_URL = "https://generativelanguage.googleapis.com/v1beta/credentials"
+IMAGE_HOST_CREDENTIAL_ID = "astrbot-image-host"
+CREDENTIAL_TIMEOUT = 30.0
+DEFAULT_AGENT = "antigravity-preview-09-2026"
 GEMINI_MODEL_PREFIX = "gemini"
-ALLOWED_MODELS = (
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-)
-DEFAULT_MODEL = "gemini-3.8-flash"
 AUTO_MODEL_ALIASES = frozenset({"", "auto"})
 INLINE_PER_FILE_LIMIT = 1 * 1024 * 1024
 INLINE_TOTAL_LIMIT = 2 * 1024 * 1024
@@ -85,12 +81,16 @@ TERMINAL_STATUS = frozenset(
 )
 RUNNING_STATUS = frozenset({"in_progress", "queued"})
 
-CHAT_PULL_MAX_BYTES = 20 * 1024 * 1024
+# 续接附件写入沙盒的上限。聊天拉取（/agget、get_sandbox_task）不走这里，大小由配置决定。
+CONTINUE_PUT_MAX_BYTES = 20 * 1024 * 1024
 CHAT_PULL_TIMEOUT_SECONDS = 90.0
+# /agget 不设总超时。下载字节数连续这么久不增加，就中止并建议换方式。
+AGGET_STALL_SECONDS = 10 * 60.0
 UI_PULL_CONCURRENCY = 2
 UI_PULL_PROGRESS_INTERVAL = 0.5
 DEFAULT_RECEIPT_TRUNCATE_CHARS = 2000
-DEFAULT_IN_PROGRESS_PER_KEY = 1
+DEFAULT_IN_PROGRESS_PER_KEY = 4
+DEFAULT_PULL_PROGRESS_MB = 40
 
 MSG_NO_CAPACITY = "目前无空余沙盒分配"
 MSG_ENV_404 = "沙盒环境不存在或已过期。"
@@ -98,7 +98,7 @@ MSG_KEY_INVALID = "API Key 无效或没有权限。"
 MSG_PULL_TIMEOUT = "拉取超时（90 秒），已中止。请改用图床或 WebUI 获取。"
 MSG_LIST_EMPTY = "该沙盒文件列表为空。"
 MSG_FILE_MISSING = "沙盒中没有这个文件。"
-MSG_FILE_TOO_LARGE = "文件超过 20MB，请使用图床或 WebUI 获取。"
+MSG_FILE_TOO_LARGE = "文件超过大小上限，请使用图床或 WebUI 获取。"
 
 OnStorageQuota = Callable[[str], Awaitable[int]]
 
@@ -304,6 +304,91 @@ def clip_text(text: str, limit: int, *, keep_full: bool) -> str:
     return body[:cap] + "\n…(过长已截断，全文见下方链接)"
 
 
+def format_bytes(n: int) -> str:
+    size = float(max(0, int(n or 0)))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} GB"
+
+
+def file_too_large_message(max_bytes: int) -> str:
+    """User-facing cap message. Whole megabytes stay as '20MB'."""
+    if max_bytes > 0 and max_bytes % (1024 * 1024) == 0:
+        label = f"{max_bytes // (1024 * 1024)}MB"
+    else:
+        label = format_bytes(max_bytes)
+    return f"文件超过 {label}，请使用图床或 WebUI 获取。"
+
+
+def pull_limit_bytes(megabytes: Any) -> int | None:
+    """Config megabytes → byte cap. 0, negative, or unparsable means no limit."""
+    try:
+        mb = int(megabytes)
+    except (TypeError, ValueError):
+        return None
+    if mb <= 0:
+        return None
+    return mb * 1024 * 1024
+
+
+def pull_progress_step_bytes(megabytes: Any, *, enabled: bool = True) -> int:
+    """Bytes between chat-pull progress messages. 0 disables reporting."""
+    if not enabled:
+        return 0
+    try:
+        mb = int(megabytes)
+    except (TypeError, ValueError):
+        mb = DEFAULT_PULL_PROGRESS_MB
+    if mb < 1:
+        mb = DEFAULT_PULL_PROGRESS_MB
+    return mb * 1024 * 1024
+
+
+def agget_stall_message(seconds: float = AGGET_STALL_SECONDS) -> str:
+    minutes = max(1, int(float(seconds) // 60))
+    return f"拉取已中止：{minutes} 分钟没有新的下载进度。建议改用图床或 WebUI 获取。"
+
+
+def format_pull_progress(short: str, name: str, loaded: int, total: int | None) -> str:
+    label = (name or "").strip() or "文件"
+    if total and total > 0:
+        size = f"{format_bytes(loaded)} / {format_bytes(total)}"
+    else:
+        size = f"已下载 {format_bytes(loaded)}"
+    if short:
+        return f"任务编号 {short} 正在拉取 {label}：{size}"
+    return f"正在拉取 {label}：{size}"
+
+
+class PullProgress:
+    """Fire once each time a chat pull crosses another `step` bytes.
+
+    A known size below `step` never fires. Unknown size (0 / None) fires only
+    after the download itself crosses `step`, so a smaller file stays silent.
+    """
+
+    def __init__(self, step: int, known_size: int | None = None) -> None:
+        self.step = int(step or 0)
+        known = int(known_size or 0)
+        self.known = known if known > 0 else None
+        if self.step > 0 and self.known is not None and self.known < self.step:
+            self.step = 0
+        self._next = self.step
+
+    def marks(self, loaded: int) -> list[int]:
+        if self.step <= 0:
+            return []
+        found: list[int] = []
+        while loaded >= self._next:
+            found.append(self._next)
+            self._next += self.step
+        return found
+
+
 def files_error_kind(status_code: int | None, message: str, *, listing: bool) -> str:
     """Map an environment-files failure onto a fixed reply kind."""
     text = (message or "").lower()
@@ -352,15 +437,16 @@ def build_httpx_client_kwargs(
     proxy: str = "",
     use_proxy: bool = False,
     headers: dict[str, str] | None = None,
+    follow_redirects: bool = True,
 ) -> dict[str, Any]:
     """Plugin HTTP options. trust_env is off so an empty proxy really means direct.
 
-    Image-host webhook calls pass use_proxy=False. Gemini calls pass use_proxy=True.
+    Gemini calls pass use_proxy=True. Pass follow_redirects=False for credential writes.
     """
     timeout_obj = timeout if isinstance(timeout, httpx.Timeout) else httpx.Timeout(timeout, connect=30.0)
     kwargs: dict[str, Any] = {
         "timeout": timeout_obj,
-        "follow_redirects": True,
+        "follow_redirects": bool(follow_redirects),
         "trust_env": False,
     }
     if headers:
@@ -369,27 +455,6 @@ def build_httpx_client_kwargs(
     if use_proxy and cleaned:
         kwargs["proxy"] = cleaned
     return kwargs
-
-
-async def consume_bounded(
-    chunks: Any,
-    *,
-    max_bytes: int | None = None,
-    cancel_event: Any = None,
-) -> bytes:
-    """Read an async byte stream, aborting on cancel or when max_bytes is crossed."""
-    total = 0
-    out: list[bytes] = []
-    async for chunk in chunks:
-        if cancel_event is not None and cancel_event.is_set():
-            raise GeminiPullCancelled("下载已取消")
-        if not chunk:
-            continue
-        if max_bytes is not None and total + len(chunk) > max_bytes:
-            raise GeminiFileTooLargeError(MSG_FILE_TOO_LARGE)
-        total += len(chunk)
-        out.append(chunk)
-    return b"".join(out)
 
 
 def normalize_environment_file_entry(item: dict[str, Any] | None) -> dict[str, Any]:
@@ -540,6 +605,86 @@ def sandbox_target_from_path(local_path: str) -> str:
     return f"/workspace/{name}"
 
 
+def is_reserved_upload_token_target(target: str) -> bool:
+    """True when a source target is the old plaintext token file, after path cleanup."""
+    text = (target or "").strip().replace("\\", "/")
+    while "//" in text:
+        text = text.replace("//", "/")
+    if not text.startswith("/") and not text.startswith("."):
+        text = f"/workspace/{Path(text).name}"
+    parts: list[str] = []
+    for part in text.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            return False
+        parts.append(part)
+    return "/".join(parts) == "workspace/upload.token"
+
+
+def webhook_upload_host(url: str) -> str:
+    """HTTPS host for the image-host webhook. Errors never include the raw URL."""
+    text = url or ""
+    if not text.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        raise GeminiClientError("图床上传地址无效。")
+    try:
+        parsed = urlparse(text.strip())
+        port = parsed.port
+    except ValueError:
+        raise GeminiClientError("图床上传地址无效。") from None
+    if (parsed.scheme or "").lower() != "https":
+        raise GeminiClientError("图床上传地址无效。")
+    if parsed.username or parsed.password:
+        raise GeminiClientError("图床上传地址无效。")
+    host = parsed.hostname or ""
+    if (
+        not host
+        or "*" in host
+        or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in host)
+    ):
+        raise GeminiClientError("图床上传地址无效。")
+    if port is not None and not 1 <= port <= 65535:
+        raise GeminiClientError("图床上传地址无效。")
+    return host
+
+
+def image_host_network(host: str, credential_id: str = IMAGE_HOST_CREDENTIAL_ID) -> dict[str, Any]:
+    """Allow all egress, and inject the bearer credential only on the upload host."""
+    return {
+        "allowlist": [
+            {"domain": host, "credential": credential_id},
+            {"domain": "*"},
+        ]
+    }
+
+
+def build_upload_instruction(
+    *,
+    names: list[str],
+    original_names: list[str],
+    webhook: str,
+    public_base: str,
+    prefix: str,
+) -> str:
+    """Prompt text for sandbox uploads. The token is not included."""
+    mapping = ", ".join(
+        f"{orig} -> {stamped}" for orig, stamped in zip(original_names, names)
+    )
+    return (
+        "\n\n【文件上传要求】任务完成后，将以下文件上传到图床："
+        + ", ".join(names)
+        + f"。原始文件名与上传文件名对应：{mapping}。"
+        f"上传接口：{webhook}；上传目录：{prefix}/；"
+        f"公网基础地址：{public_base.rstrip('/')}。"
+        "必须使用上述带时间戳前缀的文件名上传，禁止使用未加前缀的原始文件名，避免覆盖历史文件。"
+        "向该上传接口 POST 时不要设置 Authorization，平台会在请求离开沙盒时注入。"
+        "不要读取 /workspace/upload.token 或任何 Token 文件。"
+        "不要在命令输出、文件或回执里打印请求头。"
+        "文件后缀以调用方指定为准；如需上传大包，建议调用方指定 .tar.gz。"
+        "上传后用 GET 验证公网文件 URL 返回 200，并在最终回执中列出每个文件的公网 URL。"
+    )
+
+
 def resolve_model(raw: str | None) -> str:
     """Return a concrete model id, or empty string to omit agent_config.model."""
     model = (raw or "").strip()
@@ -564,6 +709,32 @@ def resolve_agent(raw: str | None) -> tuple[str, str]:
             f"已按默认 {DEFAULT_AGENT} 提交；底层模型请改「接入与模型」里的底层模型。"
         )
     return agent, ""
+
+
+def build_image_input_parts(images: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """把图片负载规范成 Interactions 的 input image 分节。
+
+    每一项是 {"data": <base64 字符串>, "mime_type": "image/png"}。
+    官方 Interactions API 只接受 text 和 image 输入，图片必须是 inline base64。
+    续接（previous_interaction_id）同样接受——这是往已有沙盒会话传图的唯一
+    可靠通道：Files PUT 目前服务端落 0 字节，environment_id + sources 会 400。
+    """
+    parts: list[dict[str, Any]] = []
+    for image in images or []:
+        if not isinstance(image, dict):
+            continue
+        data = str(image.get("data") or "").strip()
+        if not data:
+            continue
+        mime = str(image.get("mime_type") or image.get("mime") or "").strip()
+        parts.append(
+            {
+                "type": "image",
+                "mime_type": mime or "image/png",
+                "data": data,
+            }
+        )
+    return parts
 
 
 class GeminiSandboxClient:
@@ -604,19 +775,13 @@ class GeminiSandboxClient:
     def agent_label(self) -> str:
         return self.agent or DEFAULT_AGENT
 
-    def _headers(self, api_key: str | None = None) -> dict[str, str]:
-        return {
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key or self.api_key,
-            "Api-Revision": API_REVISION,
-        }
-
     def _client_kwargs(
         self,
         timeout: float,
         api_key: str | None = None,
         *,
         content_type: str | None = "application/json",
+        follow_redirects: bool = True,
     ) -> dict[str, Any]:
         headers = {
             "x-goog-api-key": api_key or self.api_key,
@@ -629,6 +794,7 @@ class GeminiSandboxClient:
             proxy=self.proxy,
             use_proxy=True,
             headers=headers,
+            follow_redirects=follow_redirects,
         )
 
     def require_api_key(self) -> None:
@@ -652,25 +818,33 @@ class GeminiSandboxClient:
         new_sandbox: bool,
         sandbox_id: str | None,
         sources: list[dict[str, Any]] | None,
+        network: dict[str, Any] | None = None,
     ) -> str | dict[str, Any]:
         sources = sources or []
+        net = network if isinstance(network, dict) and network else None
         if new_sandbox:
+            if not sources and net is None:
+                return "remote"
+            env: dict[str, Any] = {"type": "remote"}
             if sources:
-                return {"type": "remote", "sources": sources}
-            return "remote"
+                env["sources"] = sources
+            if net is not None:
+                env["network"] = net
+            return env
         env_id = (sandbox_id or "").strip()
         if not env_id:
             raise GeminiClientError(
                 "new_sandbox=false 时必须提供 sandbox_id（environment_id）以复用沙盒。"
             )
+        if not sources and net is None:
+            return env_id
+        # Official EnvironmentConfig.environment_id updates an existing env.
+        env = {"type": "remote", "environment_id": env_id}
         if sources:
-            # Official EnvironmentConfig.environment_id updates an existing env.
-            return {
-                "type": "remote",
-                "environment_id": env_id,
-                "sources": sources,
-            }
-        return env_id
+            env["sources"] = sources
+        if net is not None:
+            env["network"] = net
+        return env
 
     def build_sources_from_files(
         self,
@@ -682,16 +856,15 @@ class GeminiSandboxClient:
 
         def _add_inline(target: str, content: str, encoding: str | None = None) -> None:
             nonlocal total
-            raw_len = (
-                len(content.encode("utf-8"))
-                if encoding != "base64"
-                else (len(base64.b64decode(content, validate=False)) if content else 0)
-            )
             if encoding == "base64":
+                # 只解码一次：非法 base64 按原长度计，异常不向上抛，
+                # 由随后的官方限制检查决定是否拒绝。
                 try:
-                    raw_len = len(base64.b64decode(content, validate=False))
+                    raw_len = len(base64.b64decode(content or "", validate=False))
                 except Exception:
-                    raw_len = len(content)
+                    raw_len = len(content or "")
+            else:
+                raw_len = len(content.encode("utf-8"))
             if raw_len > INLINE_PER_FILE_LIMIT:
                 raise GeminiClientError(
                     f"内联文件超过官方限制 1MB/文件: {target} ({raw_len} bytes)"
@@ -712,6 +885,8 @@ class GeminiSandboxClient:
             for piece in str(file_paths).split(","):
                 local = piece.strip()
                 if not local:
+                    continue
+                if is_reserved_upload_token_target(sandbox_target_from_path(local)):
                     continue
                 path = Path(local).expanduser()
                 if not path.is_file():
@@ -760,6 +935,8 @@ class GeminiSandboxClient:
                     enc = str(encoding).strip() if encoding else None
                     if not target.startswith("/") and not target.startswith("."):
                         target = f"/workspace/{Path(target).name}"
+                    if is_reserved_upload_token_target(target):
+                        continue
                     _add_inline(target, str(content), encoding=enc)
 
         return sources
@@ -774,18 +951,37 @@ class GeminiSandboxClient:
         previous_task_id: str | None,
         sources: list[dict[str, Any]],
         background: bool | None = None,
+        network: dict[str, Any] | None = None,
+        images: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         prompt = (prompt or "").strip()
         if not prompt:
             raise GeminiClientError("prompt 不能为空。")
+        if sources and not new_sandbox:
+            # 2026-10-07 实测：environment_id + sources 组合 Google 一律 400
+            # invalid_request（与 new_session 无关）。往已有沙盒传图请走 images
+            # 多模态 input；传文件只能走 Files PUT（当前服务端落 0 字节，见
+            # _put_continue_uploads 的回读校验）。
+            raise GeminiClientError(
+                "复用已有沙盒（environment_id）时不能携带 sources，"
+                "Google 将返回 400 invalid_request。"
+            )
         env = self.build_environment(
             new_sandbox=new_sandbox,
             sandbox_id=sandbox_id,
             sources=sources,
+            network=network,
         )
+        # 有图片时 input 用 Content 数组：text 分节 + image 分节（inline base64）。
+        # 无图片时保持纯字符串，行为与旧版本一致。
+        image_parts = build_image_input_parts(images)
         payload: dict[str, Any] = {
             "agent": self.agent or DEFAULT_AGENT,
-            "input": prompt,
+            "input": (
+                [{"type": "text", "text": prompt}, *image_parts]
+                if image_parts
+                else prompt
+            ),
             "environment": env,
         }
         agent_config = self._agent_config()
@@ -811,6 +1007,121 @@ class GeminiSandboxClient:
                 )
             payload["previous_interaction_id"] = prev
         return payload
+
+    @staticmethod
+    def _credential_failure(
+        stage: str,
+        credential_id: str,
+        status: int | None,
+    ) -> GeminiClientError:
+        if status is None:
+            logger.warning(f"凭据{stage}失败 id={credential_id} 超时或网络错误")
+            return GeminiClientError(f"凭据{stage}失败: id={credential_id} 超时或网络错误")
+        logger.warning(f"凭据{stage}失败 id={credential_id} HTTP {status}")
+        return GeminiClientError(f"凭据{stage}失败: id={credential_id} HTTP {status}")
+
+    @staticmethod
+    def _credential_code_is_aborted(resp: httpx.Response) -> bool:
+        try:
+            payload = resp.json()
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        err = payload.get("error")
+        if not isinstance(err, dict):
+            return False
+        return err.get("code") == "aborted"
+
+    @staticmethod
+    def _require_credential_json(resp: httpx.Response, *, stage: str, credential_id: str) -> None:
+        try:
+            payload = resp.json()
+        except Exception:
+            raise GeminiSandboxClient._credential_failure(
+                stage, credential_id, resp.status_code
+            ) from None
+        if not isinstance(payload, dict):
+            raise GeminiSandboxClient._credential_failure(
+                stage, credential_id, resp.status_code
+            ) from None
+
+    async def ensure_bearer_credential(self, api_key: str, credential_id: str, token: str) -> None:
+        """Create or update a project bearer credential. Errors omit secrets and response bodies."""
+        key = (api_key or "").strip()
+        if not key:
+            raise GeminiClientError("凭据准备失败: API Key 为空。")
+        cred_id = (credential_id or "").strip()
+        if not cred_id:
+            raise GeminiClientError("凭据准备失败: 凭据 ID 为空。")
+        if not (token or "").strip():
+            raise GeminiClientError("凭据准备失败: Token 为空。")
+        create_body = {
+            "id": cred_id,
+            "type": "bearer_token",
+            "token": token,
+            "header_name": "Authorization",
+            "prefix": "Bearer",
+        }
+        patch_body = {
+            "type": "bearer_token",
+            "token": token,
+            "header_name": "Authorization",
+            "prefix": "Bearer",
+        }
+        patch_url = f"{GEMINI_CREDENTIALS_URL}/{quote(cred_id, safe='')}"
+        stage = "创建"
+        try:
+            async with httpx.AsyncClient(
+                **self._client_kwargs(CREDENTIAL_TIMEOUT, key, follow_redirects=False)
+            ) as client:
+                resp = await client.post(GEMINI_CREDENTIALS_URL, json=create_body)
+                if resp.status_code in (200, 201):
+                    self._require_credential_json(resp, stage="创建", credential_id=cred_id)
+                    logger.info(f"凭据已创建 id={cred_id} HTTP {resp.status_code}")
+                    return
+                if resp.status_code == 409 and self._credential_code_is_aborted(resp):
+                    logger.info(f"凭据已存在，改为更新 id={cred_id} HTTP 409")
+                    stage = "更新"
+                    resp = await client.patch(patch_url, json=patch_body)
+                    if resp.status_code in (200, 201):
+                        self._require_credential_json(resp, stage="更新", credential_id=cred_id)
+                        logger.info(f"凭据已更新 id={cred_id} HTTP {resp.status_code}")
+                        return
+                    raise self._credential_failure("更新", cred_id, resp.status_code) from None
+                raise self._credential_failure("创建", cred_id, resp.status_code) from None
+        except GeminiClientError:
+            raise
+        except httpx.TimeoutException:
+            raise self._credential_failure(stage, cred_id, None) from None
+        except httpx.HTTPError:
+            raise self._credential_failure(stage, cred_id, None) from None
+
+    async def ensure_credentials_for_keys(
+        self,
+        keys: list[str],
+        credential_id: str,
+        token: str,
+    ) -> list[str]:
+        """Keep keys whose credential write succeeded, in the original order."""
+        ready: list[str] = []
+        last_error: GeminiClientError | None = None
+        for key in keys:
+            if not str(key or "").strip():
+                last_error = GeminiClientError("凭据准备失败: API Key 为空。")
+                continue
+            try:
+                await self.ensure_bearer_credential(key, credential_id, token)
+            except GeminiClientError as exc:
+                last_error = exc
+                logger.warning(f"凭据准备未使用该 Key: {exc}")
+                continue
+            ready.append(key)
+        if ready:
+            return ready
+        if last_error is not None:
+            raise last_error
+        raise GeminiClientError("凭据准备失败: 没有可用的 API Key。")
 
     async def _post_interaction(self, payload: dict[str, Any], api_key: str) -> httpx.Response:
         async with httpx.AsyncClient(**self._client_kwargs(SUBMIT_TIMEOUT, api_key)) as client:
@@ -984,6 +1295,90 @@ class GeminiSandboxClient:
         ):
             return True
         return False
+
+    async def get_interaction_status(
+        self, task_id: str, *, api_key: str | None = None
+    ) -> str:
+        """只取交互状态文本。响应 id 必须与请求一致，避免把别的交互当成本条。"""
+        data = await self.get_interaction(task_id, api_key=api_key)
+        returned = str(data.get("id") or "").strip()
+        if returned and returned != task_id.strip():
+            raise GeminiClientError("交互响应 id 与请求不一致。")
+        status = str(data.get("status") or "").strip().lower()
+        if not status:
+            raise GeminiClientError("交互响应缺少 status 字段。")
+        return status
+
+    async def delete_interaction(
+        self, task_id: str, *, api_key: str | None = None
+    ) -> None:
+        """删除单条交互（WebUI 删除会话）。
+
+        官方提供 DELETE /v1beta/interactions/{id}。固定显式 Key，不轮换；
+        404 说明远端已不存在，交由上层决定是否只清本地。
+        """
+        self.require_api_key()
+        task_id = (task_id or "").strip()
+        if not task_id:
+            raise GeminiClientError("task_id 不能为空。")
+        if ".." in task_id or "\x00" in task_id:
+            raise GeminiClientError("task_id 含非法路径字符。")
+        target_key = api_key or (self.api_keys[0] if self.api_keys else None)
+        if not target_key:
+            raise GeminiClientError("没有可用的 Gemini API Key。")
+        url = f"{GEMINI_INTERACTIONS_URL}/{quote(task_id, safe='')}"
+        async with httpx.AsyncClient(
+            **self._client_kwargs(RETRIEVE_GET_TIMEOUT, target_key)
+        ) as client:
+            try:
+                resp = await client.delete(url)
+            except httpx.TimeoutException as e:
+                raise GeminiClientError("删除会话超时。") from e
+            except httpx.HTTPError as e:
+                raise GeminiClientError(f"删除会话网络错误: {e}") from e
+        if resp.status_code >= 400:
+            raise GeminiClientError(
+                self._format_http_error(resp, "删除会话"),
+                status_code=resp.status_code,
+            )
+
+    async def get_environment(
+        self, env_id: str, *, api_key: str | None = None
+    ) -> dict[str, Any]:
+        """查询单个环境，不访问文件列表或解包交互响应。"""
+        self.require_api_key()
+        env_id = environment_id_of({"id": env_id})
+        if not env_id:
+            raise GeminiClientError("environment_id 不能为空。")
+        if ".." in env_id or "\x00" in env_id:
+            raise GeminiClientError("environment_id 含非法路径字符。")
+        target_key = api_key or (self.api_keys[0] if self.api_keys else None)
+        if not target_key:
+            raise GeminiClientError("没有可用的 Gemini API Key。")
+        url = f"{GEMINI_ENVIRONMENTS_URL}/{quote(env_id, safe='')}"
+        async with httpx.AsyncClient(
+            **self._client_kwargs(ENV_LIST_TIMEOUT, target_key)
+        ) as client:
+            try:
+                resp = await client.get(url)
+            except httpx.TimeoutException as e:
+                raise GeminiClientError("查询沙盒环境超时。") from e
+            except httpx.HTTPError as e:
+                raise GeminiClientError(f"查询沙盒环境网络错误: {e}") from e
+        if resp.status_code >= 400:
+            raise GeminiClientError(
+                self._format_http_error(resp, "查询沙盒环境"),
+                status_code=resp.status_code,
+            )
+        try:
+            payload = resp.json()
+        except ValueError as e:
+            raise GeminiClientError("查询沙盒环境返回的不是 JSON。") from e
+        if not isinstance(payload, dict):
+            raise GeminiClientError("查询沙盒环境响应格式无法解析。")
+        if environment_id_of(payload) != env_id:
+            raise GeminiClientError("查询沙盒环境响应的 environment_id 缺失或不匹配。")
+        return payload
 
     async def list_environments(self, *, api_key: str | None = None) -> list[dict[str, Any]]:
         self.require_api_key()
@@ -1184,10 +1579,12 @@ class GeminiSandboxClient:
         cancel_event: Any = None,
         max_bytes: int | None = None,
         timeout: float | None = None,
+        timeout_message: str | None = None,
     ):
         """Stream an environment file (alt=media) as byte chunks.
 
         cancel_event stops the read between chunks. max_bytes aborts instead of truncating.
+        timeout is the httpx read idle limit, not a cap on the whole download.
         """
         self.require_api_key()
         target_key = api_key or (self.api_keys[0] if self.api_keys else None)
@@ -1213,13 +1610,13 @@ class GeminiSandboxClient:
                         if not chunk:
                             continue
                         if max_bytes is not None and total + len(chunk) > max_bytes:
-                            raise GeminiFileTooLargeError(MSG_FILE_TOO_LARGE)
+                            raise GeminiFileTooLargeError(file_too_large_message(max_bytes))
                         total += len(chunk)
                         yield chunk
             except GeminiClientError:
                 raise
             except httpx.TimeoutException as e:
-                raise GeminiFileTimeoutError(MSG_PULL_TIMEOUT) from e
+                raise GeminiFileTimeoutError(timeout_message or MSG_PULL_TIMEOUT) from e
             except httpx.HTTPError as e:
                 raise GeminiClientError(f"下载沙盒文件网络错误: {e}") from e
 
@@ -1239,6 +1636,30 @@ class GeminiSandboxClient:
         PUT /upload/v1beta/environments/{id}/files/{path}
         """
         self.require_api_key()
+        env_id, data, rel, target_key = self._prepare_upload(
+            env_id, path, content, api_key=api_key
+        )
+        url = self._resumable_upload_url(env_id, rel)
+        return await self._resumable_put(
+            url,
+            data,
+            mime=self._upload_mime(content_type),
+            params=self._upload_params(overwrite),
+            api_key=target_key,
+            target_key=target_key,
+            action="写入沙盒文件",
+        )
+
+    def _prepare_upload(
+        self,
+        env_id: str,
+        path: str,
+        content: Any,
+        *,
+        api_key: str | None,
+    ) -> tuple[str, bytes, str, str]:
+        """共用上传前置：Key、环境 ID、路径、正文与 MIME 归一化。"""
+        self.require_api_key()
         env_id = environment_id_of({"id": env_id}) or (env_id or "").strip()
         if not env_id:
             raise GeminiClientError("environment_id 不能为空。")
@@ -1253,48 +1674,23 @@ class GeminiSandboxClient:
         rel = normalize_environment_file_path(path, default="")
         if not rel:
             raise GeminiClientError("上传路径不能为空。")
+        return env_id, data, rel, target_key
+
+    def _resumable_upload_url(self, env_id: str, rel: str) -> str:
         encoded_env = quote(env_id, safe="")
         encoded_path = encode_environment_file_path(rel)
-        url = f"{GEMINI_UPLOAD_ENV_BASE}/{encoded_env}/files/{encoded_path}"
-        mime = (content_type or "application/octet-stream").strip() or "application/octet-stream"
-        params: dict[str, Any] = {"overwrite": "true"} if overwrite else {}
-        async with httpx.AsyncClient(
-            **self._client_kwargs(
-                ENV_FILES_UPLOAD_TIMEOUT,
-                target_key,
-                content_type=mime,
-            )
-        ) as client:
-            try:
-                resp = await client.put(url, params=params or None, content=data)
-            except httpx.HTTPError as e:
-                raise GeminiClientError(f"写入沙盒文件网络错误: {e}") from e
-        if resp.status_code >= 400:
-            raise GeminiClientError(
-                self._format_http_error(resp, "写入沙盒文件"),
-                status_code=resp.status_code,
-            )
-        try:
-            payload = resp.json()
-        except Exception:
-            payload = {}
-        if isinstance(payload, dict):
-            files = payload.get("files")
-            if isinstance(files, list) and files and isinstance(files[0], dict):
-                normalized = normalize_environment_file_entry(files[0])
-                if normalized:
-                    return normalized
-            if payload:
-                normalized = normalize_environment_file_entry(payload)
-                if normalized.get("name") or normalized.get("path"):
-                    return normalized
-        return {
-            "name": rel.split("/")[-1],
-            "path": rel,
-            "type": "file",
-            "size_bytes": len(data),
-            "mime_type": mime,
-        }
+        if encoded_path:
+            return f"{GEMINI_UPLOAD_ENV_BASE}/{encoded_env}/files/{encoded_path}"
+        return f"{GEMINI_UPLOAD_ENV_BASE}/{encoded_env}/files"
+
+    def _upload_params(self, overwrite: bool) -> dict[str, Any]:
+        params: dict[str, Any] = {"uploadType": "resumable"}
+        if overwrite:
+            params["overwrite"] = "true"
+        return params
+
+    def _upload_mime(self, content_type: str | None) -> str:
+        return (content_type or "application/octet-stream").strip() or "application/octet-stream"
 
     async def download_environment_file_to(
         self,
@@ -1322,85 +1718,107 @@ class GeminiSandboxClient:
         overwrite: bool = True,
         api_key: str | None = None,
     ) -> dict[str, Any]:
-        """Upload bytes into an environment via resumable Scotty protocol."""
+        """Upload bytes into an environment (WebUI upload route).
+
+        Official (2026-09-17) resumable session:
+        PUT /upload/v1beta/environments/{id}/files/{path}?uploadType=resumable
+        with X-Upload-Content-Type / X-Upload-Content-Length and an empty body,
+        then PUT the payload at the Location URL with a Content-Range header.
+        """
         self.require_api_key()
-        env_id = environment_id_of({"id": env_id}) or (env_id or "").strip()
-        if not env_id:
-            raise GeminiClientError("environment_id 不能为空。")
-        if ".." in env_id or "\x00" in env_id:
-            raise GeminiClientError("environment_id 含非法路径字符。")
-        target_key = api_key or (self.api_keys[0] if self.api_keys else None)
-        if not target_key:
-            raise GeminiClientError("没有可用的 Gemini API Key。")
-        if content is None:
-            raise GeminiClientError("上传内容不能为空。")
-        data = content if isinstance(content, (bytes, bytearray)) else bytes(content)
-        rel = normalize_environment_file_path(path, default="")
-        encoded_env = quote(env_id, safe="")
-        encoded_path = encode_environment_file_path(rel)
-        if encoded_path:
-            start_url = f"{GEMINI_UPLOAD_ENV_BASE}/{encoded_env}/files/{encoded_path}"
-        else:
-            start_url = f"{GEMINI_UPLOAD_ENV_BASE}/{encoded_env}/files"
-        params: dict[str, Any] = {}
-        if overwrite:
-            params["overwrite"] = "true"
-        mime = (content_type or "application/octet-stream").strip() or "application/octet-stream"
+        env_id, data, rel, target_key = self._prepare_upload(
+            env_id, path, content, api_key=api_key
+        )
+        url = self._resumable_upload_url(env_id, rel)
+        return await self._resumable_put(
+            url,
+            data,
+            mime=self._upload_mime(content_type),
+            params=self._upload_params(overwrite),
+            api_key=target_key,
+            target_key=target_key,
+            action="上传沙盒文件",
+        )
+
+    async def _resumable_put(
+        self,
+        url: str,
+        data: bytes,
+        *,
+        mime: str,
+        params: dict[str, Any],
+        api_key: str,
+        target_key: str,
+        action: str,
+    ) -> dict[str, Any]:
+        """官方 resumable 上传：空正文开会话，再带 Content-Range 传正文。
+
+        直接 PUT 正文（文档里的单文件 curl）在沙盒侧常回 504
+        deadline_exceeded，改为走文档的 uploadType=resumable 会话。
+        """
+        total = len(data)
         start_headers = {
-            "x-goog-api-key": target_key,
+            "x-goog-api-key": api_key,
             "Api-Revision": API_REVISION,
-            "X-Goog-Upload-Protocol": "resumable",
-            "X-Goog-Upload-Command": "start",
-            "X-Goog-Upload-Header-Content-Length": str(len(data)),
-            "X-Goog-Upload-Header-Content-Type": mime,
+            "X-Upload-Content-Type": mime,
+            "X-Upload-Content-Length": str(total),
         }
-        timeout = httpx.Timeout(ENV_FILES_UPLOAD_TIMEOUT, connect=30.0)
         async with httpx.AsyncClient(
-            **build_httpx_client_kwargs(timeout=timeout, proxy=self.proxy, use_proxy=True)
+            **self._client_kwargs(ENV_FILES_UPLOAD_TIMEOUT, target_key, content_type=None)
         ) as client:
             try:
-                start_resp = await client.put(start_url, params=params, headers=start_headers)
+                start_resp = await client.put(
+                    url, params=params, headers=start_headers, content=b""
+                )
             except httpx.HTTPError as e:
-                raise GeminiClientError(f"开始上传沙盒文件网络错误: {e}") from e
+                raise GeminiClientError(f"{action}网络错误: {e}") from e
             if start_resp.status_code >= 400:
-                raise GeminiClientError(self._format_http_error(start_resp, "开始上传沙盒文件"))
-            upload_url = (
-                start_resp.headers.get("x-goog-upload-url")
-                or start_resp.headers.get("X-Goog-Upload-URL")
-                or ""
-            ).strip()
-            if not upload_url:
-                raise GeminiClientError("开始上传沙盒文件未返回 x-goog-upload-url。")
+                raise GeminiClientError(
+                    self._format_http_error(start_resp, action),
+                    status_code=start_resp.status_code,
+                )
+            session_url = (start_resp.headers.get("location") or "").strip()
+            if not session_url:
+                raise GeminiClientError(f"{action}未返回上传会话地址（Location）。")
             put_headers = {
-                "X-Goog-Upload-Command": "upload, finalize",
-                "X-Goog-Upload-Offset": "0",
                 "Content-Type": mime,
+                "Content-Range": f"bytes 0-{max(total - 1, 0)}/{total}",
             }
             try:
-                put_resp = await client.put(upload_url, content=data, headers=put_headers)
+                put_resp = await client.put(
+                    session_url, headers=put_headers, content=data
+                )
             except httpx.HTTPError as e:
-                raise GeminiClientError(f"上传沙盒文件网络错误: {e}") from e
+                raise GeminiClientError(f"{action}网络错误: {e}") from e
             if put_resp.status_code >= 400:
-                raise GeminiClientError(self._format_http_error(put_resp, "上传沙盒文件"))
+                raise GeminiClientError(
+                    self._format_http_error(put_resp, action),
+                    status_code=put_resp.status_code,
+                )
             try:
                 payload = put_resp.json()
             except Exception:
                 payload = {}
-            if isinstance(payload, dict) and payload:
-                return normalize_environment_file_entry(payload) or {
-                    "name": rel.split("/")[-1],
-                    "path": rel,
-                    "type": "file",
-                    "size_bytes": len(data),
-                    "mime_type": mime,
-                }
-            return {
-                "name": rel.split("/")[-1],
-                "path": rel,
-                "type": "file",
-                "size_bytes": len(data),
-                "mime_type": mime,
-            }
+        if isinstance(payload, dict) and payload:
+            batch = payload.get("files")
+            if isinstance(batch, list) and batch and isinstance(batch[0], dict):
+                normalized = normalize_environment_file_entry(batch[0])
+                if normalized.get("name") or normalized.get("path"):
+                    return normalized
+            normalized = normalize_environment_file_entry(payload)
+            if normalized.get("name") or normalized.get("path"):
+                return normalized
+        rel = normalize_environment_file_path(
+            url.rsplit("/files/", 1)[-1], default=""
+        ) if "/files/" in url else ""
+        name = rel.rsplit("/", 1)[-1] if rel else "upload"
+        return {
+            "name": name,
+            "path": rel or name,
+            "type": "file",
+            "size_bytes": total,
+            "mime_type": mime,
+        }
 
     def _parse_json_response(self, resp: httpx.Response, *, action: str) -> dict[str, Any]:
         if resp.status_code >= 400:

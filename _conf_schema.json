@@ -24,8 +24,8 @@
       "sandbox_agent": {
         "description": "沙盒 agent 型号",
         "type": "string",
-        "hint": "Interactions 请求的 agent 字段，默认 antigravity-preview-05-2026。Google 发布新沙盒版本后只改这里。不要填 gemini-* 模型名，底层模型填上面的「底层模型」。",
-        "default": "antigravity-preview-05-2026"
+        "hint": "Interactions 请求的 agent 字段，默认 antigravity-preview-09-2026。Google 发布新沙盒版本后只改这里。不要填 gemini-* 模型名，底层模型填上面的「底层模型」。",
+        "default": "antigravity-preview-09-2026"
       },
       "submit_background": {
         "description": "提交后立即返回",
@@ -42,8 +42,8 @@
       "max_in_progress_per_key": {
         "description": "单 Key 进行中任务上限",
         "type": "int",
-        "hint": "每个 Gemini Key 同时处于 in_progress 的任务数，默认 1。只统计本地缓存。新建任务优先交给更空闲的 Key；剩余额度相同则提交到上一把 Key 的下一把。全部占满时先对相关短号 GET 刷新一次，仍无空闲则提示目前无空余沙盒分配。续接不换 Key，达到上限直接拒绝。",
-        "default": 1
+        "hint": "每个 Gemini Key 同时处于 in_progress 的任务数，默认 4。只统计本地缓存。新建任务优先交给更空闲的 Key；剩余额度相同则提交到上一把 Key 的下一把。全部占满时先对相关短号 GET 刷新一次，仍无空闲则提示目前无空余沙盒分配。续接不换 Key，达到上限直接拒绝。",
+        "default": 4
       }
     }
   },
@@ -60,11 +60,48 @@
       }
     }
   },
-  "receipt": {
-    "description": "取回回执",
-    "hint": "控制取回结果怎么发到聊天。图片回执只用于状态为 completed 的取回。",
+  "pull": {
+    "description": "聊天拉取",
+    "hint": "控制 /agget 和 get_sandbox_task 从沙盒拉文件。两条路径的大小上限和超时分开。WebUI 沙盒文件页不走这里。",
     "type": "object",
     "items": {
+      "max_mb": {
+        "description": "/agget 大小上限（MB）",
+        "type": "int",
+        "hint": "只作用于 /agget。0 表示不限制。默认 0。/agget 不设总超时；连续 10 分钟没有新的下载数据会中止，并建议改用图床或 WebUI。",
+        "default": 0
+      },
+      "tool_max_mb": {
+        "description": "工具拉取大小上限（MB）",
+        "type": "int",
+        "hint": "只作用于 get_sandbox_task。0 表示不限制。默认 0。该工具固定 90 秒超时，超过大小或超时就中止。",
+        "default": 0
+      },
+      "progress": {
+        "description": "拉取进度反馈",
+        "type": "bool",
+        "hint": "开启后，下载每跨过一次阈值就在聊天里发一条进度。文件总大小低于阈值时不发。默认开启。",
+        "default": true
+      },
+      "progress_mb": {
+        "description": "进度反馈阈值（MB）",
+        "type": "int",
+        "hint": "每下载这么多就反馈一次。文件小于这个值时不反馈。默认 40。小于 1 时按 40 处理。",
+        "default": 40
+      }
+    }
+  },
+  "receipt": {
+    "description": "取回回执",
+    "hint": "控制回执怎么发到聊天。图片回执只用于状态为 completed 的取回。沙盒路径回执只决定回执里写不写工作空间路径。",
+    "type": "object",
+    "items": {
+      "sandbox_path_receipt": {
+        "description": "沙盒路径回执",
+        "type": "bool",
+        "hint": "开启后，提交、续接和取回的回执写上工作空间路径，并说明用 /agget 或 get_sandbox_task 拉取。关闭后回执不写路径。沙盒始终被要求把产物存到 /workspace 下，不受此开关影响。",
+        "default": true
+      },
       "image_receipt": {
         "description": "图片回执",
         "type": "bool",
@@ -94,18 +131,43 @@
         "type": "bool",
         "hint": "提交或续接满 1 小时仍未手动取回时，后台查询一次并写日志，不推送到会话。手动取回会取消这次等待。",
         "default": true
+      },
+      "file_status_poll": {
+        "description": "完成标记提醒",
+        "type": "bool",
+        "hint": "开启后，提交时让沙盒做完再写一个空的完成标记文件。插件按下方间隔去看这个文件，最多看 1 小时。看到了就在原会话提示用 /agr 取回。/agr 问到任务还在跑（in_progress）时继续看；问到已结束才停。默认开启。",
+        "default": true
+      },
+      "file_poll_interval": {
+        "description": "完成标记查询间隔（秒）",
+        "type": "int",
+        "hint": "隔多久去沙盒看一次完成标记。默认 30 秒。最小 5 秒。",
+        "default": 30
+      }
+    }
+  },
+  "probe": {
+    "description": "测试功能",
+    "hint": "还在试的开关。默认不影响 /ags、/agc 的完成提醒。",
+    "type": "object",
+    "items": {
+      "completed_notify": {
+        "description": "工具提交也提醒",
+        "type": "bool",
+        "hint": "/ags、/agc 提交的，看到完成标记后照常在原会话提示。模型用工具提交的默认只写日志、不发消息，避免打断当前对话。打开后，工具提交也照常提示。默认关闭。",
+        "default": false
       }
     }
   },
   "image_host": {
     "description": "图床上传",
-    "hint": "沙盒产物与插件生成的 md 走这里。关闭总开关后不再上传，地址和 Token 仍保留。",
+    "hint": "沙盒产物走这里。关闭总开关后不再要求上传，地址和 Token 仍保留。产物仍要求存到工作空间。",
     "type": "object",
     "items": {
       "enabled": {
         "description": "启用上传图床",
         "type": "bool",
-        "hint": "关闭后不挂载上传 Token、不要求沙盒上传文件，也不上传 md。重新打开即恢复。",
+        "hint": "关闭后不再要求沙盒上传。不删除已有凭据，也不撤销旧环境上已经写过的出站规则。重新打开即恢复。沙盒仍会被要求把产物存到工作空间。",
         "default": true
       },
       "webhook_url": {
@@ -123,7 +185,7 @@
       "token": {
         "description": "Bearer Token",
         "type": "string",
-        "hint": "仅在提交任务时挂载为 /workspace/upload.token。不写日志、不回显。",
+        "hint": "存为当前 Google 项目内的 bearer 凭据，由出站代理注入到 Webhook 主机。不写入沙盒，不写日志。一个项目只配一套图床。",
         "default": "",
         "secret": true
       },
@@ -132,6 +194,18 @@
         "type": "string",
         "hint": "例如 agysb。Agent 和插件上传文件时使用此目录。",
         "default": "agysb"
+      },
+      "receipt_base_url": {
+        "description": "回执基础地址",
+        "type": "string",
+        "hint": "只替换回执里图床链接的域名，后面仍拼接上传目录和文件名。留空则使用公网访问基础地址。QQ 群中频繁发送未备案域名，域名容易被标记。不改变发给沙盒的公网地址。",
+        "default": ""
+      },
+      "receipt_url": {
+        "description": "回执图床 URL",
+        "type": "bool",
+        "hint": "开启后，提交、续接和取回的回执写上图床链接。关闭后不写。是否要求沙盒上传仍由「启用上传图床」决定。",
+        "default": true
       }
     }
   },
@@ -149,8 +223,26 @@
       "idle_ttl_hours": {
         "description": "闲置多久可回收（小时）",
         "type": "int",
-        "hint": "从本插件最后一次 submit、retrieve、continue，或 Google last_accessed 起算。默认 24 小时，方便当天继续 /agcontinue。",
+        "hint": "从本插件最后一次 submit、retrieve、continue，或 Google last_accessed 起算。默认 72 小时（3 天），方便过几天继续 /agcontinue。",
+        "default": 72
+      },
+      "cleanup_sessions": {
+        "description": "自动清理会话",
+        "type": "bool",
+        "hint": "启动时以及每次新建任务提交前，清理已终态且闲置的会话；每个沙盒至少保留最近 1 条。进行中与未获取状态的会话不清理。",
+        "default": true
+      },
+      "session_idle_hours": {
+        "description": "会话闲置多久可清理（小时）",
+        "type": "int",
+        "hint": "按会话记录时间起算，默认 24 小时。清理只删除该交互与本地短号记录，不会动沙盒里的共享文件。",
         "default": 24
+      },
+      "session_keep_recent": {
+        "description": "每个沙盒至少保留的最近会话数",
+        "type": "int",
+        "hint": "即使已过闲置时间也先留着，默认 1。填 0 也按 1 处理，避免沙盒一条会话都不剩。",
+        "default": 1
       },
       "keep_recent": {
         "description": "每个 Key 至少保留的最近沙盒数",

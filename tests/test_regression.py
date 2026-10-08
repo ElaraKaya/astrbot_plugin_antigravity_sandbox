@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import sys
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -14,9 +16,16 @@ sys.path.insert(0, str(ROOT))
 import httpx  # noqa: E402
 
 from gemini_client import (  # noqa: E402
-    CHAT_PULL_MAX_BYTES,
+    AGGET_STALL_SECONDS,
     CHAT_PULL_TIMEOUT_SECONDS,
+    CONTINUE_PUT_MAX_BYTES,
+    DEFAULT_IN_PROGRESS_PER_KEY,
+    DEFAULT_PULL_PROGRESS_MB,
     DEFAULT_RECEIPT_TRUNCATE_CHARS,
+    ENV_LIST_TIMEOUT,
+    GEMINI_ENVIRONMENTS_URL,
+    GEMINI_INTERACTIONS_URL,
+    IMAGE_HOST_CREDENTIAL_ID,
     MSG_ENV_404,
     MSG_FILE_MISSING,
     MSG_FILE_TOO_LARGE,
@@ -33,17 +42,28 @@ from gemini_client import (  # noqa: E402
     GeminiPullCancelled,
     GeminiRetrieveQueryError,
     GeminiSandboxClient,
+    GeminiSubmitTimeoutError,
     ProgressThrottle,
+    PullProgress,
+    agget_stall_message,
     build_httpx_client_kwargs,
+    build_image_input_parts,
+    build_upload_instruction,
     clip_text,
     count_key_in_progress,
     ensure_md_filename,
     environment_media_url,
+    file_too_large_message,
     files_error_kind,
     fixed_files_message,
+    format_pull_progress,
+    image_host_network,
+    pull_limit_bytes,
+    pull_progress_step_bytes,
     select_balanced_keys,
     select_idle_keys,
     slim_environment_file_entry,
+    webhook_upload_host,
     workspace_download_path,
 )
 
@@ -120,6 +140,15 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(select_idle_keys(["key-a"], {"key-a": 1}, 1), [])
         self.assertEqual(MSG_NO_CAPACITY, "目前无空余沙盒分配")
 
+    def test_default_in_progress_cap_and_schema_are_four(self):
+        self.assertEqual(DEFAULT_IN_PROGRESS_PER_KEY, 4)
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["model"]["items"]["max_in_progress_per_key"]["default"], 4)
+        keys = ["key-a", "key-b"]
+        counts = {"key-a": 4, "key-b": 3}
+        self.assertEqual(select_idle_keys(keys, counts, DEFAULT_IN_PROGRESS_PER_KEY), ["key-b"])
+        self.assertEqual(select_balanced_keys(keys, counts, DEFAULT_IN_PROGRESS_PER_KEY), ["key-b"])
+
     def test_submit_balances_toward_idler_key_then_next_key(self):
         keys = ["key-a", "key-b", "key-c"]
         # 当前 Key 只剩 1 个额度（上限 3、进行中 2），换到更空闲的。
@@ -192,20 +221,23 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(throttle.allow(1.2, force=True))
         self.assertTrue(throttle.allow(1.8))
 
-    def test_proxy_applies_to_gemini_and_not_to_webhook_helper(self):
+    def test_proxy_switch_applies_only_when_enabled(self):
         proxied = GeminiSandboxClient(api_keys=["k"], proxy="http://127.0.0.1:7890")
         options = proxied._client_kwargs(5, "k")
         self.assertEqual(options["proxy"], "http://127.0.0.1:7890")
         self.assertFalse(options["trust_env"])
+        self.assertTrue(options["follow_redirects"])
         direct = GeminiSandboxClient(api_keys=["k"], proxy="  ")
         self.assertNotIn("proxy", direct._client_kwargs(5, "k"))
-        webhook = build_httpx_client_kwargs(
+        direct_only = build_httpx_client_kwargs(
             timeout=5,
             proxy="http://127.0.0.1:7890",
             use_proxy=False,
+            follow_redirects=False,
         )
-        self.assertNotIn("proxy", webhook)
-        self.assertFalse(webhook["trust_env"])
+        self.assertNotIn("proxy", direct_only)
+        self.assertFalse(direct_only["trust_env"])
+        self.assertFalse(direct_only["follow_redirects"])
 
     def test_continue_rejects_interaction_sources(self):
         client = GeminiSandboxClient(api_keys=["k"])
@@ -228,10 +260,205 @@ class PolicyTests(unittest.TestCase):
         )
         self.assertEqual(payload["environment"], "env")
         self.assertNotIn("sources", payload["environment"] if isinstance(payload["environment"], dict) else {})
+        network = image_host_network("img.example.com")
+        fresh = client.build_create_payload(
+            prompt="新建",
+            new_sandbox=True,
+            sandbox_id=None,
+            new_session=True,
+            previous_task_id=None,
+            sources=[{"type": "inline", "target": "/workspace/a.md", "content": "hi"}],
+            network=network,
+        )
+        self.assertEqual(fresh["environment"]["type"], "remote")
+        self.assertIn("sources", fresh["environment"])
+        self.assertEqual(fresh["environment"]["network"], network)
+        bare = client.build_create_payload(
+            prompt="新建",
+            new_sandbox=True,
+            sandbox_id=None,
+            new_session=True,
+            previous_task_id=None,
+            sources=None,
+            network=network,
+        )
+        self.assertNotIn("sources", bare["environment"])
+        continued = client.build_create_payload(
+            prompt="继续",
+            new_sandbox=False,
+            sandbox_id="env",
+            new_session=False,
+            previous_task_id="prev",
+            sources=None,
+            network=network,
+        )
+        self.assertEqual(continued["previous_interaction_id"], "prev")
+        self.assertEqual(continued["environment"]["environment_id"], "env")
+        self.assertNotIn("sources", continued["environment"])
+        rules = continued["environment"]["network"]["allowlist"]
+        self.assertEqual(rules[0]["domain"], "img.example.com")
+        self.assertEqual(rules[0]["credential"], IMAGE_HOST_CREDENTIAL_ID)
+        self.assertEqual(rules[1], {"domain": "*"})
 
     def test_limits(self):
-        self.assertEqual(CHAT_PULL_MAX_BYTES, 20 * 1024 * 1024)
+        self.assertEqual(CONTINUE_PUT_MAX_BYTES, 20 * 1024 * 1024)
         self.assertEqual(CHAT_PULL_TIMEOUT_SECONDS, 90.0)
+        self.assertEqual(AGGET_STALL_SECONDS, 10 * 60.0)
+        self.assertEqual(
+            agget_stall_message(),
+            "拉取已中止：10 分钟没有新的下载进度。建议改用图床或 WebUI 获取。",
+        )
+        self.assertEqual(DEFAULT_PULL_PROGRESS_MB, 40)
+        self.assertIsNone(pull_limit_bytes(0))
+        self.assertIsNone(pull_limit_bytes(-1))
+        self.assertIsNone(pull_limit_bytes("nope"))
+        self.assertEqual(pull_limit_bytes(20), 20 * 1024 * 1024)
+        self.assertEqual(pull_progress_step_bytes(40, enabled=True), 40 * 1024 * 1024)
+        self.assertEqual(pull_progress_step_bytes(0, enabled=True), 40 * 1024 * 1024)
+        self.assertEqual(pull_progress_step_bytes(40, enabled=False), 0)
+        self.assertEqual(
+            file_too_large_message(20 * 1024 * 1024),
+            "文件超过 20MB，请使用图床或 WebUI 获取。",
+        )
+
+    def test_pull_progress_skips_files_under_the_threshold(self):
+        step = 40 * 1024 * 1024
+        small = PullProgress(step, 10 * 1024 * 1024)
+        self.assertEqual(small.marks(50 * 1024 * 1024), [])
+        unknown = PullProgress(step, None)
+        self.assertEqual(unknown.marks(39 * 1024 * 1024), [])
+        self.assertEqual(unknown.marks(40 * 1024 * 1024), [step])
+        self.assertEqual(unknown.marks(80 * 1024 * 1024), [step * 2])
+        big = PullProgress(step, 100 * 1024 * 1024)
+        self.assertEqual(big.marks(step), [step])
+        self.assertEqual(
+            format_pull_progress("0003", "a.zip", step, 100 * 1024 * 1024),
+            "任务编号 0003 正在拉取 a.zip：40.00 MB / 100.00 MB",
+        )
+        self.assertEqual(
+            format_pull_progress("", "a.zip", step, None),
+            "正在拉取 a.zip：已下载 40.00 MB",
+        )
+        self.assertEqual(PullProgress(0, None).marks(step * 3), [])
+
+    def test_new_session_reuses_existing_environment_without_previous_interaction(self):
+        client = GeminiSandboxClient(api_keys=["k"])
+        for previous_task_id in (None, "old-task"):
+            for network in (None, image_host_network("img.example.com")):
+                with self.subTest(previous_task_id=previous_task_id, network=network):
+                    payload = client.build_create_payload(
+                        prompt="在原沙盒新开会话",
+                        new_sandbox=False,
+                        sandbox_id="env-existing",
+                        new_session=True,
+                        previous_task_id=previous_task_id,
+                        sources=None,
+                        network=network,
+                    )
+                    expected_environment = "env-existing"
+                    if network is not None:
+                        expected_environment = {
+                            "type": "remote",
+                            "environment_id": "env-existing",
+                            "network": network,
+                        }
+                    self.assertEqual(payload["environment"], expected_environment)
+                    self.assertNotIn("previous_interaction_id", payload)
+                    self.assertIs(payload["background"], True)
+                    self.assertIs(payload["store"], True)
+
+    def test_build_image_input_parts_normalizes_payloads(self):
+        parts = build_image_input_parts(
+            [
+                {"data": "QUJD", "mime_type": "image/png"},
+                {"data": "  ", "mime_type": "image/png"},
+                {"mime_type": "image/png"},
+                {"data": "QUJD"},
+                "not-a-dict",
+                None,
+            ]
+        )
+        self.assertEqual(
+            parts,
+            [
+                {"type": "image", "mime_type": "image/png", "data": "QUJD"},
+                {"type": "image", "mime_type": "image/png", "data": "QUJD"},
+            ],
+        )
+        self.assertEqual(build_image_input_parts(None), [])
+        self.assertEqual(build_image_input_parts([]), [])
+
+    def test_payload_sends_images_as_multimodal_input(self):
+        client = GeminiSandboxClient(api_keys=["k"])
+        images = [{"data": "QUJD", "mime_type": "image/png"}]
+        payload = client.build_create_payload(
+            prompt="描述图片",
+            new_sandbox=False,
+            sandbox_id="env",
+            new_session=False,
+            previous_task_id="prev",
+            sources=None,
+            images=images,
+        )
+        # 有图片时 input 是 Content 数组：text 分节 + image 分节
+        self.assertEqual(payload["input"][0], {"type": "text", "text": "描述图片"})
+        self.assertEqual(payload["input"][1]["type"], "image")
+        self.assertEqual(payload["input"][1]["mime_type"], "image/png")
+        self.assertEqual(payload["input"][1]["data"], "QUJD")
+        # 续接结构不受影响
+        self.assertEqual(payload["previous_interaction_id"], "prev")
+        self.assertEqual(payload["environment"], "env")
+
+        # 新会话（/agnew）同样接受图片分节
+        fresh = client.build_create_payload(
+            prompt="描述图片",
+            new_sandbox=False,
+            sandbox_id="env",
+            new_session=True,
+            previous_task_id=None,
+            sources=None,
+            images=images,
+        )
+        self.assertEqual(fresh["input"][1]["data"], "QUJD")
+        self.assertNotIn("previous_interaction_id", fresh)
+
+    def test_payload_without_images_keeps_plain_string_input(self):
+        client = GeminiSandboxClient(api_keys=["k"])
+        payload = client.build_create_payload(
+            prompt="纯文本任务",
+            new_sandbox=True,
+            sandbox_id=None,
+            new_session=True,
+            previous_task_id=None,
+            sources=None,
+            images=None,
+        )
+        self.assertEqual(payload["input"], "纯文本任务")
+        empty = client.build_create_payload(
+            prompt="纯文本任务",
+            new_sandbox=True,
+            sandbox_id=None,
+            new_session=True,
+            previous_task_id=None,
+            sources=None,
+            images=[],
+        )
+        self.assertEqual(empty["input"], "纯文本任务")
+
+    def test_reuse_environment_rejects_sources(self):
+        # 2026-10-07 实测：environment_id + sources 一律 400 invalid_request
+        client = GeminiSandboxClient(api_keys=["k"])
+        for new_session in (True, False):
+            with self.subTest(new_session=new_session):
+                with self.assertRaises(GeminiClientError):
+                    client.build_create_payload(
+                        prompt="复用",
+                        new_sandbox=False,
+                        sandbox_id="env",
+                        new_session=new_session,
+                        previous_task_id="prev" if not new_session else None,
+                        sources=[{"type": "inline", "target": "/workspace/a.md", "content": "x"}],
+                    )
 
     def test_background_payload_carries_store_true(self):
         client = GeminiSandboxClient(api_keys=["k"])
@@ -265,13 +492,223 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(RETRIEVE_GET_RETRIES, 1)
         self.assertLess(RETRIEVE_GET_TIMEOUT, 15.0)
 
+    def test_get_interaction_status_uses_fixed_key_and_validates_id(self):
+        from urllib.parse import quote
+
+        seen: list[httpx.Request] = []
+        client = ProbeClient(
+            httpx.MockTransport(
+                lambda request: (
+                    seen.append(request),
+                    httpx.Response(200, json={"id": "task-9", "status": "COMPLETED"}),
+                )[1]
+            ),
+            api_keys=["first-key", "assigned-key"],
+        )
+        status = _run(client.get_interaction_status("task-9", api_key="assigned-key"))
+        self.assertEqual(status, "completed")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].method, "GET")
+        self.assertEqual(
+            str(seen[0].url), f"{GEMINI_INTERACTIONS_URL}/{quote('task-9', safe='')}"
+        )
+        self.assertEqual(seen[0].headers["x-goog-api-key"], "assigned-key")
+
+    def test_get_interaction_status_rejects_mismatched_or_missing_status(self):
+        for payload in ({"id": "other", "status": "completed"}, {"id": "task-9"}):
+            with self.subTest(payload=payload):
+                client = ProbeClient(
+                    httpx.MockTransport(lambda request: httpx.Response(200, json=payload)),
+                    api_keys=["k"],
+                )
+                with self.assertRaises(GeminiClientError):
+                    _run(client.get_interaction_status("task-9"))
+
+    def test_delete_interaction_uses_fixed_key_and_keeps_status_codes(self):
+        from urllib.parse import quote
+
+        seen: list[httpx.Request] = []
+        client = ProbeClient(
+            httpx.MockTransport(
+                lambda request: (
+                    seen.append(request),
+                    httpx.Response(204),
+                )[1]
+            ),
+            api_keys=["first-key", "assigned-key"],
+        )
+        _run(client.delete_interaction("task-9", api_key="assigned-key"))
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].method, "DELETE")
+        self.assertEqual(
+            str(seen[0].url), f"{GEMINI_INTERACTIONS_URL}/{quote('task-9', safe='')}"
+        )
+        self.assertEqual(seen[0].headers["x-goog-api-key"], "assigned-key")
+        self.assertEqual(client.seen_timeout, RETRIEVE_GET_TIMEOUT)
+
+    def test_delete_interaction_http_errors_keep_status_and_do_not_switch_key(self):
+        for code in (401, 403, 404, 429):
+            with self.subTest(code=code):
+                seen: list[httpx.Request] = []
+                client = ProbeClient(
+                    httpx.MockTransport(
+                        lambda request: (
+                            seen.append(request),
+                            httpx.Response(code, json={"error": {"message": "nope"}}),
+                        )[1]
+                    ),
+                    api_keys=["first-key", "assigned-key"],
+                )
+                with self.assertRaises(GeminiClientError) as ctx:
+                    _run(client.delete_interaction("task-9", api_key="assigned-key"))
+                self.assertEqual(ctx.exception.status_code, code)
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(seen[0].headers["x-goog-api-key"], "assigned-key")
+
+    def test_delete_interaction_rejects_bad_id_and_missing_key_without_request(self):
+        client = ProbeClient(httpx.MockTransport(lambda request: httpx.Response(204)), api_keys=[])
+        for bad in ("", "  ", "a../b", "a\x00b"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(GeminiClientError):
+                    _run(client.delete_interaction(bad))
+        with self.assertRaises(GeminiClientError):
+            _run(client.delete_interaction("task-9"))
+
 
 class HttpTests(unittest.TestCase):
-    def test_put_uses_environment_upload_url(self):
+    def test_get_environment_uses_fixed_key_encoded_url_and_environment_timeout(self):
+        from urllib.parse import quote
+
+        seen: list[httpx.Request] = []
+        env_id = "环境 /?#%"
+        response_payload = {"name": f"environments/{env_id}", "size_bytes": "12"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json=response_payload)
+
+        client = ProbeClient(
+            httpx.MockTransport(handler),
+            api_keys=["first-key", "assigned-key", "other-key"],
+        )
+        payload = _run(client.get_environment(f"environments/{env_id}", api_key="assigned-key"))
+        self.assertEqual(payload, response_payload)
+        self.assertEqual(len(seen), 1)
+        request = seen[0]
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(str(request.url), f"{GEMINI_ENVIRONMENTS_URL}/{quote(env_id, safe='')}")
+        self.assertEqual(request.headers["x-goog-api-key"], "assigned-key")
+        self.assertEqual(request.url.query, b"")
+        self.assertEqual(client.seen_timeout, ENV_LIST_TIMEOUT)
+        self.assertNotIn("/files", str(request.url))
+
+    def test_get_environment_accepts_supported_top_level_identifiers(self):
+        for field in ("environment_id", "id", "name"):
+            for value in ("env-existing", "environments/env-existing"):
+                with self.subTest(field=field, value=value):
+                    expected = {field: value}
+                    client = ProbeClient(
+                        httpx.MockTransport(lambda request: httpx.Response(200, json=expected)),
+                        api_keys=["k"],
+                    )
+                    self.assertEqual(_run(client.get_environment("env-existing")), expected)
+
+    def test_get_environment_http_error_preserves_status_and_does_not_switch_key(self):
+        for status in (401, 403, 404, 429, 500):
+            with self.subTest(status=status):
+                seen: list[str] = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    seen.append(request.headers["x-goog-api-key"])
+                    return httpx.Response(status, json={"error": {"message": "not found"}})
+
+                client = ProbeClient(httpx.MockTransport(handler), api_keys=["first", "assigned"])
+                with self.assertRaises(GeminiClientError) as ctx:
+                    _run(client.get_environment("env-existing", api_key="assigned"))
+                self.assertEqual(ctx.exception.status_code, status)
+                self.assertIn(f"HTTP {status}", str(ctx.exception))
+                self.assertEqual(seen, ["assigned"])
+
+    def test_get_environment_timeout_and_network_error_are_client_errors(self):
+        for error_type in (httpx.ReadTimeout, httpx.ConnectError):
+            with self.subTest(error_type=error_type):
+                seen: list[httpx.Request] = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    seen.append(request)
+                    raise error_type("mock failure", request=request)
+
+                client = ProbeClient(httpx.MockTransport(handler), api_keys=["first", "assigned"])
+                with self.assertRaises(GeminiClientError) as ctx:
+                    _run(client.get_environment("env-existing", api_key="assigned"))
+                self.assertIsNone(ctx.exception.status_code)
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(seen[0].headers["x-goog-api-key"], "assigned")
+                self.assertIsInstance(ctx.exception.__cause__, error_type)
+
+    def test_get_environment_rejects_non_dict_missing_and_mismatched_identifiers(self):
+        invalid_payloads = [
+            [],
+            [{"id": "env-existing"}],
+            "env-existing",
+            None,
+            {},
+            {"size_bytes": 12},
+            {"id": "other-env"},
+            {"environment_id": "environments/other-env"},
+            {"data": {"id": "env-existing"}},
+            {"interaction": {"environment_id": "env-existing"}},
+        ]
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                client = ProbeClient(
+                    httpx.MockTransport(
+                        lambda request: httpx.Response(200, content=json.dumps(payload).encode())
+                    ),
+                    api_keys=["k"],
+                )
+                with self.assertRaises(GeminiClientError):
+                    _run(client.get_environment("env-existing", api_key="k"))
+
+    def test_get_environment_rejects_invalid_json(self):
+        client = ProbeClient(
+            httpx.MockTransport(lambda request: httpx.Response(200, text="<html>not JSON</html>")),
+            api_keys=["k"],
+        )
+        with self.assertRaises(GeminiClientError) as ctx:
+            _run(client.get_environment("env-existing"))
+        self.assertIn("不是 JSON", str(ctx.exception))
+
+    def test_get_environment_rejects_invalid_id_and_missing_key_before_request(self):
         seen: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             seen.append(request)
+            return httpx.Response(200, json={"id": "env-existing"})
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["k"])
+        for env_id in ("", "  ", "environments/", "../env", "env..id", "env\x00id"):
+            with self.subTest(env_id=env_id):
+                with self.assertRaises(GeminiClientError):
+                    _run(client.get_environment(env_id, api_key="k"))
+        unconfigured = ProbeClient(httpx.MockTransport(handler))
+        with self.assertRaises(GeminiClientError):
+            _run(unconfigured.get_environment("env-existing", api_key="k"))
+        self.assertEqual(seen, [])
+
+    def test_put_uses_environment_upload_url(self):
+        seen: list[httpx.Request] = []
+        session_url = (
+            "https://generativelanguage.googleapis.com/upload/v1beta/environments/"
+            "env123/files/workspace/notes.md?uploadType=resumable&upload_id=abc"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if request.headers.get("x-upload-content-length"):
+                # Session start: empty body, returns the upload session URL.
+                return httpx.Response(200, headers={"location": session_url})
+            body = request.read()
             return httpx.Response(
                 200,
                 json={
@@ -280,7 +717,7 @@ class HttpTests(unittest.TestCase):
                             "name": "notes.md",
                             "path": "workspace/notes.md",
                             "type": "FILE",
-                            "size_bytes": "4",
+                            "size_bytes": str(len(body)),
                         }
                     ]
                 },
@@ -299,13 +736,43 @@ class HttpTests(unittest.TestCase):
 
         meta = _run(run())
         self.assertEqual(meta["name"], "notes.md")
-        self.assertEqual(len(seen), 1)
-        request = seen[0]
-        self.assertEqual(request.method, "PUT")
-        self.assertIn("/upload/v1beta/environments/env123/files/workspace/notes.md", str(request.url))
-        self.assertNotIn("/interactions", str(request.url))
-        self.assertEqual(request.content, b"data")
-        self.assertEqual(request.headers["x-goog-api-key"], "test-key")
+        self.assertEqual(len(seen), 2)
+        start, upload = seen
+        self.assertEqual(start.method, "PUT")
+        self.assertEqual(upload.method, "PUT")
+        self.assertIn("/upload/v1beta/environments/env123/files/workspace/notes.md", str(start.url))
+        self.assertIn("uploadType=resumable", str(start.url))
+        self.assertNotIn("/interactions", str(start.url))
+        self.assertEqual(start.content, b"")
+        self.assertEqual(start.headers["x-goog-api-key"], "test-key")
+        self.assertEqual(start.headers["x-upload-content-length"], "4")
+        self.assertEqual(start.headers["x-upload-content-type"], "text/markdown")
+        # Payload goes to the session URL with a Content-Range, not to the origin.
+        self.assertEqual(str(upload.url), session_url)
+        self.assertEqual(upload.content, b"data")
+        self.assertEqual(upload.headers["content-range"], "bytes 0-3/4")
+
+    def test_resumable_upload_falls_back_when_no_location(self):
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json={})
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["k"])
+
+        async def run():
+            return await client.upload_environment_file(
+                "env123",
+                "workspace/a.bin",
+                b"abc",
+                content_type="application/octet-stream",
+                api_key="k",
+            )
+
+        with self.assertRaises(GeminiClientError) as ctx:
+            _run(run())
+        self.assertIn("Location", str(ctx.exception))
 
     def test_pull_aborts_over_20mb_and_on_cancel(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -327,7 +794,7 @@ class HttpTests(unittest.TestCase):
 
         with self.assertRaises(GeminiFileTooLargeError) as ctx:
             _run(too_big())
-        self.assertEqual(str(ctx.exception), MSG_FILE_TOO_LARGE)
+        self.assertEqual(str(ctx.exception), file_too_large_message(4))
 
         cancel = asyncio.Event()
         cancel.set()
@@ -527,19 +994,33 @@ class SourceTests(unittest.TestCase):
         tree = ast.parse(MAIN.read_text(encoding="utf-8"))
         chat_src = ""
         ui_src = ""
-        upload_src = ""
+        submit_src = ""
+        continue_src = ""
         for node in ast.walk(tree):
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_pull_chat_file_inner":
                 chat_src = ast.get_source_segment(MAIN.read_text(encoding="utf-8"), node) or ""
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ui_pull_worker":
                 ui_src = ast.get_source_segment(MAIN.read_text(encoding="utf-8"), node) or ""
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_upload_file_bytes":
-                upload_src = ast.get_source_segment(MAIN.read_text(encoding="utf-8"), node) or ""
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_do_submit":
+                submit_src = ast.get_source_segment(MAIN.read_text(encoding="utf-8"), node) or ""
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_do_continue":
+                continue_src = ast.get_source_segment(MAIN.read_text(encoding="utf-8"), node) or ""
         self.assertNotIn("_ui_pull_sem", chat_src)
         self.assertIn("_chat_pull_blocked", chat_src)
         self.assertIn("_ui_pull_sem", ui_src)
-        self.assertIn("use_proxy=False", upload_src)
+        self.assertLess(
+            submit_src.find("ensure_credentials_for_keys"),
+            submit_src.find("_remember_submit_key"),
+        )
+        self.assertLess(
+            continue_src.find("ensure_bearer_credential"),
+            continue_src.find("_put_continue_uploads"),
+        )
+        self.assertIn("api_key=assigned_key", continue_src)
         text = MAIN.read_text(encoding="utf-8")
+        self.assertNotIn("def _upload_file_bytes", text)
+        self.assertNotIn("def _public_url_from_upload_payload", text)
+        self.assertIn("任务绑定的 API Key 不可用，请恢复对应配置。", text)
         self.assertIn("Comp.File", text)
         self.assertIn("sources=None", text)
         self.assertIn("沙盒网络存疑", text)
@@ -559,41 +1040,403 @@ class SourceTests(unittest.TestCase):
         self.assertIn("未完成任务无法续接", text)
         self.assertIn("def _chat_pull_blocked", text)
         self.assertIn('endswith(".token")', text)
-        # 续接说明按新修订：默认 md 那句单独成行，附件提示另起一句
         self.assertIn(
-            "  在同一沙盒会话中续接任务。不写类型时默认 md，并返回对应预期网址。\\n",
+            "  指定其它类型时仍会额外要求一份带时间戳的 result.md。\\n",
             text,
         )
+        self.assertIn("【产物放置要求】", text)
+        self.assertIn('"/agget {short} <文件路径> 获取文件(可能需先取回任务)"', text)
+        self.assertIn('"后续:"', text)
+        self.assertNotIn("后续 /agr {short} 取回，", text)
+        self.assertNotIn("def _maybe_plugin_upload_md", text)
+        self.assertNotIn("plugin_md=", text)
+        self.assertNotIn("default_ext=None", text)
+        schema = (ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+        self.assertIn("沙盒路径回执", schema)
+        self.assertIn("拉取大小上限", schema)
+        self.assertIn("拉取进度反馈", schema)
+        self.assertIn("进度反馈阈值", schema)
+        self.assertIn('"max_mb"', schema)
+        self.assertIn('"tool_max_mb"', schema)
+        self.assertIn("工具拉取大小上限", schema)
+        self.assertIn("_agget_pull_job", text)
+        self.assertIn("total_timeout=None", text)
+        self.assertIn("没有新的下载进度", client_text)
+        self.assertIn("回执基础地址", schema)
+        self.assertNotIn("卡住 20MB", text)
+        self.assertIn("默认不限制", text)
+        self.assertIn("回执图床 URL", schema)
+        self.assertIn("完成标记提醒", schema)
+        self.assertIn("完成标记查询间隔", schema)
+        self.assertNotIn("取回文件查询状态", schema)
+        self.assertIn('"probe"', schema)
+        self.assertIn("测试功能", schema)
+        self.assertIn("未备案域名", schema)
         self.assertNotIn('f"taskid: {short}"', text)
 
 
+class CredentialTests(unittest.TestCase):
+    SENTINEL_TOKEN = "sentinel-token-value"
+    SENTINEL_KEY = "sentinel-api-key-value"
+
+    def setUp(self):
+        import gemini_client as gc
+
+        self._gc = gc
+        self._old_logger = gc.logger
+        self.lines: list[str] = []
+
+        class Capture:
+            def __init__(self, sink: list[str]):
+                self.sink = sink
+
+            def info(self, *args, **kwargs):
+                self.sink.append(" ".join(str(arg) for arg in args))
+
+            warning = info
+            error = info
+
+        gc.logger = Capture(self.lines)
+
+    def tearDown(self):
+        self._gc.logger = self._old_logger
+
+    def _assert_secret_hidden(self, *chunks: str) -> None:
+        blob = "\n".join(chunks) + "\n" + "\n".join(self.lines)
+        self.assertNotIn(self.SENTINEL_TOKEN, blob)
+        self.assertNotIn(self.SENTINEL_KEY, blob)
+
+    def test_webhook_host_accepts_https_and_rejects_unsafe_forms(self):
+        self.assertEqual(
+            webhook_upload_host("https://img.example.com/Webhook/upload"),
+            "img.example.com",
+        )
+        self.assertEqual(
+            webhook_upload_host("https://img.example.com:8443/hook"),
+            "img.example.com",
+        )
+        bad_urls = [
+            "http://img.example.com/hook",
+            "https:///hook",
+            "https://*/hook",
+            "https://*.example.com/hook",
+            "https://user:pass@img.example.com/hook",
+            "https://img.example.com:abc/hook",
+            "https://img.example.com:99999/hook",
+            "not a url",
+            "",
+        ]
+        for raw in bad_urls:
+            with self.subTest(raw=raw):
+                with self.assertRaises(GeminiClientError) as ctx:
+                    webhook_upload_host(raw)
+                if raw:
+                    self.assertNotIn(raw, str(ctx.exception))
+                self.assertEqual(str(ctx.exception), "图床上传地址无效。")
+
+    def test_upload_instruction_does_not_ask_for_the_token_file(self):
+        text = build_upload_instruction(
+            names=["260101_result.md"],
+            original_names=["result.md"],
+            webhook="https://img.example.com/Webhook/upload",
+            public_base="https://img.example.com",
+            prefix="agysb",
+        )
+        self.assertNotIn("从 /workspace/upload.token 读取", text)
+        self.assertIn("不要设置 Authorization", text)
+        self.assertIn("不要读取 /workspace/upload.token", text)
+
+    def test_sources_drop_reserved_token_paths(self):
+        client = GeminiSandboxClient(api_keys=["k"])
+        import json
+
+        contents = json.dumps(
+            [
+                {"target": "/workspace/./upload.token", "content": self.SENTINEL_TOKEN},
+                {"target": "upload.token", "content": self.SENTINEL_TOKEN},
+                {"target": "/workspace//upload.token", "content": self.SENTINEL_TOKEN},
+                {"target": "/workspace/ok.txt", "content": "hi"},
+            ]
+        )
+        sources = client.build_sources_from_files(
+            file_paths="E:/no-such-dir/upload.token",
+            file_contents=contents,
+        )
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["target"], "/workspace/ok.txt")
+        self.assertNotIn(self.SENTINEL_TOKEN, str(sources))
+
+    def test_credential_create_update_and_redaction(self):
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if request.method == "POST":
+                return httpx.Response(
+                    409,
+                    json={
+                        "error": {
+                            "code": "aborted",
+                            "message": f"leak {self.SENTINEL_TOKEN} {self.SENTINEL_KEY}",
+                        }
+                    },
+                )
+            if request.method == "PATCH":
+                return httpx.Response(200, json={"id": IMAGE_HOST_CREDENTIAL_ID})
+            return httpx.Response(500, text=self.SENTINEL_TOKEN)
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["other-key"])
+        _run(
+            client.ensure_bearer_credential(
+                self.SENTINEL_KEY,
+                IMAGE_HOST_CREDENTIAL_ID,
+                self.SENTINEL_TOKEN,
+            )
+        )
+        self.assertEqual([item.method for item in seen], ["POST", "PATCH"])
+        self.assertEqual(seen[0].url.path, "/v1beta/credentials")
+        self.assertEqual(seen[1].url.path, f"/v1beta/credentials/{IMAGE_HOST_CREDENTIAL_ID}")
+        for item in seen:
+            self.assertEqual(item.headers["x-goog-api-key"], self.SENTINEL_KEY)
+            payload = json.loads(item.content)
+            self.assertEqual(payload["type"], "bearer_token")
+            self.assertEqual(payload["token"], self.SENTINEL_TOKEN)
+            self.assertEqual(payload["header_name"], "Authorization")
+            self.assertEqual(payload["prefix"], "Bearer")
+        self.assertEqual(json.loads(seen[0].content)["id"], IMAGE_HOST_CREDENTIAL_ID)
+        self.assertNotIn("id", json.loads(seen[1].content))
+        self._assert_secret_hidden()
+
+    def test_credential_create_accepts_200_and_201(self):
+        for status in (200, 201):
+            with self.subTest(status=status):
+                def handler(request: httpx.Request, status=status) -> httpx.Response:
+                    return httpx.Response(status, json={"id": IMAGE_HOST_CREDENTIAL_ID})
+
+                client = ProbeClient(httpx.MockTransport(handler), api_keys=["k"])
+                _run(client.ensure_bearer_credential("k", IMAGE_HOST_CREDENTIAL_ID, "tok"))
+
+    def test_non_aborted_409_does_not_patch(self):
+        methods: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            methods.append(request.method)
+            return httpx.Response(
+                409,
+                json={"error": {"code": "already_exists", "message": self.SENTINEL_TOKEN}},
+            )
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["other"])
+        with self.assertRaises(GeminiClientError) as ctx:
+            _run(
+                client.ensure_bearer_credential(
+                    self.SENTINEL_KEY,
+                    IMAGE_HOST_CREDENTIAL_ID,
+                    self.SENTINEL_TOKEN,
+                )
+            )
+        self.assertEqual(methods, ["POST"])
+        self.assertIn("HTTP 409", str(ctx.exception))
+        self._assert_secret_hidden(
+            str(ctx.exception),
+            f"提交失败: {ctx.exception}",
+            f"续接交互失败: {ctx.exception}",
+        )
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertTrue(ctx.exception.__suppress_context__)
+
+    def test_credential_failures_stay_sanitized(self):
+        cases = {
+            "patch": lambda request: (
+                httpx.Response(
+                    409,
+                    json={"error": {"code": "aborted", "message": self.SENTINEL_TOKEN}},
+                )
+                if request.method == "POST"
+                else httpx.Response(500, text=f"{self.SENTINEL_TOKEN} {self.SENTINEL_KEY}")
+            ),
+            "html": lambda request: httpx.Response(200, text=f"<html>{self.SENTINEL_TOKEN}</html>"),
+            "redirect": lambda request: httpx.Response(
+                302,
+                headers={"Location": "https://example.invalid/next"},
+                text=self.SENTINEL_TOKEN,
+            ),
+            "timeout": None,
+        }
+
+        def run_case(kind: str):
+            def handler(request: httpx.Request) -> httpx.Response:
+                if kind == "timeout":
+                    raise httpx.TimeoutException(self.SENTINEL_TOKEN)
+                result = cases[kind](request)
+                if not isinstance(result, httpx.Response):
+                    raise AssertionError(kind)
+                return result
+
+            client = ProbeClient(httpx.MockTransport(handler), api_keys=["other-key"])
+            with self.assertRaises(GeminiClientError) as ctx:
+                _run(
+                    client.ensure_bearer_credential(
+                        self.SENTINEL_KEY,
+                        IMAGE_HOST_CREDENTIAL_ID,
+                        self.SENTINEL_TOKEN,
+                    )
+                )
+            self.assertNotIsInstance(ctx.exception, GeminiSubmitTimeoutError)
+            self._assert_secret_hidden(
+                str(ctx.exception),
+                f"提交失败: {ctx.exception}",
+                f"续接交互失败: {ctx.exception}",
+            )
+            self.assertTrue(ctx.exception.__suppress_context__)
+
+        for kind in cases:
+            with self.subTest(kind=kind):
+                self.lines.clear()
+                run_case(kind)
+
+    def test_empty_key_does_not_call_or_fall_back(self):
+        called = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal called
+            called = True
+            return httpx.Response(201, json={"id": "x"})
+
+        client = ProbeClient(httpx.MockTransport(handler), api_keys=["real-key"])
+        with self.assertRaises(GeminiClientError) as ctx:
+            _run(client.ensure_bearer_credential("  ", IMAGE_HOST_CREDENTIAL_ID, "tok"))
+        self.assertFalse(called)
+        self.assertIn("API Key 为空", str(ctx.exception))
+
+    def test_key_filter_keeps_success_order_and_hides_secrets(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            key = request.headers["x-goog-api-key"]
+            if key == "key-a":
+                return httpx.Response(500, text=f"{self.SENTINEL_TOKEN} {self.SENTINEL_KEY}")
+            if key == "key-b":
+                return httpx.Response(201, json={"id": IMAGE_HOST_CREDENTIAL_ID})
+            return httpx.Response(500, text="unexpected")
+
+        client = ProbeClient(
+            httpx.MockTransport(handler),
+            api_keys=["key-a", "key-b", "key-c"],
+        )
+        ready = _run(
+            client.ensure_credentials_for_keys(
+                ["key-a", "key-b"],
+                IMAGE_HOST_CREDENTIAL_ID,
+                self.SENTINEL_TOKEN,
+            )
+        )
+        self.assertEqual(ready, ["key-b"])
+        self._assert_secret_hidden()
+
+        def fail_all(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text=self.SENTINEL_TOKEN)
+
+        failing = ProbeClient(httpx.MockTransport(fail_all), api_keys=["key-a", "key-b"])
+        with self.assertRaises(GeminiClientError) as ctx:
+            _run(
+                failing.ensure_credentials_for_keys(
+                    ["key-a", "key-b"],
+                    IMAGE_HOST_CREDENTIAL_ID,
+                    self.SENTINEL_TOKEN,
+                )
+            )
+        self._assert_secret_hidden(str(ctx.exception))
+
+    def test_interaction_failover_stays_inside_prepared_keys(self):
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            key = request.headers["x-goog-api-key"]
+            seen.append(key)
+            if key == "key-a":
+                return httpx.Response(429, json={"error": {"message": "rate"}})
+            return httpx.Response(200, json={"id": "task", "status": "in_progress"})
+
+        client = ProbeClient(
+            httpx.MockTransport(handler),
+            api_keys=["key-a", "key-b", "key-c"],
+        )
+        payload = {"input": "hi"}
+        _data, used = _run(client.create_interaction(payload, candidate_keys=["key-a", "key-b"]))
+        self.assertEqual(seen, ["key-a", "key-b"])
+        self.assertEqual(used, "key-b")
+        seen.clear()
+        with self.assertRaises(GeminiClientError):
+            _run(client.create_interaction(payload, api_key="key-a"))
+        self.assertEqual(seen, ["key-a"])
+
+
 class AgGetParseTests(unittest.TestCase):
-    """校验 /agget 的完整路径解析，覆盖优雅风格与旧写法兼容。"""
+    """校验 /agget 的完整路径解析，覆盖优雅风格与旧写法兼容。
+
+    直接执行 main.py 里 agget 的解析语句（yield 之前的部分），
+    这样测的是真实实现，不是测试里复制的副本。
+    """
 
     @staticmethod
-    def _parse(raw: str) -> tuple[str, str]:
-        """与 agget 中的解析逻辑保持一致（抽出来便于回归）。"""
-        import re as _re
+    def _parse_statements() -> tuple[str, list[str]]:
+        """返回 (imports 前缀, agget 解析语句源码)。"""
+        import ast as _ast
 
-        drive = _re.compile(r"^[A-Za-z]:$")
-        raw = (raw or "").strip()
-        task_ref = ""
-        name = raw
-        if (raw[:2] and drive.fullmatch(raw[:2])) or raw.startswith(("/", "\\")):
-            name = raw
-        elif ":" in raw:
-            head, _, tail = raw.partition(":")
-            head = head.strip()
-            tail = tail.strip().lstrip("/")
-            if head.isdigit() and tail:
-                task_ref = head
-                name = tail
-        elif " " in raw:
-            head, _, tail = raw.partition(" ")
-            if head.strip().isdigit() and tail.strip():
-                task_ref = head.strip()
-                name = tail.strip()
-        return task_ref, name
+        src = MAIN.read_text(encoding="utf-8")
+        tree = _ast.parse(src)
+        handler = None
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.AsyncFunctionDef) and node.name == "agget":
+                handler = node
+                break
+        assert handler is not None, "agget handler not found in main.py"
+        lines = src.splitlines()
+        kept: list[str] = []
+        for stmt in handler.body:
+            # 跳过 docstring
+            if isinstance(stmt, _ast.Expr) and isinstance(stmt.value, _ast.Constant):
+                continue
+            # 到 `short = task_ref or ...` 为止，后面是真正的调用与发送
+            if isinstance(stmt, _ast.Assign) and any(
+                isinstance(t, _ast.Name) and t.id == "short" for t in stmt.targets
+            ):
+                break
+            chunk = lines[stmt.lineno - 1 : stmt.end_lineno]
+            if any("yield event" in line for line in chunk):
+                continue
+            kept.append("\n".join(chunk))
+        prefix_lines: list[str] = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Assign) and any(
+                isinstance(t, _ast.Name) and t.id == "_DRIVE_PREFIX_RE"
+                for t in node.targets
+            ):
+                prefix_lines = lines[node.lineno - 1 : node.end_lineno]
+        return "\n".join(prefix_lines), kept
+
+    @classmethod
+    def setUpClass(cls):
+        import re as _re
+        import textwrap as _textwrap
+
+        prefix, statements = cls._parse_statements()
+        namespace: dict = {"re": _re}
+        exec(prefix, namespace)
+        body = _textwrap.dedent("\n".join(statements))
+        indented = "\n".join(
+            f"    {line}" if line.strip() else "" for line in body.splitlines()
+        )
+        wrapper = (
+            "def parse(rest):\n"
+            f"{indented}\n"
+            "    return task_ref, name\n"
+        )
+        exec(wrapper, namespace)
+        cls._real_parse = staticmethod(namespace["parse"])
+
+    @classmethod
+    def _parse(cls, raw: str) -> tuple[str, str]:
+        return cls._real_parse(raw)
 
     def test_space_form_is_primary(self):
         self.assertEqual(
@@ -627,6 +1470,378 @@ class AgGetParseTests(unittest.TestCase):
 
     def test_empty_is_rejected(self):
         self.assertEqual(self._parse("   "), ("", ""))
+
+    def test_short_number_alone_is_not_a_path(self):
+        # 光有任务编号、没接路径：识别成编号并让上层给出用法提示，
+        # 不能把编号当成路径去查后报「未找到该任务编号」。
+        self.assertEqual(self._parse("0009"), ("0009", ""))
+        self.assertEqual(self._parse("9"), ("9", ""))
+        self.assertEqual(self._parse("0009:"), ("0009", ""))
+
+
+class ReceiptFormatTests(unittest.TestCase):
+    @staticmethod
+    def _helpers() -> dict:
+        text = MAIN.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        wanted = {
+            "workspace_product_paths",
+            "swap_url_origin",
+            "placement_instruction",
+            "ensure_result_md",
+            "completed_marker_name",
+            "stamped_completed_path",
+            "is_completed_marker_path",
+            "completed_marker_instruction",
+            "file_poll_notice",
+            "file_poll_should_stop",
+            "_output_file_names",
+            "_as_str",
+        }
+        chunks: list[str] = []
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in wanted:
+                segment = ast.get_source_segment(text, node)
+                if segment:
+                    chunks.append(segment)
+        namespace: dict = {}
+        exec(
+            "from typing import Any\nfrom urllib.parse import urlsplit, urlunsplit\n"
+            "from datetime import datetime\n\n"
+            "RUNNING_STATUS = frozenset({'in_progress', 'queued'})\n"
+            "TERMINAL_STATUS = frozenset({"
+            "'completed', 'failed', 'cancelled', 'incomplete', "
+            "'budget_exceeded', 'requires_action'})\n\n"
+            + "\n\n".join(chunks),
+            namespace,
+        )
+        namespace["COMPLETED_MARKER_SUFFIX"] = ".completed"
+        namespace["_submit_stamp"] = lambda: "260928153045"
+        return namespace
+
+    def test_workspace_path_uses_stamped_filename(self):
+        helpers = self._helpers()
+        self.assertEqual(
+            helpers["workspace_product_paths"](["260927153045_result.md"]),
+            ["/workspace/260927153045_result.md"],
+        )
+
+    def test_receipt_base_replaces_origin_only(self):
+        helpers = self._helpers()
+        swap = helpers["swap_url_origin"]
+        url = "https://real.example/agysb/260927153045_result.md?x=1"
+        self.assertEqual(swap(url, ""), url)
+        self.assertEqual(
+            swap(url, "https://spare.example"),
+            "https://spare.example/agysb/260927153045_result.md?x=1",
+        )
+        self.assertEqual(
+            swap(url, "https://spare.example/ignored"),
+            "https://spare.example/agysb/260927153045_result.md?x=1",
+        )
+        self.assertEqual(
+            swap(url, "spare.example"),
+            "https://spare.example/agysb/260927153045_result.md?x=1",
+        )
+
+    def test_placement_tells_sandbox_to_keep_md_for_this_round(self):
+        helpers = self._helpers()
+        place = helpers["placement_instruction"]
+        md = place(["/workspace/260927153045_result.md"])
+        self.assertIn("【产物放置要求】", md)
+        self.assertIn("/workspace/260927153045_result.md", md)
+        self.assertIn("不要把上一轮已有报告复制后交差", md)
+        png = place(["/workspace/260927153045_result.png"])
+        self.assertNotIn("不要把上一轮已有报告复制后交差", png)
+        self.assertEqual(place([]), "")
+
+    def test_png_still_adds_one_result_md(self):
+        helpers = self._helpers()
+        ensure = helpers["ensure_result_md"]
+        self.assertEqual(ensure(""), "result.md")
+        self.assertEqual(ensure("result.png"), "result.png,result.md")
+        self.assertEqual(ensure("result.png,result.html"), "result.png,result.html,result.md")
+        self.assertEqual(ensure("result.md"), "result.md")
+        self.assertEqual(ensure("notes.md,result.md"), "notes.md,result.md")
+
+    def test_poll_watches_only_this_round_completed_marker(self):
+        helpers = self._helpers()
+        self.assertEqual(
+            helpers["completed_marker_name"]("260928153045"),
+            "260928153045.completed",
+        )
+        self.assertEqual(
+            helpers["stamped_completed_path"]("260928153045"),
+            "/workspace/260928153045.completed",
+        )
+        # 与 result.md 用同一时间戳，工具输出路径差一个后缀
+        self.assertEqual(
+            helpers["stamped_completed_path"]("260928153045"),
+            "/workspace/260928153045_result.md".replace("_result.md", ".completed"),
+        )
+        self.assertEqual(helpers["file_poll_notice"]("0001"), "任务 0001 可能已经完成，请使用 /agr 0001 取回")
+
+    def test_completed_marker_path_filter(self):
+        helpers = self._helpers()
+        is_marker = helpers["is_completed_marker_path"]
+        self.assertTrue(is_marker("/workspace/260928153045.completed"))
+        self.assertTrue(is_marker("workspace/260928153045.COMPLETED"))
+        self.assertFalse(is_marker("/workspace/260928153045_result.md"))
+        self.assertFalse(is_marker(""))
+
+    def test_completed_marker_instruction_text(self):
+        helpers = self._helpers()
+        text = helpers["completed_marker_instruction"]("260928153045")
+        self.assertIn("完成所有任务后请在工作空间创建文件 260928153045.completed的空文件,此项不需要汇报。", text)
+        self.assertTrue(text.startswith("\n\n"))
+
+    def test_in_progress_does_not_stop_completed_poll(self):
+        helpers = self._helpers()
+        stop = helpers["file_poll_should_stop"]
+        self.assertFalse(stop("in_progress"))
+        self.assertFalse(stop("IN_PROGRESS"))
+        self.assertFalse(stop("queued"))
+        self.assertFalse(stop("unknown"))
+        self.assertFalse(stop(""))
+        self.assertTrue(stop("completed"))
+        self.assertTrue(stop("failed"))
+        self.assertTrue(stop("cancelled"))
+        self.assertTrue(stop("incomplete"))
+
+
+class LatestRoundTests(unittest.TestCase):
+    @staticmethod
+    def _pick():
+        text = MAIN.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        wanted = {
+            "_as_str",
+            "_now",
+            "_parse_iso",
+            "_parse_short_int",
+            "_index_item_is_round",
+            "pick_latest_indexed_short",
+        }
+        chunks: list[str] = []
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in wanted:
+                segment = ast.get_source_segment(text, node)
+                if segment:
+                    chunks.append(segment)
+        namespace: dict = {}
+        exec(
+            "import re\n"
+            "from datetime import datetime\n"
+            "SHORT_ID_WIDTH = 4\n"
+            "CONTINUE_SHORT_TIME_WIDTH = 6\n"
+            "CONTINUE_SHORT_RE = re.compile(r'^(\\d+)_(\\d{6})$')\n\n"
+            + "\n\n".join(chunks),
+            namespace,
+        )
+        return namespace["pick_latest_indexed_short"]
+
+    def test_side_rows_do_not_outrank_a_real_round(self):
+        pick = self._pick()
+        sandbox = "env-1"
+        index = {
+            "0006": {
+                "sandbox_id": sandbox,
+                "task_id": "task-new",
+                "recorded_at": "2026-09-28T18:47:08+08:00",
+                "expected_paths": "/workspace/260928184708_result.md",
+                "retrieved": "1",
+                "last_status": "completed",
+            },
+            "0014": {
+                "sandbox_id": sandbox,
+                "task_id": "task-old",
+                "recorded_at": "2026-09-28T18:47:10+08:00",
+                "retrieved": "1",
+                "last_status": "completed",
+            },
+        }
+        self.assertEqual(pick(index, sandbox), "0006")
+
+    def test_without_round_rows_newest_stamp_still_wins(self):
+        pick = self._pick()
+        sandbox = "env-1"
+        index = {
+            "0001": {
+                "sandbox_id": sandbox,
+                "recorded_at": "2026-09-28T18:00:00+08:00",
+            },
+            "0002": {
+                "sandbox_id": sandbox,
+                "recorded_at": "2026-09-28T19:00:00+08:00",
+            },
+        }
+        self.assertEqual(pick(index, sandbox), "0002")
+        self.assertEqual(pick(index, "missing"), "")
+
+    def test_continue_gate_uses_the_followed_task_and_reply_does_not_allocate(self):
+        text = MAIN.read_text(encoding="utf-8")
+        self.assertIn(
+            "gate_short = self._short_for_task(task_id) or overwrite_short",
+            text,
+        )
+        self.assertNotIn(
+            "return self._record_short(receipt.task_id, receipt.sandbox_id)",
+            text,
+        )
+        self.assertIn("allocate=False", text)
+
+    def test_continue_record_never_mints_a_short(self):
+        text = MAIN.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        segment = ""
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if isinstance(child, ast.FunctionDef) and child.name == "_record_short":
+                        segment = ast.get_source_segment(text, child) or ""
+        self.assertTrue(segment)
+        namespace: dict = {"_as_str": lambda value: "" if value is None else str(value).strip()}
+        exec(textwrap.dedent(segment), namespace)
+        record = namespace["_record_short"]
+
+        class Box:
+            def __init__(self):
+                self._short_index = {
+                    "0006": {"task_id": "old", "sandbox_id": "env", "key": "k"},
+                }
+                self.allocated = False
+
+            def _find_key_for(self, **_kwargs):
+                return ""
+
+            def _short_for_task(self, task_id):
+                for short, item in self._short_index.items():
+                    if item.get("task_id") == task_id:
+                        return short
+                return ""
+
+            def _short_item(self, task_id, sandbox_id, *, key="", recorded_at=""):
+                item = {"task_id": task_id, "sandbox_id": sandbox_id}
+                if key:
+                    item["key"] = key
+                if recorded_at:
+                    item["recorded_at"] = recorded_at
+                return item
+
+            def _copy_retrieve_meta(self, _src, _dest):
+                return None
+
+            def _save_short_index(self):
+                return None
+
+            def _trim_short_index(self):
+                raise AssertionError("continue trimmed the short index")
+
+            def _alloc_submit_short(self):
+                self.allocated = True
+                raise AssertionError("continue allocated a short")
+
+        box = Box()
+        got = record(
+            box,
+            "new-task",
+            "env",
+            previous_task_id="old",
+            overwrite_short="0006",
+            allocate=False,
+        )
+        self.assertEqual(got, "0006")
+        self.assertEqual(box._short_index["0006"]["task_id"], "new-task")
+        self.assertEqual(list(box._short_index), ["0006"])
+        self.assertFalse(box.allocated)
+
+        empty = Box()
+        empty._short_index = {}
+        missing = record(empty, "new-task", "env", allocate=False)
+        self.assertEqual(missing, "")
+        self.assertEqual(empty._short_index, {})
+        self.assertFalse(empty.allocated)
+
+
+class CompletedNotifyOriginTests(unittest.TestCase):
+    """完成标记提示按提交来源区分：指令照常，工具默认静默。"""
+
+    @staticmethod
+    def _gate():
+        """抽出 _completed_notify_enabled_for，用桩 config 跑真实判定。"""
+        text = MAIN.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        wanted = {"_completed_notify_enabled_for"}
+        segments = []
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if isinstance(child, ast.FunctionDef) and child.name in wanted:
+                        segment = ast.get_source_segment(text, child)
+                        if segment:
+                            segments.append(textwrap.dedent(segment))
+        assert segments, "_completed_notify_enabled_for not found in main.py"
+        namespace: dict = {
+            "_as_str": lambda v: "" if v is None else str(v).strip(),
+            "_as_bool": lambda v, d: (
+                str(v).strip().lower() in {"1", "true", "yes", "on"} if v is not None else d
+            ),
+        }
+        exec("\n\n".join(segments), namespace)
+        return namespace["_completed_notify_enabled_for"]
+
+    def _stub(self, **probe):
+        class Stub:
+            def _setting(self, group, key, legacy=None, default=None):
+                assert group == "probe"
+                return probe.get(key, default)
+
+        return Stub()
+
+    def test_command_origin_always_notifies(self):
+        gate = self._gate()
+        self.assertTrue(gate(self._stub(), "command"))
+        # 即使开关关着也发，指令是用户自己打的
+        self.assertTrue(gate(self._stub(completed_notify=False), "command"))
+
+    def test_tool_origin_stays_silent_by_default(self):
+        gate = self._gate()
+        # 外层模型自主提交：默认不往会话里弹提示
+        self.assertFalse(gate(self._stub(), "tool"))
+        # 开关显式关同样不发
+        self.assertFalse(gate(self._stub(completed_notify=False), "tool"))
+        # 读到空或缺省都回落静默
+        self.assertFalse(gate(self._stub(completed_notify=None), "tool"))
+
+    def test_tool_origin_notifies_only_when_switch_on(self):
+        gate = self._gate()
+        self.assertTrue(gate(self._stub(completed_notify=True), "tool"))
+        self.assertTrue(gate(self._stub(completed_notify="true"), "tool"))
+
+    def test_unknown_origin_treated_as_tool(self):
+        # 来源字段缺失或未知值时按更保守的工具提交处理
+        gate = self._gate()
+        self.assertFalse(gate(self._stub(), ""))
+        self.assertFalse(gate(self._stub(), "cron"))
+        self.assertTrue(gate(self._stub(completed_notify=True), ""))
+
+    def test_notify_routes_by_origin(self):
+        """_notify_file_ready 只对允许的来源调用 send_message。"""
+        text = MAIN.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        segment = ""
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if (
+                        isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and child.name == "_notify_file_ready"
+                    ):
+                        segment = ast.get_source_segment(text, child) or ""
+        assert segment
+        # 指令来源仍然 @提交人
+        self.assertIn('if origin == "command" and sender_id:', segment)
+        self.assertIn("self._completed_notify_enabled_for(origin)", segment)
 
 
 if __name__ == "__main__":

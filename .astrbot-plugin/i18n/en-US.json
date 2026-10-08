@@ -7,7 +7,7 @@
   "pages": {
     "sandbox-files": {
       "title": "Sandbox Files",
-      "description": "Browse sandbox workspace files. Downloads show real progress, can be cancelled, and run two at a time."
+      "description": "Browse shared sandbox files by independent session task. Deleting a sandbox removes all linked tasks and short IDs. Downloads show real progress, can be cancelled, and run two at a time."
     }
   }
 }
